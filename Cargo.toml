@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/phi-kernel"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.0.0"
+repository = "https://github.com/ewigmidori/phi"
+authors = ["EwigMidori"]
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+futures = "0.3.31"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+strum = { version = "0.28.0", features = ["derive"] }
+thiserror = "2.0.16"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1.18.0", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Groups at lower priority so individual overrides win.
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pedantic docs noise: thin kernel ports keep short API docs over # Errors on every Result.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Trait / helper methods return Result for fallible store adapters even when memory never fails.
+unnecessary_wraps = "allow"
+doc_markdown = "allow"
