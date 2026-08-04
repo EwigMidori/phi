@@ -20,6 +20,11 @@
 //! **Persistence:** [`Self::open`] rehydrates + validates a snapshot from the
 //! injected [`TreeStore`]; mutations never persist implicitly — call
 //! [`Self::persist`] (or [`Self::snapshot`] + a [`TreeStore`]) explicitly.
+//!
+//! **Id boundary:** the tree stores kernel [`SessionId`]s but never registers
+//! them with the kernel — a node id is a tree fact, not necessarily a live
+//! kernel session. Products must reconcile derived ids with the kernel
+//! `SessionDirectory` when they realize a session.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
