@@ -27,7 +27,7 @@ use crate::events::{EventBus, KernelEvent};
 use crate::ids::{JobId, MessageId, SessionId};
 use crate::transcript::Transcript;
 
-use super::job::SendJob;
+use super::job::GenerationJob;
 
 /// Loop signal from [`super::turn::GenerationTurn::handle`] — not `Option` / `Ok(None)`.
 #[derive(Debug)]
@@ -64,19 +64,19 @@ pub(crate) enum TurnTerminal {
 pub(crate) enum TurnOutcome {
     /// Successful generation; buffer is the assistant body to record.
     Completed {
-        job: SendJob,
+        job: GenerationJob,
         assistant_message_id: MessageId,
         content: String,
     },
     /// Stopped or cancelled mid-flight. Does not mean the model crashed.
     Aborted {
-        job: SendJob,
+        job: GenerationJob,
         assistant_message_id: MessageId,
         /// Text already buffered when interrupted (may be empty).
         partial: String,
     },
     /// Generation failed; `message` is for operators/UI error surfaces.
-    Failed { job: SendJob, message: String },
+    Failed { job: GenerationJob, message: String },
 }
 
 impl TurnOutcome {

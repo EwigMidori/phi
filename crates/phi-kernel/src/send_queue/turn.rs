@@ -1,4 +1,4 @@
-//! One in-flight generation for a claimed [`SendJob`](super::SendJob).
+//! One in-flight generation for a claimed [`GenerationJob`](super::GenerationJob).
 //!
 //! **SRP:** owns stream-event interpretation, text buffer, [`ToolLedger`], and
 //! terminal classification. [`handle`](GenerationTurn::handle) is pure state +
@@ -25,11 +25,11 @@ use super::effect::{
     CommitUnit, Disposition, EffectApplier, EffectBatch, TranscriptWrite, TurnOutcome, TurnTerminal,
 };
 use super::epoch::Epoch;
-use super::job::SendJob;
+use super::job::GenerationJob;
 use super::tool_ledger::ToolLedger;
 
 pub(crate) struct GenerationTurn {
-    job: SendJob,
+    job: GenerationJob,
     assistant_message_id: MessageId,
     claimed_epoch: Epoch,
     dialogue: Vec<DialogueTurn>,
@@ -39,7 +39,11 @@ pub(crate) struct GenerationTurn {
 
 impl GenerationTurn {
     #[must_use]
-    pub(crate) fn begin(job: SendJob, claimed_epoch: Epoch, dialogue: Vec<DialogueTurn>) -> Self {
+    pub(crate) fn begin(
+        job: GenerationJob,
+        claimed_epoch: Epoch,
+        dialogue: Vec<DialogueTurn>,
+    ) -> Self {
         Self {
             job,
             assistant_message_id: MessageId::generate(),
@@ -340,7 +344,7 @@ mod tests {
 
     #[test]
     fn handle_text_delta_buffers_and_emits_without_side_channels() {
-        let job = SendJob::new(SessionId::generate(), MessageId::generate());
+        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
         let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
         let (disposition, batch) = turn.handle(AgentEvent::TextDelta { text: "hi".into() });
         assert!(matches!(disposition, Disposition::Continue));
@@ -355,7 +359,7 @@ mod tests {
 
     #[test]
     fn handle_finished_is_terminal() {
-        let job = SendJob::new(SessionId::generate(), MessageId::generate());
+        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
         let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
         let (disposition, batch) = turn.handle(AgentEvent::Finished {
             reason: Some("stop".into()),
@@ -369,7 +373,7 @@ mod tests {
 
     #[test]
     fn handle_tool_call_opens_ledger_and_write_only() {
-        let job = SendJob::new(SessionId::generate(), MessageId::generate());
+        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
         let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
         let (disposition, batch) = turn.handle(AgentEvent::ToolCall {
             tool_call_id: "tc1".into(),
@@ -400,7 +404,7 @@ mod tests {
 
     #[test]
     fn seal_incomplete_after_tool_call_without_result() {
-        let job = SendJob::new(SessionId::generate(), MessageId::generate());
+        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
         let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
         let (_disposition, _batch) = turn.handle(AgentEvent::ToolCall {
             tool_call_id: "tc-open".into(),
@@ -428,7 +432,7 @@ mod tests {
     /// Status field is sole outcome authority — kernel must not sniff `output` JSON keys.
     #[test]
     fn status_field_is_sole_authority_anti_sniff() {
-        let job = SendJob::new(SessionId::generate(), MessageId::generate());
+        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
         let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
         let _ = turn.handle(AgentEvent::ToolCall {
             tool_call_id: "tc1".into(),
@@ -455,7 +459,7 @@ mod tests {
 
     #[test]
     fn tool_result_explicit_denied_status() {
-        let job = SendJob::new(SessionId::generate(), MessageId::generate());
+        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
         let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
         let _ = turn.handle(AgentEvent::ToolCall {
             tool_call_id: "tc1".into(),
@@ -480,7 +484,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_result_is_notice_only() {
-        let job = SendJob::new(SessionId::generate(), MessageId::generate());
+        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
         let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
         // No prior ToolCall — ledger has no open id.
         let (disposition, batch) = turn.handle(AgentEvent::ToolResult {
@@ -503,7 +507,7 @@ mod tests {
 
     #[test]
     fn start_effects_emits_generation_start() {
-        let job = SendJob::new(SessionId::generate(), MessageId::generate());
+        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
         let turn = GenerationTurn::begin(job.clone(), Epoch::ZERO, Vec::new());
         let batch = turn.start_effects();
         assert!(batch.writes.is_empty());

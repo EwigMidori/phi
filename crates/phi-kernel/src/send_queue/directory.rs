@@ -13,7 +13,7 @@ use crate::events::EventBus;
 use crate::ids::{JobId, SessionId};
 use crate::transcript::Transcript;
 
-use super::job::SendJob;
+use super::job::GenerationJob;
 use super::queue::SendQueue;
 
 /// `session_id → SendQueue` plus constructor-injected [`AgentPorts`].
@@ -71,7 +71,7 @@ impl SessionDirectory {
     /// Push job; creates SendQueue if missing. Returns pending job ids.
     ///
     /// `job.session_id` must equal `session_id`.
-    pub fn enqueue(&self, session_id: &SessionId, job: SendJob) -> Result<Vec<JobId>> {
+    pub fn enqueue(&self, session_id: &SessionId, job: GenerationJob) -> Result<Vec<JobId>> {
         if &job.session_id != session_id {
             return Err(KernelError::InvalidArgument(format!(
                 "job session {} does not match enqueue target {}",

@@ -9,7 +9,7 @@ First package of **[phi](../../README.md)**: minimal agent **mechanisms**.
 | Ids | `SessionId`, `JobId`, `MessageId` |
 | Errors | `KernelError` |
 | Agent contract | `AgentRuntime`, `TurnRequest`, `AgentEvent`, `AgentPrefix`, `TurnMaterials`, `AgentPorts` |
-| Generation | **`SendQueue`**, `SendJob`, `SessionDirectory` (`AgentPorts` = runtime + materials) |
+| Generation | **`SendQueue`**, `GenerationJob`, `SessionDirectory` (`AgentPorts` = runtime + materials) |
 | History | `Transcript` (`ensure_live`, record, `truncate_from`, load_dialogue), `InMemoryTranscript` |
 | Events | `KernelEvent` (generation-class only), `EventBus` |
 

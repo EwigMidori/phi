@@ -19,5 +19,5 @@ mod tool_ledger;
 mod turn;
 
 pub use directory::SessionDirectory;
-pub use job::SendJob;
+pub use job::GenerationJob;
 pub use queue::SendQueue;

@@ -11,7 +11,7 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 - `AgentPorts` = runtime + `TurnMaterials` (pump inject); `SourcesTurnMaterials` = default prepare from sources
 - `AgentPrefix` / `AgentPrefixSource` / `PreambleSection` / `SkillSlug` / `SkillDesc` / `ToolSpec`
 - `ToolCallSealPolicy` / `ToolCallSealSource` (seal; no enum default; usually behind materials)
-- **`SendQueue`** / `SendJob` / `SessionDirectory` (never call this "mailbox")
+- **`SendQueue`** / `GenerationJob` / `SessionDirectory` (never call this "mailbox")
 - `Transcript` / `truncate_from` (trait in `transcript/`); reference impl `transcript::memory::InMemoryTranscript` (re-exported)
 
 ## Prefix vs turn (ownership)

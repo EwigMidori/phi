@@ -5,7 +5,7 @@
 //! | Area | Surface |
 //! |------|---------|
 //! | Contract | [`AgentRuntime`], [`TurnRequest`], [`AgentEvent`] |
-//! | Generation | [`SendQueue`], [`SessionDirectory`], [`SendJob`] |
+//! | Generation | [`SendQueue`], [`SessionDirectory`], [`GenerationJob`] |
 //! | History | [`Transcript`], [`InMemoryTranscript`] |
 //! | Observe | [`KernelEvent`], [`EventBus`] |
 //!
@@ -48,7 +48,7 @@ pub use agent::{
 pub use error::{KernelError, Result};
 pub use events::{EventBus, KernelEvent};
 pub use ids::{JobId, MessageId, SessionId};
-pub use send_queue::{SendJob, SendQueue, SessionDirectory};
+pub use send_queue::{GenerationJob, SendQueue, SessionDirectory};
 pub use transcript::{InMemoryTranscript, RecordResult, Transcript, TruncateResult};
 
 pub const KERNEL_NAME: &str = "phi-kernel";
@@ -139,10 +139,10 @@ mod integration {
         let events = bus();
 
         let u1 = store.record_user(&sid, "one").unwrap();
-        dir.enqueue(&sid, SendJob::new(sid.clone(), u1.message_id))
+        dir.enqueue(&sid, GenerationJob::new(sid.clone(), u1.message_id))
             .unwrap();
         let u2 = store.record_user(&sid, "two").unwrap();
-        dir.enqueue(&sid, SendJob::new(sid.clone(), u2.message_id))
+        dir.enqueue(&sid, GenerationJob::new(sid.clone(), u2.message_id))
             .unwrap();
 
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
@@ -198,7 +198,7 @@ mod integration {
         let events = bus();
 
         let u = store.record_user(&sid, "keep me").unwrap();
-        dir.enqueue(&sid, SendJob::new(sid.clone(), u.message_id))
+        dir.enqueue(&sid, GenerationJob::new(sid.clone(), u.message_id))
             .unwrap();
 
         let dir2 = dir.clone();
@@ -229,13 +229,13 @@ mod integration {
         let events = bus();
 
         let u1 = store.record_user(&sid, "one").unwrap();
-        dir.enqueue(&sid, SendJob::new(sid.clone(), u1.message_id))
+        dir.enqueue(&sid, GenerationJob::new(sid.clone(), u1.message_id))
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 
         let u2 = store.record_user(&sid, "two").unwrap();
         let u2_id = u2.message_id.clone();
-        dir.enqueue(&sid, SendJob::new(sid.clone(), u2_id.clone()))
+        dir.enqueue(&sid, GenerationJob::new(sid.clone(), u2_id.clone()))
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 
@@ -249,7 +249,7 @@ mod integration {
         assert_eq!(store.load_dialogue(&sid).unwrap().len(), 2);
 
         let u2b = store.record_user(&sid, "two-edited").unwrap();
-        dir.enqueue(&sid, SendJob::new(sid.clone(), u2b.message_id))
+        dir.enqueue(&sid, GenerationJob::new(sid.clone(), u2b.message_id))
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 
@@ -282,7 +282,7 @@ mod integration {
         dir.activate(&sid);
         let events = bus();
         let u = store.record_user(&sid, "use tool").unwrap();
-        dir.enqueue(&sid, SendJob::new(sid.clone(), u.message_id))
+        dir.enqueue(&sid, GenerationJob::new(sid.clone(), u.message_id))
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 

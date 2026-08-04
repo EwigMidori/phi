@@ -25,7 +25,7 @@ use crate::transcript::Transcript;
 
 use super::effect::{CommitUnit, EffectApplier, TurnOutcome};
 use super::epoch::Epoch;
-use super::job::SendJob;
+use super::job::GenerationJob;
 use super::turn::GenerationTurn;
 
 /// One claimed generation seat: job + claim-time stop-generation snapshot.
@@ -34,14 +34,14 @@ use super::turn::GenerationTurn;
 /// (job without its claim epoch, or the reverse).
 #[derive(Clone, Debug)]
 struct RunningClaim {
-    job: SendJob,
+    job: GenerationJob,
     /// `cancel_epoch` at claim time; void once live has been bumped past this.
     epoch: Epoch,
 }
 
 struct QueueInner {
     id: SessionId,
-    pending: VecDeque<SendJob>,
+    pending: VecDeque<GenerationJob>,
     /// Current claim seat (job + claim-time epoch together).
     running: Option<RunningClaim>,
     /// This queue’s stop-generation number: claim snapshots it; stop bumps it;
@@ -121,7 +121,7 @@ impl SendQueue {
     /// Push job only — claim only inside [`run_until_idle`](Self::run_until_idle).
     ///
     /// Rejects jobs whose `session_id` does not match this queue (invariant).
-    pub fn enqueue(&self, job: SendJob) -> Result<()> {
+    pub fn enqueue(&self, job: GenerationJob) -> Result<()> {
         let mut g = self.lock();
         if job.session_id != g.id {
             return Err(KernelError::InvalidArgument(format!(
@@ -133,7 +133,7 @@ impl SendQueue {
         Ok(())
     }
 
-    fn claim_for_pump(&self) -> Option<(SendJob, Epoch)> {
+    fn claim_for_pump(&self) -> Option<(GenerationJob, Epoch)> {
         let mut g = self.lock();
         debug_assert!(g.pump_active, "claim_for_pump without pump seat");
         if let Some(claim) = g.running.clone() {
@@ -289,7 +289,7 @@ mod tests {
     fn enqueue_does_not_claim_until_pump() {
         let sid = SessionId::generate();
         let q = SendQueue::new(sid.clone());
-        let job = SendJob::new(sid, MessageId::generate());
+        let job = GenerationJob::new(sid, MessageId::generate());
         let jid = job.job_id.clone();
         q.enqueue(job).unwrap();
         assert_eq!(q.pending_ids(), vec![jid]);
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn enqueue_rejects_foreign_session() {
         let q = SendQueue::new(SessionId::generate());
-        let foreign = SendJob::new(SessionId::generate(), MessageId::generate());
+        let foreign = GenerationJob::new(SessionId::generate(), MessageId::generate());
         assert!(q.enqueue(foreign).is_err());
     }
 
