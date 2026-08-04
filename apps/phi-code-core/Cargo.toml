@@ -1,0 +1,15 @@
+[package]
+name = "phi-code-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "phi-code product runtime"
+readme = "README.md"
+
+[dependencies]
+phi-kernel = { path = "../../crates/phi-kernel" }
+phi-ext-tree-agent = { path = "../../crates/phi-ext-tree-agent" }
+phi-ext-subagent = { path = "../../crates/phi-ext-subagent" }
+
+[lints]
+workspace = true

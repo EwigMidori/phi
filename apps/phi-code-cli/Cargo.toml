@@ -1,0 +1,19 @@
+[package]
+name = "phi-code-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "phi-code CLI entry"
+readme = "README.md"
+
+[[bin]]
+name = "phi-code"
+path = "src/main.rs"
+
+[dependencies]
+crossterm.workspace = true
+phi-code-core = { path = "../phi-code-core" }
+ratatui.workspace = true
+
+[lints]
+workspace = true

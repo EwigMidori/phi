@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/phi-kernel", "crates/phi-ext-tree-agent", "crates/phi-ext-subagent"]
+members = [
+    "crates/phi-kernel",
+    "crates/phi-ext-tree-agent",
+    "crates/phi-ext-subagent",
+    "apps/phi-code-core",
+    "apps/phi-code-cli",
+]
 resolver = "2"
 
 [workspace.package]
@@ -11,7 +17,9 @@ authors = ["EwigMidori"]
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+crossterm = "0.28"
 futures = "0.3.31"
+ratatui = "0.29"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 strum = { version = "0.28.0", features = ["derive"] }

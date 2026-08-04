@@ -7,7 +7,8 @@ Open-source **agent kernel** (+ future extensions). Daan (`crates/da-*`, `web/`)
 | **Project** | `phi` |
 | **Kernel** | [`phi-kernel`](./crates/phi-kernel/) |
 | **Tree agent** | `phi-ext-tree-agent` (v0) + `phi-ext-subagent` (delegation interface) |
-| **Status** | Stage-1 kernel port in progress |
+| **Product** | `apps/phi-code-core` (runtime) + `apps/phi-code-cli` (`phi-code` binary) |
+| **Status** | Dense vertical slice in progress |
 
 ## Layers
 
@@ -30,10 +31,14 @@ phi/
     phi-kernel/
     phi-ext-tree-agent/
     phi-ext-subagent/
+  apps/
+    phi-code-core/
+    phi-code-cli/    # bin: phi-code
 ```
 
 ```bash
 cargo test --workspace
+cargo run -p phi-code-cli
 ```
 
 ## Relationship to Daan monorepo
