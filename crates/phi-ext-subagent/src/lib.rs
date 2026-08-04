@@ -7,9 +7,9 @@
 //!
 //! | Area | Surface |
 //! |------|---------|
-//! | Delegation | [`SubagentRequest`], [`SubagentResult`], [`Subagent`] |
+//! | Delegation | [`SubagentRequest`] (`TreeChild` / `Ephemeral`), [`SubagentResult`], [`Subagent`] |
 //! | Binding | [`SubagentSource`], [`NoSubagents`], [`MapSubagents`] |
-//! | Spawn | [`SpawnMode`], [`SessionSpawner`], [`SpawnBudget`] |
+//! | Spawn | [`SessionSpawner`], [`SpawnBudget`] |
 //!
 //! **Tool-shaped delegation:** from the parent turn's view one subagent invocation
 //! is exactly one tool call — [`SubagentRequest`] carries the kernel [`ToolCallId`]
@@ -35,7 +35,8 @@ pub mod subagent;
 
 pub use spawn::{SessionSpawner, SpawnBudget};
 pub use subagent::{
-    MapSubagents, NoSubagents, SpawnMode, Subagent, SubagentRequest, SubagentResult, SubagentSource,
+    EphemeralRequest, MapSubagents, NoSubagents, Subagent, SubagentRequest, SubagentResult,
+    SubagentSource, TreeChildRequest,
 };
 
 #[cfg(test)]
@@ -48,7 +49,7 @@ mod integration {
     use serde_json::json;
 
     use super::{
-        MapSubagents, SpawnMode, Subagent, SubagentRequest, SubagentResult, SubagentSource,
+        MapSubagents, Subagent, SubagentRequest, SubagentResult, SubagentSource, TreeChildRequest,
     };
 
     /// Test double: echoes the request input back as the delegation output.
@@ -59,7 +60,7 @@ mod integration {
         async fn run(&self, request: &SubagentRequest) -> SubagentResult {
             SubagentResult {
                 status: ToolResultStatus::Ok,
-                output: request.input.clone(),
+                output: request.input().clone(),
             }
         }
     }
@@ -73,18 +74,17 @@ mod integration {
         let subagent = source
             .subagent_for(&ToolName::new("research"))
             .expect("bound tool resolves");
-        let req = SubagentRequest {
+        let req = SubagentRequest::TreeChild(TreeChildRequest {
             tool_call_id: ToolCallId::new("tc-1"),
             tool_name: ToolName::new("research"),
             input: json!({"q": "graphs"}),
             parent_session_id: SessionId::generate(),
-            mode: SpawnMode::TreeChild,
-        };
+        });
         let result = subagent.run(&req).await;
         assert_eq!(result.status, ToolResultStatus::Ok);
         assert_eq!(result.output, json!({"q": "graphs"}));
         // The borrowed request survives the await — correlation is never lost.
-        assert_eq!(req.tool_call_id, ToolCallId::new("tc-1"));
+        assert_eq!(req.tool_call_id(), &ToolCallId::new("tc-1"));
         assert!(source.subagent_for(&ToolName::new("missing")).is_none());
     }
 }

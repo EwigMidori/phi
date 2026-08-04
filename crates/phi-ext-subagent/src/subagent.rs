@@ -14,62 +14,91 @@ use phi_kernel::{SessionId, ToolCallId, ToolName, ToolResultStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// How a delegation is materialized relative to the session graph.
+/// How a delegation is materialized — the **outer discriminant** of the request.
 ///
-/// Both variants exist in v0 because the request shape must be final before the
-/// v1 runner can route on it; only `TreeChild` touches the graph. **No
-/// [`Default`]** — every delegation states its disposition explicitly.
+/// The session-id field lives on the variant that owns its semantics, so a
+/// field's meaning can never depend on another field:
+/// - `TreeChild` carries `parent_session_id` — a **real parent** (the derivation
+///   source for a new child session node).
+/// - `Ephemeral` carries `origin_session_id` — **not a parent** (there is no
+///   session node); it only feeds binding-material preparation for the child
+///   generation. The ephemeral child's own session identity is a v1 runner
+///   decision.
 ///
-/// Relation to [`SubagentRequest::parent_session_id`]: under `TreeChild` that id
-/// is the **derivation source** for a new child session node; under `Ephemeral`
-/// there is **no session node**, and the id only feeds binding-material
-/// preparation for the child generation (the ephemeral child's own session
-/// identity is a v1 runner decision).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum SpawnMode {
-    /// One-shot generation with **no graph impact** — no derived session node.
-    Ephemeral,
-    /// The subagent becomes a **derived session node** of the parent session
-    /// (v1 wiring through [`crate::spawn::SessionSpawner`]).
-    TreeChild,
-}
-
-/// Input to [`Subagent::run`] — the complete description of one delegation.
-///
-/// Field rationale ("why here"):
+/// Common-field rationale ("why here"):
 /// - `tool_call_id`: the parent turn's tool ledger correlates delegations by
-///   kernel [`ToolCallId`]; the v1 runner must report the outcome against exactly
-///   this call, so the id rides on the request.
-/// - `tool_name`: the delegation's address — [`SubagentSource`] resolves the
+///   kernel [`ToolCallId`]; the v1 runner must report the outcome against
+///   exactly this call, so the id rides on the request.
+/// - `tool_name`: the delegation's **address** — [`SubagentSource`] resolves the
 ///   [`Subagent`] by it, and it matches the parent's tool catalog name.
 /// - `input`: opaque tool input (kernel discipline: `input` / `output` are
 ///   `serde_json::Value`, never interpreted by this crate).
-/// - `parent_session_id`: origin session; semantics differ per [`SpawnMode`] —
-///   see the field doc below (`TreeChild` derivation source vs `Ephemeral`
-///   materials-only).
-/// - `mode`: explicit per-call spawn disposition (`Ephemeral` vs `TreeChild`),
-///   so the runner never has to guess how to materialize the subagent.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// **No `Default`** — every delegation states its disposition as the variant.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum SubagentRequest {
+    /// The subagent becomes a **derived session node** of the parent session
+    /// (v1 wiring through [`crate::spawn::SessionSpawner`]).
+    TreeChild(TreeChildRequest),
+    /// One-shot generation with **no graph impact** — no derived session node.
+    Ephemeral(EphemeralRequest),
+}
+
+impl SubagentRequest {
+    /// The parent turn's tool-call correlation key — common to both variants.
+    #[must_use]
+    pub fn tool_call_id(&self) -> &ToolCallId {
+        match self {
+            Self::TreeChild(r) => &r.tool_call_id,
+            Self::Ephemeral(r) => &r.tool_call_id,
+        }
+    }
+
+    /// The delegation's address — common to both variants.
+    #[must_use]
+    pub fn tool_name(&self) -> &ToolName {
+        match self {
+            Self::TreeChild(r) => &r.tool_name,
+            Self::Ephemeral(r) => &r.tool_name,
+        }
+    }
+
+    /// Opaque tool input — common to both variants.
+    #[must_use]
+    pub fn input(&self) -> &Value {
+        match self {
+            Self::TreeChild(r) => &r.input,
+            Self::Ephemeral(r) => &r.input,
+        }
+    }
+}
+
+/// The `TreeChild` message: a delegation that derives a child session node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SubagentRequest {
+pub struct TreeChildRequest {
     pub tool_call_id: ToolCallId,
     pub tool_name: ToolName,
     pub input: Value,
-    /// The session the delegation originates from.
-    ///
-    /// Dual-mode semantics — depends on [`Self::mode`]:
-    /// - `SpawnMode::TreeChild`: this id is the **derivation source**. v1 runs
-    ///   it through [`crate::spawn::SessionSpawner::spawn_child`] to derive the
-    ///   child session node.
-    /// - `SpawnMode::Ephemeral`: there is **no session node**. The id exists
-    ///   only so the v1 runner can prepare binding material for the child
-    ///   generation (e.g. [`phi_kernel::AgentPrefixSource::prefix_for`]); the
-    ///   ephemeral child generation's own `session_id` is an **open v1 runner
-    ///   decision** — the parent's session id must never be reused as the child
-    ///   generation id inside the parent's transcript.
+    /// The **derivation source** — the real parent session. v1 runs it through
+    /// [`crate::spawn::SessionSpawner::spawn_child`] to derive the child node.
     pub parent_session_id: SessionId,
-    pub mode: SpawnMode,
+}
+
+/// The `Ephemeral` message: a one-shot delegation with no session node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EphemeralRequest {
+    pub tool_call_id: ToolCallId,
+    pub tool_name: ToolName,
+    pub input: Value,
+    /// Origin session used only to prepare binding material for the child
+    /// generation (e.g. [`phi_kernel::AgentPrefixSource::prefix_for`]). **Not a
+    /// parent** — there is no session node; the ephemeral child generation's
+    /// own `session_id` is an open v1 runner decision and must never reuse this
+    /// id inside the parent's transcript.
+    pub origin_session_id: SessionId,
 }
 
 /// The outcome of one delegation — the ext twin of
@@ -96,11 +125,11 @@ pub trait Subagent: Send + Sync {
     /// Execute one delegation and close it with a [`SubagentResult`].
     ///
     /// `request` is **borrowed**: after the `await` the v1 runner still needs
-    /// `request.tool_call_id` to backfill the parent's tool ledger — an owning
-    /// argument would force an early `clone`, and "extract the id or lose the
-    /// correlation" is an interface-induced error class that borrowing removes
-    /// at the type level. Implementations emit a fresh child-generation output,
-    /// so borrowing costs nothing.
+    /// `request.tool_call_id()` to backfill the parent's tool ledger — an
+    /// owning argument would force an early `clone`, and "extract the id or
+    /// lose the correlation" is an interface-induced error class that borrowing
+    /// removes at the type level. Implementations emit a fresh child-generation
+    /// output, so borrowing costs nothing.
     async fn run(&self, request: &SubagentRequest) -> SubagentResult;
 }
 
@@ -139,8 +168,8 @@ impl SubagentSource for MapSubagents {
 #[cfg(test)]
 mod tests {
     use super::{
-        MapSubagents, NoSubagents, SpawnMode, Subagent, SubagentRequest, SubagentResult,
-        SubagentSource,
+        EphemeralRequest, MapSubagents, NoSubagents, Subagent, SubagentRequest, SubagentResult,
+        SubagentSource, TreeChildRequest,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -157,31 +186,40 @@ mod tests {
         async fn run(&self, request: &SubagentRequest) -> SubagentResult {
             SubagentResult {
                 status: ToolResultStatus::Ok,
-                output: request.input.clone(),
+                output: request.input().clone(),
             }
         }
     }
 
-    /// Minimal fixture request exercising every field.
-    fn request(mode: SpawnMode) -> SubagentRequest {
-        SubagentRequest {
+    /// Minimal `TreeChild` fixture request exercising the derived-node path.
+    fn tree_child_request() -> SubagentRequest {
+        SubagentRequest::TreeChild(TreeChildRequest {
             tool_call_id: ToolCallId::new("tc-1"),
             tool_name: ToolName::new("research"),
             input: json!({"q": "graphs"}),
             parent_session_id: SessionId::generate(),
-            mode,
-        }
+        })
+    }
+
+    /// Minimal `Ephemeral` fixture request exercising the no-node path.
+    fn ephemeral_request() -> SubagentRequest {
+        SubagentRequest::Ephemeral(EphemeralRequest {
+            tool_call_id: ToolCallId::new("tc-1"),
+            tool_name: ToolName::new("research"),
+            input: json!({"q": "graphs"}),
+            origin_session_id: SessionId::generate(),
+        })
     }
 
     #[tokio::test]
     async fn subagent_run_closes_with_status_and_output() {
         let subagent = Arc::new(EchoSubagent) as Arc<dyn Subagent>;
-        let req = request(SpawnMode::Ephemeral);
+        let req = ephemeral_request();
         let result = subagent.run(&req).await;
         assert_eq!(result.status, ToolResultStatus::Ok);
         assert_eq!(result.output, json!({"q": "graphs"}));
         // The borrowed request survives the await — correlation is never lost.
-        assert_eq!(req.tool_call_id, ToolCallId::new("tc-1"));
+        assert_eq!(req.tool_call_id(), &ToolCallId::new("tc-1"));
     }
 
     #[test]
@@ -196,16 +234,37 @@ mod tests {
     }
 
     #[test]
-    fn spawn_mode_has_both_variants_and_serde_shape() {
-        assert_ne!(SpawnMode::Ephemeral, SpawnMode::TreeChild);
-        assert_eq!(
-            serde_json::to_string(&SpawnMode::Ephemeral).unwrap(),
-            "\"ephemeral\""
-        );
-        assert_eq!(
-            serde_json::to_string(&SpawnMode::TreeChild).unwrap(),
-            "\"treeChild\""
-        );
+    fn subagent_request_tree_child_serde_shape() {
+        let req = tree_child_request();
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["mode"], "treeChild");
+        assert!(value.get("parentSessionId").is_some());
+        let roundtrip: SubagentRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, req);
+    }
+
+    #[test]
+    fn subagent_request_ephemeral_serde_shape() {
+        let req = ephemeral_request();
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["mode"], "ephemeral");
+        assert!(value.get("originSessionId").is_some());
+        // Core remediation: an Ephemeral message must never carry a parent.
+        assert!(value.get("parentSessionId").is_none());
+        let roundtrip: SubagentRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(roundtrip, req);
+    }
+
+    #[test]
+    fn common_fields_accessible_across_variants() {
+        let tree = tree_child_request();
+        let ephemeral = ephemeral_request();
+        assert_eq!(tree.tool_call_id(), ephemeral.tool_call_id());
+        assert_eq!(tree.tool_name(), ephemeral.tool_name());
+        assert_eq!(tree.input(), ephemeral.input());
+        assert_eq!(tree.tool_call_id(), &ToolCallId::new("tc-1"));
+        assert_eq!(tree.tool_name(), &ToolName::new("research"));
+        assert_eq!(tree.input(), &json!({"q": "graphs"}));
     }
 
     #[test]

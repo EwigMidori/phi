@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use phi_kernel::SessionId;
 use serde::{Deserialize, Serialize};
 
-/// Creates a **derived child session node** for `SpawnMode::TreeChild` delegations.
+/// Creates a **derived child session node** for [`crate::subagent::SubagentRequest::TreeChild`] delegations.
 ///
 /// A `TreeChild` delegation is a **with-history delegation** (context-carrying):
 /// the child is derived as `WithHistory` — it inherits the parent's context
@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 /// on `phi-ext-tree-agent`).
 ///
 /// The port exists in v0 even though nothing implements it yet: the request
-/// shape already carries `TreeChild`, so the v1 runner needs a place to wire the
-/// derive.
+/// shape already carries a `TreeChild` variant, so the v1 runner needs a place
+/// to wire the derive.
 #[async_trait]
 pub trait SessionSpawner: Send + Sync {
     /// Derive a child session from `parent_session_id` and return the new id.
@@ -28,7 +28,7 @@ pub trait SessionSpawner: Send + Sync {
     /// The port carries only facts the receiver needs — `tool_name` has **no
     /// consumer** here: a tree-agent `SessionTree::derive(parent, WithHistory)`
     /// stores no label, and the delegation's catalog name is already held by the
-    /// runner on [`crate::subagent::SubagentRequest::tool_name`]. The derivation
+    /// runner via [`crate::subagent::SubagentRequest::tool_name`]. The derivation
     /// is **with-history** (`WithHistory`) per the trait doc; exact semantics
     /// are the wiring side's, not this port's. Errors follow the kernel
     /// `AgentRuntime::run` convention (`String`): spawn failure is infra failure

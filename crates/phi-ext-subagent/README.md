@@ -8,9 +8,9 @@ final; the runner lands in v1.
 
 | Area | API |
 |------|-----|
-| Delegation | `SubagentRequest`, `SubagentResult`, `Subagent` |
+| Delegation | `SubagentRequest` (`TreeChild` / `Ephemeral`), `SubagentResult`, `Subagent` |
 | Binding | `SubagentSource`, `NoSubagents`, `MapSubagents` |
-| Spawn | `SpawnMode` (`Ephemeral` / `TreeChild`), `SessionSpawner`, `SpawnBudget` |
+| Spawn | `SessionSpawner`, `SpawnBudget` |
 
 **Tool-shaped delegation:** from the parent turn's view one subagent invocation is
 exactly one tool call — `SubagentRequest` carries the kernel `ToolCallId` +
@@ -18,6 +18,12 @@ exactly one tool call — `SubagentRequest` carries the kernel `ToolCallId` +
 `SubagentResult { status, output }`. `status` is the **sole outcome authority**
 (kernel `ToolResultStatus`); `output` is opaque and never sniffed. No stream, no
 partials.
+
+**Two messages, one wire:** `SubagentRequest` is an outer enum (`mode` tag):
+`TreeChild` derives a **child session node** and carries `parent_session_id` — a
+**real parent** (the derivation source); `Ephemeral` has **no session node** and
+carries `origin_session_id` — **not a parent**, only binding-material
+preparation for the child generation.
 
 **v0 boundary:** no runner, no execution. `Subagent` is implemented by
 products/adapters; `SessionSpawner` (the `TreeChild` derive port) is wired by
