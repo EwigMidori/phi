@@ -40,6 +40,8 @@
 pub mod error;
 pub mod spawn;
 pub mod subagent;
+#[cfg(test)]
+mod test_util;
 
 pub use error::ResolutionError;
 pub use spawn::SessionSpawner;
@@ -53,31 +55,18 @@ mod integration {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use phi_kernel::{SessionId, ToolCallId, ToolName, ToolResultStatus};
     use serde_json::json;
 
     use super::{
         DelegationContext, MapSubagents, Subagent, SubagentRequest, SubagentResolver,
-        SubagentResult, TreeChildRequest,
+        TreeChildRequest,
     };
-
-    /// Test double: echoes the request input back as the delegation output.
-    struct EchoSubagent;
-
-    #[async_trait]
-    impl Subagent for EchoSubagent {
-        async fn run(&self, request: &SubagentRequest) -> SubagentResult {
-            SubagentResult {
-                status: ToolResultStatus::Ok,
-                output: request.input().clone(),
-            }
-        }
-    }
+    use crate::test_util::EchoSubagent;
 
     #[tokio::test]
     async fn delegated_tool_call_closes_with_tool_result() {
-        let source = MapSubagents(HashMap::from([(
+        let source = MapSubagents::new(HashMap::from([(
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));
@@ -107,7 +96,7 @@ mod integration {
 
     #[test]
     fn unbound_tool_is_a_configuration_error() {
-        let source = MapSubagents(HashMap::from([(
+        let source = MapSubagents::new(HashMap::from([(
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));

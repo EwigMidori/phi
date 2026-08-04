@@ -227,7 +227,15 @@ impl SubagentResolver for NoSubagents {
 /// The caller must consult it only for a tool present in the map: a miss is a
 /// configuration error and returns [`ResolutionError::UnboundTool`].
 #[derive(Clone)]
-pub struct MapSubagents(pub HashMap<ToolName, Arc<dyn Subagent>>);
+pub struct MapSubagents(HashMap<ToolName, Arc<dyn Subagent>>);
+
+impl MapSubagents {
+    /// A resolver over the given tool → subagent map.
+    #[must_use]
+    pub fn new(map: HashMap<ToolName, Arc<dyn Subagent>>) -> Self {
+        Self(map)
+    }
+}
 
 impl SubagentResolver for MapSubagents {
     fn resolve(&self, ctx: &DelegationContext) -> crate::error::Result<Arc<dyn Subagent>> {
@@ -245,25 +253,13 @@ mod tests {
         SubagentResolver, SubagentResult, TreeChildRequest,
     };
     use crate::error::ResolutionError;
+    use crate::test_util::EchoSubagent;
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use phi_kernel::{SessionId, ToolCallId, ToolName, ToolResultStatus};
     use serde_json::{Value, json};
-
-    /// Test double: echoes the request input back as the delegation output.
-    struct EchoSubagent;
-
-    #[async_trait]
-    impl Subagent for EchoSubagent {
-        async fn run(&self, request: &SubagentRequest) -> SubagentResult {
-            SubagentResult {
-                status: ToolResultStatus::Ok,
-                output: request.input().clone(),
-            }
-        }
-    }
 
     /// Test double: echoes the input back tagged with a fixed marker.
     struct TagSubagent(&'static str);
@@ -334,7 +330,7 @@ mod tests {
 
     #[test]
     fn map_resolver_resolves_bound_tool() {
-        let source = MapSubagents(HashMap::from([(
+        let source = MapSubagents::new(HashMap::from([(
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));
@@ -346,7 +342,7 @@ mod tests {
 
     #[test]
     fn map_resolver_errors_on_unbound_tool() {
-        let source = MapSubagents(HashMap::from([(
+        let source = MapSubagents::new(HashMap::from([(
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));
