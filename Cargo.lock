@@ -166,6 +166,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "phi-ext-subagent"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "phi-kernel",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "phi-ext-tree-agent"
+version = "0.0.0"
+dependencies = [
+ "phi-kernel",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "phi-kernel"
 version = "0.0.0"
 dependencies = [

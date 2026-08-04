@@ -1,0 +1,20 @@
+[package]
+name = "phi-ext-subagent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "phi ext — parent/child agent delegation protocol (tool-shaped subagent spawn; interface surface)"
+readme = "README.md"
+
+[dependencies]
+phi-kernel = { path = "../phi-kernel" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

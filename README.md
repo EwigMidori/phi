@@ -6,7 +6,7 @@ Open-source **agent kernel** (+ future extensions). Daan (`crates/da-*`, `web/`)
 |--|--|
 | **Project** | `phi` |
 | **Kernel** | [`phi-kernel`](./crates/phi-kernel/) |
-| **Tree agent** | planned `phi-ext-*` (not in kernel) |
+| **Tree agent** | `phi-ext-tree-agent` (v0) + `phi-ext-subagent` (delegation interface) |
 | **Status** | Stage-1 kernel port in progress |
 
 ## Layers
@@ -14,7 +14,7 @@ Open-source **agent kernel** (+ future extensions). Daan (`crates/da-*`, `web/`)
 | Layer | Owns |
 |-------|------|
 | **`phi-kernel`** | Agent contract, **SendQueue**, transcript port, generation events |
-| **`phi-ext-*`** | Optional mechanisms (session graph / tree-agent first) |
+| **`phi-ext-*`** | Optional mechanisms (session tree / subagent delegation; tree-agent first) |
 | **Product (Daan)** | Close/fork defaults, HTTP, UI rendering, brand paths |
 
 ## Naming
@@ -28,10 +28,12 @@ phi/
   Cargo.toml
   crates/
     phi-kernel/
+    phi-ext-tree-agent/
+    phi-ext-subagent/
 ```
 
 ```bash
-cargo test -p phi-kernel
+cargo test --workspace
 ```
 
 ## Relationship to Daan monorepo

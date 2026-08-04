@@ -36,7 +36,7 @@ First package of **[phi](../../README.md)**: minimal agent **mechanisms**.
 
 ## Out of scope
 
-- Session **graph** / edges / fork / tombstone close → `phi-ext-*`
+- Session **tree** / edges / fork / tombstone close → `phi-ext-*`
 - Handout derive
 - Product prefs, `daan` paths, HTTP, Rig
 - Approval / ACL engines (product adapter)

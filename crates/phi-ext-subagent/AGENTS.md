@@ -1,0 +1,35 @@
+# AGENTS — phi-ext-subagent
+
+## Role
+
+Parent/child agent **delegation protocol** surface for **phi**. Tool-shaped spawn:
+one delegation is one tool call from the parent turn's view, closed by one
+`SubagentResult`. v0 ships the **interface face only** — no runner, no execution.
+
+## Public surface
+
+- `SubagentRequest` / `SubagentResult` / `Subagent`
+- `SubagentSource` / `NoSubagents` / `MapSubagents`
+- `SpawnMode` (`Ephemeral` / `TreeChild`) / `SessionSpawner` / `SpawnBudget`
+
+## Rules
+
+- Reuse kernel types: `ToolCallId`, `ToolName`, `ToolResultStatus`, `SessionId` — no new id types, no status re-encoding
+- `status` is the **sole outcome authority**; `input` / `output` stay opaque `serde_json::Value` (never sniff keys)
+- `SpawnMode` and `SpawnBudget` have **no `Default`** — policy is explicit (struct-literal construction)
+- `SubagentSource` is **binding**, not ACL — permission lives product-side
+- `SessionSpawner` is a declared port; derive implementation belongs to `phi-ext-tree-agent` / product in v1
+- Budget enforcement and the runner are **v1**; v0 only declares ports
+
+## Forbidden
+
+- Runner / executor inside v0
+- Mailbox naming (reserved for future agent notify)
+- ACL / permission engines
+- Session graph / derive / close logic (→ `phi-ext-tree-agent`)
+- `da-*` imports, product prefs, Rig / HTTP
+- Deriving status from `output` JSON
+
+## Dependencies
+
+Only crates declared in this package's `Cargo.toml`. No `da-*`.
