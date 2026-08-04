@@ -9,7 +9,7 @@ one delegation is one tool call from the parent turn's view, closed by one
 ## Public surface
 
 - `SubagentRequest` (`TreeChild` / `Ephemeral`) / `SubagentResult` / `Subagent`
-- `DelegationContext` / `SubagentResolver` / `NoSubagents` / `MapSubagents` (per-call resolver, not a per-session binding)
+- `DelegationContext` / `SubagentResolver` / `ResolutionError` / `NoSubagents` / `MapSubagents` (per-call resolver, not a per-session binding)
 - `SessionSpawner`
 
 ## Rules
@@ -18,7 +18,8 @@ one delegation is one tool call from the parent turn's view, closed by one
 - `status` is the **sole outcome authority**; `input` / `output` stay opaque `serde_json::Value` (never sniff keys)
 - `SubagentRequest` has **no `Default`** — every delegation states its disposition as the variant
 - `TreeChild` carries `parent_session_id` (a real parent / derivation source); `Ephemeral` carries `origin_session_id` (materials-only, **never** a parent). The two are distinct messages — a field's meaning never depends on another field.
-- `SubagentResolver` is **caller-first, resolver-last**: consulted only for a confirmed delegation with no explicitly chosen subagent, and **always answers** (an unresolved case is a configuration error); permission lives product-side
+- `SubagentResolver` is **caller-first, resolver-last**: consulted only for a confirmed delegation with no explicitly chosen subagent, and answers with a subagent or a typed `ResolutionError` (an unresolved case is a configuration error); permission lives product-side
+- Resolution failures are the typed `ResolutionError` enum — never raw `String` results
 - `SessionSpawner` is a declared port; derive implementation belongs to `phi-ext-tree-agent` / product in v1
 - Budget enforcement and the runner are **v1**; v0 only declares ports
 

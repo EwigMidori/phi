@@ -8,7 +8,7 @@
 //! | Area | Surface |
 //! |------|---------|
 //! | Delegation | [`SubagentRequest`] (`TreeChild` / `Ephemeral`), [`SubagentResult`], [`Subagent`] |
-//! | Dispatch | [`SubagentResolver`], [`NoSubagents`], [`MapSubagents`] |
+//! | Dispatch | [`SubagentResolver`], [`ResolutionError`], [`NoSubagents`], [`MapSubagents`] |
 //! | Spawn | [`SessionSpawner`] |
 //!
 //! **Tool-shaped delegation:** from the parent turn's view one subagent invocation
@@ -20,7 +20,8 @@
 //! **Dispatch is caller-first, resolver-last:** the initiator decides whether a
 //! call is a delegation and which subagent executes it when one is known;
 //! [`SubagentResolver`] is consulted only for a confirmed delegation with no
-//! explicitly chosen subagent, and always answers.
+//! explicitly chosen subagent, and answers with a [`Subagent`] or a typed
+//! [`ResolutionError`].
 //!
 //! **Not in this crate:** the runner (v1), ACL / permission engines (product),
 //! session-graph derive (`phi-ext-tree-agent`).
@@ -36,9 +37,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod error;
 pub mod spawn;
 pub mod subagent;
 
+pub use error::ResolutionError;
 pub use spawn::SessionSpawner;
 pub use subagent::{
     DelegationContext, EphemeralRequest, MapSubagents, NoSubagents, Subagent, SubagentRequest,
@@ -88,11 +91,13 @@ mod integration {
             unreachable!("fixture is TreeChild")
         };
         // Resolution is unconditional for a bound tool — no `None` channel.
-        let subagent = source.resolve(&DelegationContext::new(
-            inner.tool_name.clone(),
-            inner.input.clone(),
-            inner.parent_session_id.clone(),
-        ));
+        let subagent = source
+            .resolve(&DelegationContext::new(
+                inner.tool_name.clone(),
+                inner.input.clone(),
+                inner.parent_session_id.clone(),
+            ))
+            .expect("bound tool resolves");
         let result = subagent.run(&req).await;
         assert_eq!(result.status, ToolResultStatus::Ok);
         assert_eq!(result.output, json!({"q": "graphs"}));
@@ -101,16 +106,19 @@ mod integration {
     }
 
     #[test]
-    #[should_panic(expected = "not bound")]
     fn unbound_tool_is_a_configuration_error() {
         let source = MapSubagents(HashMap::from([(
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));
-        let _ = source.resolve(&DelegationContext::new(
-            ToolName::new("missing"),
-            json!({}),
-            SessionId::generate(),
-        ));
+        let err = source
+            .resolve(&DelegationContext::new(
+                ToolName::new("missing"),
+                json!({}),
+                SessionId::generate(),
+            ))
+            .err()
+            .expect("an unbound tool must be a typed resolution error");
+        assert!(err.to_string().contains("no subagent bound for tool"));
     }
 }

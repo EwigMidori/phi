@@ -9,7 +9,7 @@ final; the runner lands in v1.
 | Area | API |
 |------|-----|
 | Delegation | `SubagentRequest` (`TreeChild` / `Ephemeral`), `SubagentResult`, `Subagent` |
-| Dispatch | `DelegationContext`, `SubagentResolver`, `NoSubagents`, `MapSubagents` |
+| Dispatch | `DelegationContext`, `SubagentResolver`, `ResolutionError`, `NoSubagents`, `MapSubagents` |
 | Spawn | `SessionSpawner` |
 
 **Tool-shaped delegation:** from the parent turn's view one subagent invocation is
@@ -29,10 +29,10 @@ preparation for the child generation.
 and which subagent executes it when one is known. `SubagentResolver` is
 consulted only for a confirmed delegation with no explicitly chosen subagent,
 resolving from a `DelegationContext` (a deliberate proper subset of the request
-— `mode` is decided by the initiator, never by the resolver), and **always
-answers** — an unresolved case is a configuration error, never a normal
-outcome. Resolution may key on `tool_name`, `input` content, or other facts —
-it is **not** a per-session binding.
+— `mode` is decided by the initiator, never by the resolver), and answers with
+a subagent or a typed `ResolutionError` — an unresolved case is a configuration
+error, never a normal outcome. Resolution may key on `tool_name`, `input`
+content, or other facts — it is **not** a per-session binding.
 
 **v0 boundary:** no runner, no execution. `Subagent` is implemented by
 products/adapters; `SessionSpawner` (the `TreeChild` derive port) is wired by
@@ -44,7 +44,7 @@ products/adapters; `SessionSpawner` (the `TreeChild` derive port) is wired by
 |---------|--------|
 | Tool-result outcome | Kernel `ToolResultStatus` (reused; no re-encoding) |
 | `input` / `output` | Opaque `serde_json::Value` — never interpreted |
-| Subagent dispatch | `SubagentResolver` (**per-call resolver** via `DelegationContext`, not ACL — permission is product-side) |
+| Subagent dispatch | `SubagentResolver` (**per-call resolver** via `DelegationContext`; failures are typed `ResolutionError`; not ACL — permission is product-side) |
 | `TreeChild` derive | `SessionSpawner` — v1: `phi-ext-tree-agent` / product |
 | Spawn caps | **Not in v0** — v1 runner consults an injected `SpawnPolicy` port (product policy; mechanism prescribes no shape) |
 

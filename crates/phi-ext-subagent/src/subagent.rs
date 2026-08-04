@@ -21,6 +21,8 @@ use phi_kernel::{SessionId, ToolCallId, ToolName, ToolResultStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::error::ResolutionError;
+
 /// How a delegation is materialized — the **outer discriminant** of the request.
 ///
 /// The session-id field lives on the variant that owns its semantics, so a
@@ -181,8 +183,9 @@ impl DelegationContext {
 /// initiating the call decides first whether the call is a delegation at all,
 /// and which [`Subagent`] executes it when one is already known. The resolver
 /// is consulted only for a confirmed delegation with no explicitly chosen
-/// subagent — so it must always return a [`Subagent`]: "no answer" is a
-/// configuration error on the caller's side, never a normal outcome.
+/// subagent — so a resolved [`Subagent`] is the only normal outcome. An error
+/// ([`crate::error::ResolutionError`]) means the delegation is not configured,
+/// never "not a delegation".
 ///
 /// **Per-call, not a per-session stable binding** — deliberately unlike
 /// [`phi_kernel::AgentPrefixSource`], which binds prefix material per session
@@ -198,22 +201,22 @@ impl DelegationContext {
 /// dispatch is per-call — the name says what it does.
 pub trait SubagentResolver: Send + Sync {
     /// Resolve the [`Subagent`] for a confirmed, unbound delegation.
-    fn resolve(&self, ctx: &DelegationContext) -> Arc<dyn Subagent>;
+    fn resolve(&self, ctx: &DelegationContext) -> crate::error::Result<Arc<dyn Subagent>>;
 }
 
 /// No subagents configured: consulting this resolver is a configuration error.
 ///
 /// Composition sentinel for products that never delegate — the initiator must
 /// not confirm a delegation while this resolver is in place. Being consulted
-/// is a caller-side bug and panics loudly rather than guessing.
+/// is a caller-side bug and errors loudly rather than guessing.
 #[derive(Clone, Debug, Default)]
 pub struct NoSubagents;
 
 impl SubagentResolver for NoSubagents {
-    fn resolve(&self, _ctx: &DelegationContext) -> Arc<dyn Subagent> {
-        panic!(
-            "NoSubagents was consulted: a delegation was confirmed but no subagent resolver is configured"
-        )
+    fn resolve(&self, _ctx: &DelegationContext) -> crate::error::Result<Arc<dyn Subagent>> {
+        Err(ResolutionError::Unresolved(
+            "no subagent resolver is configured".to_owned(),
+        ))
     }
 }
 
@@ -222,16 +225,16 @@ impl SubagentResolver for NoSubagents {
 /// Keys on [`DelegationContext::tool_name`]; products compose real subagents
 /// here, tests inject doubles. Lookup only — resolution order is irrelevant.
 /// The caller must consult it only for a tool present in the map: a miss is a
-/// configuration error and panics rather than guessing.
+/// configuration error and returns [`ResolutionError::UnboundTool`].
 #[derive(Clone)]
 pub struct MapSubagents(pub HashMap<ToolName, Arc<dyn Subagent>>);
 
 impl SubagentResolver for MapSubagents {
-    fn resolve(&self, ctx: &DelegationContext) -> Arc<dyn Subagent> {
+    fn resolve(&self, ctx: &DelegationContext) -> crate::error::Result<Arc<dyn Subagent>> {
         self.0
             .get(&ctx.tool_name)
             .cloned()
-            .expect("MapSubagents consulted for a tool name that is not bound")
+            .ok_or_else(|| ResolutionError::UnboundTool(ctx.tool_name.clone()))
     }
 }
 
@@ -241,6 +244,7 @@ mod tests {
         DelegationContext, EphemeralRequest, MapSubagents, NoSubagents, Subagent, SubagentRequest,
         SubagentResolver, SubagentResult, TreeChildRequest,
     };
+    use crate::error::ResolutionError;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -275,15 +279,15 @@ mod tests {
     }
 
     /// Test double: dispatches on `ctx.input["name"]` between two subagents.
-    /// Unroutable content is a configuration error — panics, never guesses.
+    /// Unroutable content is a configuration error — errors, never guesses.
     struct ContentDispatchSource;
 
     impl SubagentResolver for ContentDispatchSource {
-        fn resolve(&self, ctx: &DelegationContext) -> Arc<dyn Subagent> {
+        fn resolve(&self, ctx: &DelegationContext) -> crate::error::Result<Arc<dyn Subagent>> {
             match ctx.input.get("name").and_then(Value::as_str) {
-                Some("research") => Arc::new(EchoSubagent),
-                Some("translate") => Arc::new(TagSubagent("translate")),
-                _ => panic!("ContentDispatchSource consulted for an unroutable name"),
+                Some("research") => Ok(Arc::new(EchoSubagent)),
+                Some("translate") => Ok(Arc::new(TagSubagent("translate"))),
+                _ => Err(ResolutionError::Unresolved("unroutable name".to_owned())),
             }
         }
     }
@@ -329,47 +333,59 @@ mod tests {
     }
 
     #[test]
-    fn map_resolver_resolves_bound_tool_without_option() {
+    fn map_resolver_resolves_bound_tool() {
         let source = MapSubagents(HashMap::from([(
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));
-        // The resolver always answers for the tool it is consulted on.
-        let _subagent: Arc<dyn Subagent> = source.resolve(&ctx("research", "graphs"));
+        // The resolver answers for the tool it is consulted on.
+        let _subagent = source
+            .resolve(&ctx("research", "graphs"))
+            .expect("bound tool resolves");
     }
 
     #[test]
-    #[should_panic(expected = "not bound")]
-    fn map_resolver_panics_on_unbound_tool() {
+    fn map_resolver_errors_on_unbound_tool() {
         let source = MapSubagents(HashMap::from([(
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));
-        let _ = source.resolve(&ctx("unknown", "x"));
+        assert!(matches!(
+            source.resolve(&ctx("unknown", "x")),
+            Err(ResolutionError::UnboundTool(_))
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "no subagent resolver is configured")]
-    fn no_subagents_panics_when_consulted() {
-        let _ = NoSubagents.resolve(&ctx("any", "x"));
+    fn no_subagents_errors_when_consulted() {
+        assert!(matches!(
+            NoSubagents.resolve(&ctx("any", "x")),
+            Err(ResolutionError::Unresolved(_))
+        ));
     }
 
     #[tokio::test]
     async fn resolver_can_dispatch_on_input_content() {
         let source = ContentDispatchSource;
         let req = ephemeral_request();
-        let research = source.resolve(&ctx("anything", "research"));
+        let research = source
+            .resolve(&ctx("anything", "research"))
+            .expect("name=research resolves to the echo subagent");
         assert_eq!(research.run(&req).await.output, json!({"q": "graphs"}));
-        let translate = source.resolve(&ctx("anything", "translate"));
+        let translate = source
+            .resolve(&ctx("anything", "translate"))
+            .expect("name=translate resolves to the tagged subagent");
         let tagged = translate.run(&req).await;
         assert_eq!(tagged.output["tag"], "translate");
     }
 
     #[test]
-    #[should_panic(expected = "unroutable")]
-    fn resolver_panics_on_unroutable_content() {
+    fn resolver_errors_on_unroutable_content() {
         // Unroutable content is a configuration error — the resolver never guesses.
-        let _ = ContentDispatchSource.resolve(&ctx("anything", "other"));
+        assert!(matches!(
+            ContentDispatchSource.resolve(&ctx("anything", "other")),
+            Err(ResolutionError::Unresolved(_))
+        ));
     }
 
     #[test]
