@@ -9,7 +9,7 @@ final; the runner lands in v1.
 | Area | API |
 |------|-----|
 | Delegation | `SubagentRequest` (`TreeChild` / `Ephemeral`), `SubagentResult`, `Subagent` |
-| Binding | `SubagentSource`, `NoSubagents`, `MapSubagents` |
+| Dispatch | `DelegationContext`, `SubagentSource`, `NoSubagents`, `MapSubagents` |
 | Spawn | `SessionSpawner`, `SpawnBudget` |
 
 **Tool-shaped delegation:** from the parent turn's view one subagent invocation is
@@ -25,6 +25,12 @@ partials.
 carries `origin_session_id` — **not a parent**, only binding-material
 preparation for the child generation.
 
+**Per-call dispatch:** `SubagentSource` resolves each delegation from a
+`DelegationContext` (a deliberate proper subset of the request — `mode` is
+decided by the initiator, never by the resolver). Resolution may key on
+`tool_name`, `input` content, or other facts — it is **not** a per-session
+binding.
+
 **v0 boundary:** no runner, no execution. `Subagent` is implemented by
 products/adapters; `SessionSpawner` (the `TreeChild` derive port) is wired by
 `phi-ext-tree-agent` or a product; budget enforcement is the v1 runner's job.
@@ -35,7 +41,7 @@ products/adapters; `SessionSpawner` (the `TreeChild` derive port) is wired by
 |---------|--------|
 | Tool-result outcome | Kernel `ToolResultStatus` (reused; no re-encoding) |
 | `input` / `output` | Opaque `serde_json::Value` — never interpreted |
-| Subagent binding | `SubagentSource` (**binding**, not ACL — permission is product-side) |
+| Subagent dispatch | `SubagentSource` (**per-call resolver** via `DelegationContext`, not ACL — permission is product-side) |
 | `TreeChild` derive | `SessionSpawner` — v1: `phi-ext-tree-agent` / product |
 | Spawn budget enforcement | v1 runner (this crate declares `SpawnBudget` only) |
 

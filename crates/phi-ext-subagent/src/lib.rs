@@ -35,8 +35,8 @@ pub mod subagent;
 
 pub use spawn::{SessionSpawner, SpawnBudget};
 pub use subagent::{
-    EphemeralRequest, MapSubagents, NoSubagents, Subagent, SubagentRequest, SubagentResult,
-    SubagentSource, TreeChildRequest,
+    DelegationContext, EphemeralRequest, MapSubagents, NoSubagents, Subagent, SubagentRequest,
+    SubagentResult, SubagentSource, TreeChildRequest,
 };
 
 #[cfg(test)]
@@ -49,7 +49,8 @@ mod integration {
     use serde_json::json;
 
     use super::{
-        MapSubagents, Subagent, SubagentRequest, SubagentResult, SubagentSource, TreeChildRequest,
+        DelegationContext, MapSubagents, Subagent, SubagentRequest, SubagentResult, SubagentSource,
+        TreeChildRequest,
     };
 
     /// Test double: echoes the request input back as the delegation output.
@@ -71,20 +72,35 @@ mod integration {
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));
-        let subagent = source
-            .subagent_for(&ToolName::new("research"))
-            .expect("bound tool resolves");
         let req = SubagentRequest::TreeChild(TreeChildRequest {
             tool_call_id: ToolCallId::new("tc-1"),
             tool_name: ToolName::new("research"),
             input: json!({"q": "graphs"}),
             parent_session_id: SessionId::generate(),
         });
+        let SubagentRequest::TreeChild(inner) = &req else {
+            unreachable!("fixture is TreeChild")
+        };
+        let subagent = source
+            .subagent_for(&DelegationContext::new(
+                inner.tool_name.clone(),
+                inner.input.clone(),
+                inner.parent_session_id.clone(),
+            ))
+            .expect("bound tool resolves");
         let result = subagent.run(&req).await;
         assert_eq!(result.status, ToolResultStatus::Ok);
         assert_eq!(result.output, json!({"q": "graphs"}));
         // The borrowed request survives the await — correlation is never lost.
         assert_eq!(req.tool_call_id(), &ToolCallId::new("tc-1"));
-        assert!(source.subagent_for(&ToolName::new("missing")).is_none());
+        assert!(
+            source
+                .subagent_for(&DelegationContext::new(
+                    ToolName::new("missing"),
+                    json!({}),
+                    inner.parent_session_id.clone(),
+                ))
+                .is_none()
+        );
     }
 }
