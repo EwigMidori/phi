@@ -15,18 +15,21 @@ use crate::model::EdgeKind;
 ///
 /// [`crate::tree::SessionTree::derive`] emits `[NodeCreated, EdgeCreated]`
 /// (node first, so a projection can require the node before linking the edge).
-/// [`crate::tree::SessionTree::close`] emits `[NodeTombstoned]` for a soft
-/// delete or `[NodeRemoved]` for a hard remove; a no-op close emits nothing.
+/// [`crate::tree::SessionTree::remove`] and
+/// [`crate::tree::SessionTree::remove_subtree`] emit `NodeRemoved` events
+/// (remove_subtree: one per removed node, **top-down**). [`crate::tree::SessionTree::reparent`]
+/// emits `[EdgeReparented]`.
 ///
 /// Field rationale (minimal projection set): a projection must be able to (a)
-/// create a node, (b) link it to a parent with its edge kind, (c) flip a node's
-/// state, and (d) drop a removed node *and* its parent edge. The last one is why
-/// `NodeRemoved` carries `parent` — without it there would be no way to drop the
-/// edge (there is deliberately no `EdgeRemoved` event in the minimal set).
+/// create a node, (b) link it to a parent with its edge kind, (c) drop a
+/// removed node *and* its parent edge, and (d) move an existing node to a new
+/// parent with a (possibly new) edge kind. (c) is why `NodeRemoved` carries
+/// `parent` — without it there would be no way to drop the edge (there is
+/// deliberately no `EdgeRemoved` event).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TreeEvent {
-    /// A new Live node appeared (from `add_root` or `derive`).
+    /// A new node appeared (from `add_root` or `derive`).
     #[serde(rename_all = "camelCase")]
     NodeCreated {
         /// The new node.
@@ -42,14 +45,8 @@ pub enum TreeEvent {
         /// The edge kind chosen at derivation.
         kind: EdgeKind,
     },
-    /// A node became Tombstoned (close of a non-leaf; its edges stay).
-    #[serde(rename_all = "camelCase")]
-    NodeTombstoned {
-        /// The node that was soft-deleted.
-        session_id: SessionId,
-    },
-    /// A node was hard-removed with its incident edges (close of a leaf; no
-    /// cascade into the subtree — a leaf has no subtree).
+    /// A node was removed together with its parent edge (from `remove`, or
+    /// from `remove_subtree` — one event per removed node).
     #[serde(rename_all = "camelCase")]
     NodeRemoved {
         /// The removed node.
@@ -57,6 +54,18 @@ pub enum TreeEvent {
         /// The parent the node had before removal — `None` for a root — so a
         /// projection can drop the parent edge without an `EdgeRemoved` event.
         parent: Option<SessionId>,
+    },
+    /// An existing node moved to a new parent (from `reparent`).
+    #[serde(rename_all = "camelCase")]
+    EdgeReparented {
+        /// The moved node (never the root).
+        child: SessionId,
+        /// The parent the node had before the move.
+        old_parent: SessionId,
+        /// The new parent (may equal `old_parent`, which updates the kind).
+        new_parent: SessionId,
+        /// The (possibly new) edge kind for the move.
+        kind: EdgeKind,
     },
 }
 
@@ -93,15 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstoned_and_removed_events_roundtrip() {
-        let tombstoned = TreeEvent::NodeTombstoned {
-            session_id: "s1".parse().unwrap(),
-        };
-        let value = serde_json::to_value(&tombstoned).unwrap();
-        assert_eq!(value["type"], json!("nodeTombstoned"));
-        let round: TreeEvent = serde_json::from_value(value).unwrap();
-        assert_eq!(round, tombstoned);
-
+    fn node_removed_event_roundtrips() {
         let removed = TreeEvent::NodeRemoved {
             session_id: "s1".parse().unwrap(),
             parent: Some("p".parse().unwrap()),
@@ -111,5 +112,21 @@ mod tests {
         assert_eq!(value["parent"], json!("p"));
         let round: TreeEvent = serde_json::from_value(value).unwrap();
         assert_eq!(round, removed);
+    }
+
+    #[test]
+    fn edge_reparented_event_roundtrips() {
+        let event = TreeEvent::EdgeReparented {
+            child: "c".parse().unwrap(),
+            old_parent: "a".parse().unwrap(),
+            new_parent: "b".parse().unwrap(),
+            kind: EdgeKind::WithHistory,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], json!("edgeReparented"));
+        assert_eq!(value["oldParent"], json!("a"));
+        assert_eq!(value["newParent"], json!("b"));
+        let round: TreeEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(round, event);
     }
 }

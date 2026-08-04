@@ -1,8 +1,15 @@
-//! The [`SessionTree`] aggregate: topology authority + lifecycle mutations.
+//! The [`SessionTree`] aggregate: pure topology + atomic, structure-preserving
+//! operations.
 //!
 //! **Tree, not graph:** one root, every node has exactly one parent, no
-//! multi-parent / DAG / merge. `derive` always creates a new Live node from a
-//! Live parent.
+//! multi-parent / DAG / merge.
+//!
+//! **Lifecycle is outside the tree:** there is no Live/Tombstoned state and no
+//! close policy here. Products keep lifecycle out-of-band and drive it with
+//! the atomic operations ([`Self::remove`] / [`Self::remove_subtree`] /
+//! [`Self::reparent`]); the tree only guarantees that every operation preserves
+//! its structural invariants (single parent, no dangling edges, single root,
+//! reachability).
 //!
 //! **Shared state:** internally `Arc<Mutex<…>>` with `&self` methods (the
 //! kernel [`phi_kernel::SessionDirectory`] pattern). `Clone` shares one logical
@@ -21,9 +28,31 @@ use phi_kernel::SessionId;
 
 use crate::error::{Result, TreeError};
 use crate::events::TreeEvent;
-use crate::model::{EdgeKind, NodeState, ParentEdge, TreeEdge};
-use crate::policy::{CloseDisposition, ClosePolicy, NodeCloseContext};
-use crate::store::{SnapshotNode, TreeSnapshot, TreeStore};
+use crate::model::{EdgeKind, ParentEdge, TreeEdge};
+use crate::store::{TreeSnapshot, TreeStore};
+
+/// Whether `node` is a **proper** descendant of `ancestor`.
+///
+/// Walks `node`'s parent chain upwards; the acyclic-tree invariant guarantees
+/// the walk terminates at the root (returns `false`) or at `ancestor`
+/// (returns `true`). Used by [`SessionTree::reparent`] for cycle detection.
+fn is_descendant_of(
+    map: &BTreeMap<String, NodeRecord>,
+    ancestor: &SessionId,
+    node: &SessionId,
+) -> bool {
+    let mut current = node.clone();
+    while let Some(edge) = map
+        .get(current.as_str())
+        .and_then(|record| record.parent_edge.as_ref())
+    {
+        if edge.parent == *ancestor {
+            return true;
+        }
+        current = edge.parent.clone();
+    }
+    false
+}
 
 /// Internal per-node record.
 ///
@@ -39,7 +68,6 @@ use crate::store::{SnapshotNode, TreeSnapshot, TreeStore};
 #[derive(Clone, Debug)]
 struct NodeRecord {
     session_id: SessionId,
-    state: NodeState,
     parent_edge: Option<ParentEdge>,
     children: Vec<SessionId>,
 }
@@ -49,24 +77,22 @@ impl NodeRecord {
     fn root(session_id: SessionId) -> Self {
         Self {
             session_id,
-            state: NodeState::Live,
             parent_edge: None,
             children: Vec::new(),
         }
     }
 
-    /// A fresh Live child record carrying its incoming edge.
+    /// A fresh child record carrying its incoming edge.
     fn child(session_id: SessionId, parent: SessionId, kind: EdgeKind) -> Self {
         Self {
             session_id,
-            state: NodeState::Live,
             parent_edge: Some(ParentEdge::new(parent, kind)),
             children: Vec::new(),
         }
     }
 }
 
-/// The session tree aggregate: topology authority + lifecycle mutations.
+/// The session tree aggregate: pure topology + atomic operations.
 ///
 /// **Why `Arc<Mutex<…>>` + `&self` instead of a plain `&mut` struct:** the
 /// kernel's [`phi_kernel::SessionDirectory`] sets the precedent, and v1 search
@@ -78,31 +104,32 @@ impl NodeRecord {
 /// [`Self::snapshot`] emits nodes and edges in a stable, deterministic order
 /// (equal trees produce equal snapshots, which tests and diffs can rely on).
 ///
+/// **Design decision (audit-confirmed):** an early draft had a public
+/// `TreeNode { session_id, state }` entity. The implementation converged on a
+/// **private** `NodeRecord` inside the aggregate with projection through the
+/// accessors — a public entity would repeat `session_id` both in the entity and
+/// in every query parameter.
+///
 /// Construct with [`Self::open`]; mutate with [`Self::add_root`],
-/// [`Self::derive`], [`Self::close`]; read with the accessor methods; persist
-/// explicitly via [`Self::persist`].
+/// [`Self::derive`], [`Self::remove`], [`Self::remove_subtree`],
+/// [`Self::reparent`]; read with the accessor methods; persist explicitly via
+/// [`Self::persist`].
 #[derive(Clone)]
 pub struct SessionTree {
     /// Node id string → record (`BTreeMap` for deterministic snapshot order).
     nodes: Arc<Mutex<BTreeMap<String, NodeRecord>>>,
     /// Injected persistence port: loaded at `open`, written by `persist`.
     store: Arc<dyn TreeStore>,
-    /// Injected close strategy (explicit at construction; never a default).
-    close_policy: Arc<dyn ClosePolicy>,
 }
 
 impl SessionTree {
     /// Open (or create) the tree: when the injected store holds a snapshot it
     /// is loaded and validated, otherwise the tree starts empty. Named `open`
     /// because loading is unconditional behavior here, not a purely-fresh `new`.
-    ///
-    /// `close_policy` is injected at this point — explicit construction, no
-    /// [`Default`] (a missing policy is a caller bug, not a silent fallback).
-    pub fn open(store: Arc<dyn TreeStore>, close_policy: Arc<dyn ClosePolicy>) -> Result<Self> {
+    pub fn open(store: Arc<dyn TreeStore>) -> Result<Self> {
         let tree = Self {
             nodes: Arc::new(Mutex::new(BTreeMap::new())),
             store,
-            close_policy,
         };
         if let Some(snapshot) = tree.store.load()? {
             snapshot.validate()?;
@@ -127,12 +154,11 @@ impl SessionTree {
     /// is lossless.
     fn rebuild_from(&self, snapshot: &TreeSnapshot) {
         let mut map = self.lock();
-        for node in &snapshot.nodes {
+        for id in &snapshot.nodes {
             map.insert(
-                node.session_id.as_str().to_owned(),
+                id.as_str().to_owned(),
                 NodeRecord {
-                    session_id: node.session_id.clone(),
-                    state: node.state,
+                    session_id: id.clone(),
                     parent_edge: None,
                     children: Vec::new(),
                 },
@@ -151,11 +177,6 @@ impl SessionTree {
     }
 
     /// Create the root node (no parent).
-    ///
-    /// The caller supplies the id because the root is usually a session that
-    /// **pre-exists the tree** (already created in the kernel / product store)
-    /// and must stay addressable by that id — unlike [`Self::derive`], which
-    /// mints a brand-new child id.
     ///
     /// Duplicates are **loud errors, not silent no-ops**: an id already in the
     /// tree fails with `NodeAlreadyExists`, and any other id when a root exists
@@ -181,13 +202,14 @@ impl SessionTree {
         }])
     }
 
-    /// Derive a new Live child from a Live parent.
+    /// Derive a new child from an existing parent.
     ///
     /// The tree **generates** the new id via [`SessionId::generate`] rather
     /// than taking it from the caller: callers cannot inject a duplicate or
     /// pre-existing id, and the id policy lives in exactly one place (the
-    /// aggregate). The parent must exist and be Live; the `kind` parameter is
-    /// explicit (no default history behavior).
+    /// aggregate). The parent must **exist** (`NodeNotFound` otherwise) — the
+    /// tree is pure topology, so any existing node can be derived from;
+    /// lifecycle decisions are the product's.
     ///
     /// Emits `[NodeCreated, EdgeCreated]` (node first).
     pub fn derive(
@@ -196,11 +218,8 @@ impl SessionTree {
         kind: EdgeKind,
     ) -> Result<(SessionId, Vec<TreeEvent>)> {
         let mut map = self.lock();
-        let parent_record = map
-            .get(parent.as_str())
-            .ok_or_else(|| TreeError::NodeNotFound(parent.to_string()))?;
-        if parent_record.state != NodeState::Live {
-            return Err(TreeError::NodeNotLive(parent.to_string()));
+        if !map.contains_key(parent.as_str()) {
+            return Err(TreeError::NodeNotFound(parent.to_string()));
         }
         let child = SessionId::generate();
         map.insert(
@@ -224,85 +243,171 @@ impl SessionTree {
         Ok((child, events))
     }
 
-    /// Close a node according to the injected [`ClosePolicy`].
+    /// Remove a **leaf** node together with its parent edge.
     ///
-    /// The tree resolves topology facts (leaf-ness) and hands them to the
-    /// policy via [`NodeCloseContext`], then enforces its invariants on the
-    /// policy's answer: `HardRemove` is honored for leaves only — removing a
-    /// non-leaf would orphan its children, so the tree refuses with
-    /// `CloseRefused` no matter what the policy asked. A close that changes
-    /// nothing (an already-Tombstoned non-leaf) emits no events.
+    /// Structure-preserving: a non-leaf has children that would be orphaned
+    /// (dangling edges), so removal is refused with `WouldOrphan` — use
+    /// [`Self::remove_subtree`] for an explicit cascade.
     ///
-    /// Emits `[NodeTombstoned]` or `[NodeRemoved]`.
-    pub fn close(&self, session_id: &SessionId) -> Result<Vec<TreeEvent>> {
+    /// Emits `[NodeRemoved]`.
+    pub fn remove(&self, session_id: &SessionId) -> Result<Vec<TreeEvent>> {
         let mut map = self.lock();
-        let (state, is_leaf) = {
-            let node = map
-                .get(session_id.as_str())
-                .ok_or_else(|| TreeError::NodeNotFound(session_id.to_string()))?;
-            (node.state, node.children.is_empty())
-        };
-        match self
-            .close_policy
-            .disposition(&NodeCloseContext::new(state, is_leaf))
-        {
-            CloseDisposition::Tombstone => {
-                if state == NodeState::Tombstoned {
-                    // Already soft-deleted: no change → no event.
-                    return Ok(Vec::new());
-                }
-                let node = map
-                    .get_mut(session_id.as_str())
-                    .expect("node existence checked above");
-                node.state = NodeState::Tombstoned;
-                Ok(vec![TreeEvent::NodeTombstoned {
-                    session_id: session_id.clone(),
-                }])
-            }
-            CloseDisposition::HardRemove => {
-                if !is_leaf {
-                    return Err(TreeError::CloseRefused(format!(
-                        "hard remove of a non-leaf would orphan its children: {session_id}"
-                    )));
-                }
-                let parent = map
-                    .get(session_id.as_str())
-                    .expect("node existence checked above")
-                    .parent_edge
-                    .as_ref()
-                    .map(|edge| edge.parent.clone());
-                map.remove(session_id.as_str());
-                if let Some(p) = parent.as_ref() {
-                    map.get_mut(p.as_str())
-                        .expect("a node's parent is always present")
-                        .children
-                        .retain(|c| c != session_id);
-                }
-                Ok(vec![TreeEvent::NodeRemoved {
-                    session_id: session_id.clone(),
-                    parent,
-                }])
-            }
+        let node = map
+            .get(session_id.as_str())
+            .ok_or_else(|| TreeError::NodeNotFound(session_id.to_string()))?;
+        if !node.children.is_empty() {
+            return Err(TreeError::WouldOrphan(session_id.to_string()));
         }
+        let parent = node.parent_edge.as_ref().map(|edge| edge.parent.clone());
+        map.remove(session_id.as_str());
+        if let Some(p) = parent.as_ref() {
+            map.get_mut(p.as_str())
+                .expect("a node's parent is always present")
+                .children
+                .retain(|c| c != session_id);
+        }
+        Ok(vec![TreeEvent::NodeRemoved {
+            session_id: session_id.clone(),
+            parent,
+        }])
     }
 
-    /// The node's current state.
+    /// Remove a node and **all of its descendants** atomically (single lock).
     ///
-    /// A missing node is an error (`NodeNotFound`), so callers that only want
-    /// existence can test with `node(...).is_ok()`.
-    pub fn node(&self, session_id: &SessionId) -> Result<NodeState> {
-        self.lock()
+    /// Emits one `[NodeRemoved]` per removed node in **top-down** order
+    /// (parents before their children, children in derivation order), each
+    /// carrying its pre-removal parent — `None` for the tree root.
+    pub fn remove_subtree(&self, session_id: &SessionId) -> Result<Vec<TreeEvent>> {
+        let mut map = self.lock();
+        if !map.contains_key(session_id.as_str()) {
+            return Err(TreeError::NodeNotFound(session_id.to_string()));
+        }
+        // Detach the subtree root from its parent first: internal parents are
+        // removed along with their children, so only this edge survives cleanup.
+        let root_parent = map
             .get(session_id.as_str())
-            .map(|node| node.state)
-            .ok_or_else(|| TreeError::NodeNotFound(session_id.to_string()))
+            .expect("existence checked above")
+            .parent_edge
+            .as_ref()
+            .map(|edge| edge.parent.clone());
+        if let Some(p) = root_parent.as_ref() {
+            map.get_mut(p.as_str())
+                .expect("the subtree root's parent is outside the subtree")
+                .children
+                .retain(|c| c != session_id);
+        }
+        // Collect the subtree top-down (BFS over the children lists).
+        let mut order = vec![session_id.clone()];
+        let mut cursor = 0;
+        while cursor < order.len() {
+            let node = map
+                .get(order[cursor].as_str())
+                .expect("subtree members exist until removed");
+            order.extend(node.children.iter().cloned());
+            cursor += 1;
+        }
+        // Emit one NodeRemoved per node, top-down, each with its pre-removal parent.
+        let mut events = Vec::with_capacity(order.len());
+        for id in &order {
+            let parent = map
+                .get(id.as_str())
+                .expect("subtree members exist until removed")
+                .parent_edge
+                .as_ref()
+                .map(|edge| edge.parent.clone());
+            map.remove(id.as_str());
+            events.push(TreeEvent::NodeRemoved {
+                session_id: id.clone(),
+                parent,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Move an existing non-root node to a new parent (structure preserving).
+    ///
+    /// The move is rejected when it would break invariants, in this check
+    /// order: missing operand → `NodeNotFound`; the child is the root →
+    /// `CannotReparentRoot` (the root has no parent by definition); the new
+    /// parent is the child itself or a descendant of it → `WouldCycle` (a
+    /// self-loop or an ancestor cycle). The child's incoming edge becomes
+    /// `(new_parent, kind)`; the new parent's children list grows at the end
+    /// (derivation order preserved). Reparenting to the node's **current**
+    /// parent is allowed and acts as an edge-kind update.
+    ///
+    /// Emits `[EdgeReparented]`.
+    pub fn reparent(
+        &self,
+        child: &SessionId,
+        new_parent: &SessionId,
+        kind: EdgeKind,
+    ) -> Result<Vec<TreeEvent>> {
+        let mut map = self.lock();
+        if !map.contains_key(child.as_str()) {
+            return Err(TreeError::NodeNotFound(child.to_string()));
+        }
+        if !map.contains_key(new_parent.as_str()) {
+            return Err(TreeError::NodeNotFound(new_parent.to_string()));
+        }
+        if map
+            .get(child.as_str())
+            .expect("existence checked above")
+            .parent_edge
+            .is_none()
+        {
+            return Err(TreeError::CannotReparentRoot(child.to_string()));
+        }
+        if new_parent == child {
+            return Err(TreeError::WouldCycle(format!(
+                "{child} would become its own parent"
+            )));
+        }
+        if is_descendant_of(&map, child, new_parent) {
+            return Err(TreeError::WouldCycle(format!(
+                "{new_parent} is inside {child}'s subtree"
+            )));
+        }
+        let old_parent = map
+            .get(child.as_str())
+            .expect("existence checked above")
+            .parent_edge
+            .as_ref()
+            .expect("non-root node always carries its parent edge")
+            .parent
+            .clone();
+        map.get_mut(old_parent.as_str())
+            .expect("a node's parent is always present")
+            .children
+            .retain(|c| c != child);
+        map.get_mut(child.as_str())
+            .expect("existence checked above")
+            .parent_edge = Some(ParentEdge::new(new_parent.clone(), kind));
+        map.get_mut(new_parent.as_str())
+            .expect("existence checked above")
+            .children
+            .push(child.clone());
+        Ok(vec![TreeEvent::EdgeReparented {
+            child: child.clone(),
+            old_parent,
+            new_parent: new_parent.clone(),
+            kind,
+        }])
+    }
+
+    /// Whether the node exists. Never errors — after the removal of the
+    /// state-returning `node()` accessor, callers use this for existence
+    /// checks.
+    #[must_use]
+    pub fn contains(&self, session_id: &SessionId) -> bool {
+        self.lock().contains_key(session_id.as_str())
     }
 
     /// The node's incoming edge: its parent and the edge kind; `None` for the
     /// root.
     ///
-    /// Replaces a bare-parent accessor: in a single-parent tree the parent and
-    /// the edge kind are **one fact** (they co-occur by construction), so one
-    /// call returns the complete fact — the kind was not queryable before.
+    /// In a single-parent tree the parent and the edge kind are **one fact**
+    /// (they co-occur by construction), so one call returns the complete fact —
+    /// the kind was not queryable before this accessor existed.
     ///
     /// A missing node is an error (`NodeNotFound`).
     pub fn incoming_edge(&self, session_id: &SessionId) -> Result<Option<ParentEdge>> {
@@ -343,8 +448,7 @@ impl SessionTree {
         }
     }
 
-    /// Whether the node currently has no children (purely topological — a
-    /// Tombstoned node with no children is still a leaf).
+    /// Whether the node currently has no children (purely topological).
     ///
     /// A missing node is an error (`NodeNotFound`).
     pub fn is_leaf(&self, session_id: &SessionId) -> Result<bool> {
@@ -363,7 +467,7 @@ impl SessionTree {
             .map(|node| node.session_id.clone()))
     }
 
-    /// Current full state as a snapshot (nodes + edges), ready for
+    /// Current full state as a snapshot (node ids + edges), ready for
     /// [`TreeStore::save`].
     ///
     /// Deterministic: nodes are emitted in ascending id order and edges grouped
@@ -372,13 +476,7 @@ impl SessionTree {
     #[must_use]
     pub fn snapshot(&self) -> TreeSnapshot {
         let map = self.lock();
-        let nodes = map
-            .values()
-            .map(|node| SnapshotNode {
-                session_id: node.session_id.clone(),
-                state: node.state,
-            })
-            .collect();
+        let nodes = map.values().map(|node| node.session_id.clone()).collect();
         let edges = map
             .values()
             .flat_map(|parent| {
@@ -433,33 +531,22 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::policy::StandardClosePolicy;
     use crate::store::InMemoryTreeStore;
-
-    /// Always-hard-remove policy, to prove the tree enforces invariants
-    /// against custom policies.
-    struct AlwaysHardRemove;
-
-    impl ClosePolicy for AlwaysHardRemove {
-        fn disposition(&self, _ctx: &NodeCloseContext) -> CloseDisposition {
-            CloseDisposition::HardRemove
-        }
-    }
 
     fn new_store() -> Arc<dyn TreeStore> {
         Arc::new(InMemoryTreeStore::new())
     }
 
-    fn standard() -> Arc<dyn ClosePolicy> {
-        Arc::new(StandardClosePolicy)
+    fn tree() -> SessionTree {
+        SessionTree::open(new_store()).unwrap()
     }
 
-    fn tree() -> SessionTree {
-        SessionTree::open(new_store(), standard()).unwrap()
+    fn assert_valid(t: &SessionTree) {
+        t.snapshot().validate().expect("snapshot stays valid");
     }
 
     #[test]
-    fn add_root_creates_a_live_root_without_parent() {
+    fn add_root_creates_a_root_without_parent() {
         let t = tree();
         let root = SessionId::generate();
         assert_eq!(
@@ -468,12 +555,13 @@ mod tests {
                 session_id: root.clone()
             }]
         );
-        assert_eq!(t.node(&root).unwrap(), NodeState::Live);
+        assert!(t.contains(&root));
         assert_eq!(t.incoming_edge(&root).unwrap(), None);
         assert!(t.children(&root).unwrap().is_empty());
         assert!(t.is_leaf(&root).unwrap());
         assert_eq!(t.path_to_root(&root).unwrap(), vec![root.clone()]);
         assert_eq!(t.root().unwrap(), Some(root));
+        assert_valid(&t);
     }
 
     #[test]
@@ -497,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_creates_a_live_child_under_a_live_parent() {
+    fn derive_creates_a_child_under_an_existing_parent() {
         let t = tree();
         let root = SessionId::generate();
         t.add_root(&root).unwrap();
@@ -515,7 +603,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(t.node(&child).unwrap(), NodeState::Live);
+        assert!(t.contains(&child));
         assert_eq!(
             t.incoming_edge(&child).unwrap(),
             Some(ParentEdge::new(root.clone(), EdgeKind::WithHistory))
@@ -551,175 +639,266 @@ mod tests {
     }
 
     #[test]
-    fn derive_from_a_tombstoned_parent_fails() {
-        let t = tree();
-        let root = SessionId::generate();
-        t.add_root(&root).unwrap();
-        let child = t.derive(&root, EdgeKind::WithoutHistory).unwrap().0;
-        // The root is now a non-leaf: closing it tombstones it.
-        t.close(&root).unwrap();
-        assert_eq!(t.node(&root).unwrap(), NodeState::Tombstoned);
-        assert!(matches!(
-            t.derive(&root, EdgeKind::WithHistory),
-            Err(TreeError::NodeNotLive(_))
-        ));
-        // The existing subtree is untouched.
-        assert_eq!(
-            t.incoming_edge(&child).unwrap(),
-            Some(ParentEdge::new(root.clone(), EdgeKind::WithoutHistory))
-        );
-    }
-
-    #[test]
-    fn close_a_leaf_hard_removes_it_and_its_edge() {
+    fn remove_a_leaf_removes_the_node_and_its_edge() {
         let t = tree();
         let root = SessionId::generate();
         t.add_root(&root).unwrap();
         let child = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
 
         assert_eq!(
-            t.close(&child).unwrap(),
+            t.remove(&child).unwrap(),
             vec![TreeEvent::NodeRemoved {
                 session_id: child.clone(),
                 parent: Some(root.clone()),
             }]
         );
-        // The node is gone and accessors now error.
-        assert!(matches!(t.node(&child), Err(TreeError::NodeNotFound(_))));
+        assert!(!t.contains(&child));
         assert!(matches!(
             t.incoming_edge(&child),
             Err(TreeError::NodeNotFound(_))
         ));
-        // The parent no longer lists it and the snapshot has no dangling edge.
         assert!(t.children(&root).unwrap().is_empty());
+        // No dangling edges in the snapshot.
         let snap = t.snapshot();
-        assert!(!snap.nodes.iter().any(|n| n.session_id == child));
+        assert!(!snap.nodes.iter().any(|id| id == &child));
         assert!(!snap.edges.iter().any(|e| e.child == child));
+        assert_valid(&t);
     }
 
     #[test]
-    fn close_a_non_leaf_tombstones_it_and_keeps_the_subtree_connected() {
+    fn remove_a_non_leaf_is_refused() {
         let t = tree();
         let root = SessionId::generate();
         t.add_root(&root).unwrap();
-        let branch = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
-        let leaf = t.derive(&branch, EdgeKind::WithoutHistory).unwrap().0;
-
-        assert_eq!(
-            t.close(&branch).unwrap(),
-            vec![TreeEvent::NodeTombstoned {
-                session_id: branch.clone()
-            }]
-        );
-        assert_eq!(t.node(&branch).unwrap(), NodeState::Tombstoned);
-        // Soft delete keeps the topology: the leaf is still reachable.
-        assert_eq!(t.children(&branch).unwrap(), vec![leaf.clone()]);
-        assert_eq!(
-            t.incoming_edge(&leaf).unwrap(),
-            Some(ParentEdge::new(branch.clone(), EdgeKind::WithoutHistory))
-        );
-        assert_eq!(
-            t.path_to_root(&leaf).unwrap(),
-            vec![leaf.clone(), branch.clone(), root.clone()]
-        );
-        assert_eq!(t.snapshot().edges.len(), 2);
+        let _child = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        assert!(matches!(t.remove(&root), Err(TreeError::WouldOrphan(_))));
+        // Nothing changed.
+        assert!(t.contains(&root));
+        assert_eq!(t.children(&root).unwrap().len(), 1);
+        assert_valid(&t);
     }
 
     #[test]
-    fn close_an_already_tombstoned_non_leaf_is_a_noop_without_events() {
+    fn remove_a_missing_node_errors() {
         let t = tree();
-        let root = SessionId::generate();
-        t.add_root(&root).unwrap();
-        let branch = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
-        let _leaf = t.derive(&branch, EdgeKind::WithHistory).unwrap().0;
-        t.close(&branch).unwrap();
-        // Closing again changes nothing → no ghost event.
-        assert_eq!(t.close(&branch).unwrap(), Vec::<TreeEvent>::new());
-        assert_eq!(t.node(&branch).unwrap(), NodeState::Tombstoned);
-        assert_eq!(t.children(&branch).unwrap().len(), 1);
+        let ghost = SessionId::generate();
+        assert!(matches!(t.remove(&ghost), Err(TreeError::NodeNotFound(_))));
     }
 
     #[test]
-    fn a_tombstoned_leaf_is_hard_removed_on_close() {
+    fn remove_subtree_cascades_in_top_down_order() {
         let t = tree();
         let root = SessionId::generate();
         t.add_root(&root).unwrap();
-        let branch = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
-        let leaf = t.derive(&branch, EdgeKind::WithHistory).unwrap().0;
+        let first_branch = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        let second_branch = t.derive(&root, EdgeKind::WithoutHistory).unwrap().0;
+        let left_leaf = t.derive(&first_branch, EdgeKind::WithHistory).unwrap().0;
+        let right_leaf = t.derive(&first_branch, EdgeKind::WithoutHistory).unwrap().0;
+        let lower_leaf = t.derive(&second_branch, EdgeKind::WithHistory).unwrap().0;
 
-        // Tombstone the non-leaf branch, then remove its live leaf child.
-        t.close(&branch).unwrap();
-        t.close(&leaf).unwrap();
-        // The branch is now a Tombstoned leaf → closing hard-removes it.
-        assert_eq!(t.node(&branch).unwrap(), NodeState::Tombstoned);
         assert_eq!(
-            t.close(&branch).unwrap(),
-            vec![TreeEvent::NodeRemoved {
-                session_id: branch.clone(),
-                parent: Some(root.clone()),
-            }]
+            t.remove_subtree(&first_branch).unwrap(),
+            vec![
+                TreeEvent::NodeRemoved {
+                    session_id: first_branch.clone(),
+                    parent: Some(root.clone()),
+                },
+                TreeEvent::NodeRemoved {
+                    session_id: left_leaf.clone(),
+                    parent: Some(first_branch.clone()),
+                },
+                TreeEvent::NodeRemoved {
+                    session_id: right_leaf.clone(),
+                    parent: Some(first_branch.clone()),
+                },
+            ]
         );
-        assert!(matches!(t.node(&branch), Err(TreeError::NodeNotFound(_))));
-        assert!(t.children(&root).unwrap().is_empty());
+        // first_branch and its descendants are gone; second_branch's subtree is untouched.
+        assert!(!t.contains(&first_branch));
+        assert!(!t.contains(&left_leaf));
+        assert!(!t.contains(&right_leaf));
+        assert!(t.contains(&second_branch));
+        assert!(t.contains(&lower_leaf));
+        assert_eq!(t.children(&root).unwrap(), vec![second_branch.clone()]);
+        assert_valid(&t);
     }
 
     #[test]
-    fn closing_the_root_leaf_empties_the_tree_and_allows_a_new_root() {
+    fn remove_subtree_of_the_root_empties_the_tree() {
         let t = tree();
         let root = SessionId::generate();
         t.add_root(&root).unwrap();
+        let a = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        let leaf = t.derive(&a, EdgeKind::WithoutHistory).unwrap().0;
+
         assert_eq!(
-            t.close(&root).unwrap(),
-            vec![TreeEvent::NodeRemoved {
-                session_id: root.clone(),
-                parent: None,
-            }]
+            t.remove_subtree(&root).unwrap(),
+            vec![
+                TreeEvent::NodeRemoved {
+                    session_id: root.clone(),
+                    parent: None,
+                },
+                TreeEvent::NodeRemoved {
+                    session_id: a.clone(),
+                    parent: Some(root.clone()),
+                },
+                TreeEvent::NodeRemoved {
+                    session_id: leaf.clone(),
+                    parent: Some(a.clone()),
+                },
+            ]
         );
         assert_eq!(t.root().unwrap(), None);
         assert!(t.snapshot().nodes.is_empty());
+        // The tree can host a new root again.
         let new_root = SessionId::generate();
         t.add_root(&new_root).unwrap();
         assert_eq!(t.root().unwrap(), Some(new_root));
     }
 
     #[test]
-    fn close_of_a_missing_node_errors() {
+    fn remove_subtree_of_a_leaf_is_single_removal() {
         let t = tree();
-        let ghost = SessionId::generate();
-        assert!(matches!(t.close(&ghost), Err(TreeError::NodeNotFound(_))));
-    }
-
-    #[test]
-    fn accessors_error_for_missing_nodes() {
-        let t = tree();
-        let ghost = SessionId::generate();
-        assert!(matches!(t.node(&ghost), Err(TreeError::NodeNotFound(_))));
-        assert!(matches!(
-            t.incoming_edge(&ghost),
-            Err(TreeError::NodeNotFound(_))
-        ));
-        assert!(matches!(
-            t.children(&ghost),
-            Err(TreeError::NodeNotFound(_))
-        ));
-        assert!(matches!(t.is_leaf(&ghost), Err(TreeError::NodeNotFound(_))));
-        assert!(matches!(
-            t.path_to_root(&ghost),
-            Err(TreeError::NodeNotFound(_))
-        ));
-    }
-
-    #[test]
-    fn hard_remove_of_a_non_leaf_is_refused_even_for_custom_policies() {
-        let store = new_store();
-        let t = SessionTree::open(store, Arc::new(AlwaysHardRemove)).unwrap();
         let root = SessionId::generate();
         t.add_root(&root).unwrap();
         let child = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
-        // Non-leaf hard remove would orphan the subtree → the tree refuses.
-        assert!(matches!(t.close(&root), Err(TreeError::CloseRefused(_))));
-        // Leaf hard remove is honored.
-        assert_eq!(t.close(&child).unwrap().len(), 1);
+        assert_eq!(
+            t.remove_subtree(&child).unwrap(),
+            vec![TreeEvent::NodeRemoved {
+                session_id: child.clone(),
+                parent: Some(root.clone()),
+            }]
+        );
+        assert!(t.children(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_subtree_of_a_missing_node_errors() {
+        let t = tree();
+        let ghost = SessionId::generate();
+        assert!(matches!(
+            t.remove_subtree(&ghost),
+            Err(TreeError::NodeNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn reparent_moves_a_child_and_updates_edges() {
+        let t = tree();
+        let root = SessionId::generate();
+        t.add_root(&root).unwrap();
+        let a = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        let b = t.derive(&root, EdgeKind::WithoutHistory).unwrap().0;
+        let x = t.derive(&a, EdgeKind::WithHistory).unwrap().0;
+
+        assert_eq!(
+            t.reparent(&x, &b, EdgeKind::WithoutHistory).unwrap(),
+            vec![TreeEvent::EdgeReparented {
+                child: x.clone(),
+                old_parent: a.clone(),
+                new_parent: b.clone(),
+                kind: EdgeKind::WithoutHistory,
+            }]
+        );
+        assert_eq!(
+            t.incoming_edge(&x).unwrap(),
+            Some(ParentEdge::new(b.clone(), EdgeKind::WithoutHistory))
+        );
+        assert!(t.children(&a).unwrap().is_empty());
+        assert_eq!(t.children(&b).unwrap(), vec![x.clone()]);
+        assert_eq!(
+            t.path_to_root(&x).unwrap(),
+            vec![x.clone(), b.clone(), root.clone()]
+        );
+        assert_valid(&t);
+    }
+
+    #[test]
+    fn reparent_appends_to_the_new_parents_children() {
+        let t = tree();
+        let root = SessionId::generate();
+        t.add_root(&root).unwrap();
+        let a = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        let b = t.derive(&root, EdgeKind::WithoutHistory).unwrap().0;
+        let b1 = t.derive(&b, EdgeKind::WithHistory).unwrap().0;
+        let x = t.derive(&a, EdgeKind::WithHistory).unwrap().0;
+
+        t.reparent(&x, &b, EdgeKind::WithoutHistory).unwrap();
+        // The moved child is appended at the end of the new parent's list.
+        assert_eq!(t.children(&b).unwrap(), vec![b1.clone(), x.clone()]);
+    }
+
+    #[test]
+    fn reparent_to_the_current_parent_updates_the_edge_kind() {
+        let t = tree();
+        let root = SessionId::generate();
+        t.add_root(&root).unwrap();
+        let child = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        t.reparent(&child, &root, EdgeKind::WithoutHistory).unwrap();
+        assert_eq!(
+            t.incoming_edge(&child).unwrap(),
+            Some(ParentEdge::new(root.clone(), EdgeKind::WithoutHistory))
+        );
+        assert_eq!(t.children(&root).unwrap(), vec![child.clone()]);
+    }
+
+    #[test]
+    fn reparent_the_root_is_refused() {
+        let t = tree();
+        let root = SessionId::generate();
+        t.add_root(&root).unwrap();
+        let child = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        assert!(matches!(
+            t.reparent(&root, &child, EdgeKind::WithHistory),
+            Err(TreeError::CannotReparentRoot(_))
+        ));
+        // Nothing changed.
+        assert_eq!(t.path_to_root(&child).unwrap(), vec![child, root]);
+    }
+
+    #[test]
+    fn reparent_to_itself_is_refused() {
+        let t = tree();
+        let root = SessionId::generate();
+        t.add_root(&root).unwrap();
+        let child = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        assert!(matches!(
+            t.reparent(&child, &child, EdgeKind::WithHistory),
+            Err(TreeError::WouldCycle(_))
+        ));
+        assert!(t.contains(&child));
+    }
+
+    #[test]
+    fn reparent_into_its_own_subtree_is_refused() {
+        let t = tree();
+        let root = SessionId::generate();
+        t.add_root(&root).unwrap();
+        let a = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        let x = t.derive(&a, EdgeKind::WithHistory).unwrap().0;
+        // Reparent `a` under its own descendant `x` would create a cycle.
+        assert!(matches!(
+            t.reparent(&a, &x, EdgeKind::WithHistory),
+            Err(TreeError::WouldCycle(_))
+        ));
+        assert_eq!(t.path_to_root(&x).unwrap(), vec![x, a, root]);
+    }
+
+    #[test]
+    fn reparent_with_missing_operands_errors() {
+        let t = tree();
+        let root = SessionId::generate();
+        t.add_root(&root).unwrap();
+        let child = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        let ghost = SessionId::generate();
+        assert!(matches!(
+            t.reparent(&ghost, &root, EdgeKind::WithHistory),
+            Err(TreeError::NodeNotFound(_))
+        ));
+        assert!(matches!(
+            t.reparent(&child, &ghost, EdgeKind::WithHistory),
+            Err(TreeError::NodeNotFound(_))
+        ));
     }
 
     #[test]
@@ -727,62 +906,72 @@ mod tests {
         let t = tree();
         let root = SessionId::generate();
         t.add_root(&root).unwrap();
-        let branch_a = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
-        let branch_b = t.derive(&root, EdgeKind::WithoutHistory).unwrap().0;
-        let leaf = t.derive(&branch_a, EdgeKind::WithHistory).unwrap().0;
-        let ids = [root.clone(), branch_a.clone(), branch_b, leaf];
-        for (step, id) in ids.iter().enumerate() {
-            t.close(id).unwrap();
-            assert!(
-                t.snapshot().validate().is_ok(),
-                "snapshot must stay valid after step {step}"
-            );
-        }
-        // Soft delete kept the subtree connected: root(T) still holds branch_a(T).
-        assert_eq!(t.snapshot().nodes.len(), 2);
-        assert_eq!(t.snapshot().edges.len(), 1);
-        assert_eq!(t.node(&branch_a).unwrap(), NodeState::Tombstoned);
-        // Tombstoned leaves are hard-removed by a later close, emptying the tree.
-        t.close(&branch_a).unwrap();
-        assert!(t.snapshot().validate().is_ok());
-        t.close(&root).unwrap();
-        assert!(t.snapshot().validate().is_ok());
+        let first_branch = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        let second_branch = t.derive(&root, EdgeKind::WithoutHistory).unwrap().0;
+        let left_leaf = t.derive(&first_branch, EdgeKind::WithHistory).unwrap().0;
+        let right_leaf = t.derive(&first_branch, EdgeKind::WithoutHistory).unwrap().0;
+        assert_valid(&t);
+
+        t.remove(&left_leaf).unwrap();
+        assert_valid(&t);
+        // Failed remove changes nothing.
+        assert!(matches!(
+            t.remove(&first_branch),
+            Err(TreeError::WouldOrphan(_))
+        ));
+        assert_valid(&t);
+        // Failed reparent changes nothing.
+        assert!(matches!(
+            t.reparent(&first_branch, &right_leaf, EdgeKind::WithHistory),
+            Err(TreeError::WouldCycle(_))
+        ));
+        assert_valid(&t);
+
+        t.reparent(&first_branch, &second_branch, EdgeKind::WithHistory)
+            .unwrap();
+        assert_valid(&t);
+        t.remove(&right_leaf).unwrap();
+        assert_valid(&t);
+        t.remove_subtree(&second_branch).unwrap();
+        assert_valid(&t);
+        t.remove(&root).unwrap();
+        assert_valid(&t);
+
         assert!(t.snapshot().nodes.is_empty());
     }
 
     #[test]
     fn persist_and_reopen_roundtrips_the_tree() {
         let store = new_store();
-        let t = SessionTree::open(store.clone(), standard()).unwrap();
+        let t = SessionTree::open(store.clone()).unwrap();
         let root = SessionId::generate();
         t.add_root(&root).unwrap();
-        let branch = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
-        let leaf = t.derive(&branch, EdgeKind::WithoutHistory).unwrap().0;
-        t.close(&branch).unwrap(); // tombstone; the subtree is kept
+        let a = t.derive(&root, EdgeKind::WithHistory).unwrap().0;
+        let b = t.derive(&root, EdgeKind::WithoutHistory).unwrap().0;
+        let x = t.derive(&a, EdgeKind::WithHistory).unwrap().0;
+        t.reparent(&x, &b, EdgeKind::WithoutHistory).unwrap();
+        t.remove(&a).unwrap();
         t.persist().unwrap();
 
-        let reopened = SessionTree::open(store, standard()).unwrap();
+        let reopened = SessionTree::open(store).unwrap();
         assert_eq!(reopened.snapshot(), t.snapshot());
         assert_eq!(reopened.root().unwrap(), Some(root.clone()));
-        assert_eq!(reopened.node(&branch).unwrap(), NodeState::Tombstoned);
-        assert_eq!(reopened.children(&branch).unwrap(), vec![leaf.clone()]);
+        assert_eq!(reopened.children(&root).unwrap(), vec![b.clone()]);
+        assert_eq!(reopened.children(&b).unwrap(), vec![x.clone()]);
         assert_eq!(
-            reopened.incoming_edge(&leaf).unwrap(),
-            Some(ParentEdge::new(branch.clone(), EdgeKind::WithoutHistory))
+            reopened.incoming_edge(&x).unwrap(),
+            Some(ParentEdge::new(b.clone(), EdgeKind::WithoutHistory))
         );
-        assert_eq!(
-            reopened.path_to_root(&leaf).unwrap(),
-            vec![leaf.clone(), branch, root]
-        );
+        assert_eq!(reopened.path_to_root(&x).unwrap(), vec![x, b, root]);
     }
 
     #[test]
     fn persist_and_reopen_an_empty_tree() {
         let store = new_store();
-        let t = SessionTree::open(store.clone(), standard()).unwrap();
+        let t = SessionTree::open(store.clone()).unwrap();
         assert_eq!(t.root().unwrap(), None);
         t.persist().unwrap();
-        let reopened = SessionTree::open(store, standard()).unwrap();
+        let reopened = SessionTree::open(store).unwrap();
         assert_eq!(reopened.root().unwrap(), None);
         let root = SessionId::generate();
         reopened.add_root(&root).unwrap();
@@ -794,18 +983,9 @@ mod tests {
         let store = new_store();
         let snapshot = TreeSnapshot {
             nodes: vec![
-                SnapshotNode {
-                    session_id: "root".parse().unwrap(),
-                    state: NodeState::Live,
-                },
-                SnapshotNode {
-                    session_id: "branch".parse().unwrap(),
-                    state: NodeState::Tombstoned,
-                },
-                SnapshotNode {
-                    session_id: "leaf".parse().unwrap(),
-                    state: NodeState::Live,
-                },
+                "root".parse().unwrap(),
+                "branch".parse().unwrap(),
+                "leaf".parse().unwrap(),
             ],
             edges: vec![
                 TreeEdge {
@@ -821,11 +1001,11 @@ mod tests {
             ],
         };
         store.save(&snapshot).unwrap();
-        let t = SessionTree::open(store, standard()).unwrap();
+        let t = SessionTree::open(store).unwrap();
         let root: SessionId = "root".parse().unwrap();
         let branch: SessionId = "branch".parse().unwrap();
         let leaf: SessionId = "leaf".parse().unwrap();
-        assert_eq!(t.node(&branch).unwrap(), NodeState::Tombstoned);
+        assert!(t.contains(&branch));
         assert_eq!(t.children(&root).unwrap(), vec![branch.clone()]);
         assert_eq!(
             t.incoming_edge(&leaf).unwrap(),
@@ -864,5 +1044,25 @@ mod tests {
                 .any(|r| matches!(r, Err(TreeError::RootAlreadyExists(_))))
         );
         assert!(t.root().unwrap().is_some());
+    }
+
+    #[test]
+    fn accessors_error_for_missing_nodes() {
+        let t = tree();
+        let ghost = SessionId::generate();
+        assert!(!t.contains(&ghost));
+        assert!(matches!(
+            t.incoming_edge(&ghost),
+            Err(TreeError::NodeNotFound(_))
+        ));
+        assert!(matches!(
+            t.children(&ghost),
+            Err(TreeError::NodeNotFound(_))
+        ));
+        assert!(matches!(t.is_leaf(&ghost), Err(TreeError::NodeNotFound(_))));
+        assert!(matches!(
+            t.path_to_root(&ghost),
+            Err(TreeError::NodeNotFound(_))
+        ));
     }
 }

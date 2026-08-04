@@ -12,29 +12,21 @@ use serde::{Deserialize, Serialize};
 use phi_kernel::SessionId;
 
 use crate::error::{Result, TreeError};
-use crate::model::{NodeState, TreeEdge};
+use crate::model::TreeEdge;
 
-/// A single node as persisted in a snapshot.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SnapshotNode {
-    /// The node's identity (reused from the kernel; no separate tree id type).
-    pub session_id: SessionId,
-    /// Live or Tombstoned at snapshot time.
-    pub state: NodeState,
-}
-
-/// Serializable state of the whole tree: nodes + edges + states.
+/// Serializable state of the whole tree: node ids + edges.
 ///
-/// This is the persistence boundary: the aggregate snapshots itself into this
-/// type and a [`TreeStore`] persists it. Structural validation lives here so
-/// both the aggregate ([`crate::tree::SessionTree::open`]) and future stores
-/// can rely on it.
+/// Nodes are just ids — the tree carries no lifecycle state, so there is
+/// nothing else to persist per node (this is why `nodes` is a flat
+/// `Vec<SessionId>` and there is no per-node struct). This is the persistence
+/// boundary: the aggregate snapshots itself into this type and a [`TreeStore`]
+/// persists it. Structural validation lives here so both the aggregate
+/// ([`crate::tree::SessionTree::open`]) and future stores can rely on it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeSnapshot {
-    /// All nodes.
-    pub nodes: Vec<SnapshotNode>,
+    /// All node ids (a node's parent and children live in `edges`).
+    pub nodes: Vec<SessionId>,
     /// All parent → child edges.
     pub edges: Vec<TreeEdge>,
 }
@@ -46,12 +38,9 @@ impl TreeSnapshot {
     /// the root (this catches cycles and orphaned components).
     pub fn validate(&self) -> Result<()> {
         let mut node_ids = BTreeSet::new();
-        for node in &self.nodes {
-            if !node_ids.insert(node.session_id.as_str()) {
-                return Err(TreeError::InvalidSnapshot(format!(
-                    "duplicate node: {}",
-                    node.session_id
-                )));
+        for id in &self.nodes {
+            if !node_ids.insert(id.as_str()) {
+                return Err(TreeError::InvalidSnapshot(format!("duplicate node: {id}")));
             }
         }
         if self.nodes.is_empty() {
@@ -177,11 +166,8 @@ mod tests {
     use super::*;
     use crate::model::EdgeKind;
 
-    fn node(id: &str, state: NodeState) -> SnapshotNode {
-        SnapshotNode {
-            session_id: id.parse().unwrap(),
-            state,
-        }
+    fn node(id: &str) -> SessionId {
+        id.parse().unwrap()
     }
 
     fn edge(parent: &str, child: &str, kind: EdgeKind) -> TreeEdge {
@@ -192,14 +178,10 @@ mod tests {
         }
     }
 
-    fn live(id: &str) -> SnapshotNode {
-        node(id, NodeState::Live)
-    }
-
     #[test]
     fn validate_accepts_a_well_formed_snapshot() {
         let snap = TreeSnapshot {
-            nodes: vec![live("root"), node("a", NodeState::Tombstoned), live("b")],
+            nodes: vec![node("root"), node("a"), node("b")],
             edges: vec![
                 edge("root", "a", EdgeKind::WithHistory),
                 edge("a", "b", EdgeKind::WithoutHistory),
@@ -221,7 +203,7 @@ mod tests {
     #[test]
     fn validate_rejects_duplicate_node_ids() {
         let snap = TreeSnapshot {
-            nodes: vec![live("root"), live("root")],
+            nodes: vec![node("root"), node("root")],
             edges: Vec::new(),
         };
         assert!(matches!(
@@ -245,7 +227,7 @@ mod tests {
     #[test]
     fn validate_rejects_dangling_edges() {
         let snap = TreeSnapshot {
-            nodes: vec![live("root")],
+            nodes: vec![node("root")],
             edges: vec![edge("root", "ghost", EdgeKind::WithHistory)],
         };
         assert!(matches!(
@@ -257,7 +239,7 @@ mod tests {
     #[test]
     fn validate_rejects_multiple_roots() {
         let snap = TreeSnapshot {
-            nodes: vec![live("root"), live("other")],
+            nodes: vec![node("root"), node("other")],
             edges: Vec::new(),
         };
         assert!(matches!(
@@ -269,7 +251,7 @@ mod tests {
     #[test]
     fn validate_rejects_a_child_with_two_parents() {
         let snap = TreeSnapshot {
-            nodes: vec![live("root"), live("a"), live("b")],
+            nodes: vec![node("root"), node("a"), node("b")],
             edges: vec![
                 edge("root", "a", EdgeKind::WithHistory),
                 edge("root", "b", EdgeKind::WithHistory),
@@ -285,7 +267,7 @@ mod tests {
     #[test]
     fn validate_rejects_an_unreachable_cycle() {
         let snap = TreeSnapshot {
-            nodes: vec![live("root"), live("x")],
+            nodes: vec![node("root"), node("x")],
             edges: vec![edge("x", "x", EdgeKind::WithHistory)],
         };
         assert!(matches!(
@@ -299,7 +281,7 @@ mod tests {
         let store = InMemoryTreeStore::new();
         assert_eq!(store.load().unwrap(), None);
         let snap = TreeSnapshot {
-            nodes: vec![live("root")],
+            nodes: vec![node("root")],
             edges: Vec::new(),
         };
         store.save(&snap).unwrap();

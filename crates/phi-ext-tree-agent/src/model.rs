@@ -1,33 +1,22 @@
-//! Shared tree model types (nodes, edges) used by the aggregate, the events,
-//! and the snapshots.
+//! Shared tree model types (edges) used by the aggregate, the events, and the
+//! snapshots.
 //!
 //! **Tree, not graph:** every node has exactly one parent (the root has none);
 //! multi-parent, DAG, and merge are out of scope for this crate.
+//!
+//! **No lifecycle state here:** this crate models pure topology. Live /
+//! Tombstoned status and close semantics belong to the product, which
+//! orchestrates them with the aggregate's atomic operations.
 
 use serde::{Deserialize, Serialize};
 
 use phi_kernel::SessionId;
 
-/// Lifecycle state of a tree node.
-///
-/// Mirrors the product's (Daan) `SoftDeletedSession` placeholder semantics: a
-/// `Tombstoned` node stays in the topology (its subtree stays connected) but
-/// can no longer be derived from or focused.
-///
-/// **No [`Default`]** — a node must be created in an explicit state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum NodeState {
-    /// Open for derivation and focus.
-    Live,
-    /// Soft-deleted: kept in the topology, not derivable, not focusable.
-    Tombstoned,
-}
-
 /// How the parent → child edge was created.
 ///
 /// **Explicit parameter, no [`Default`]** — the caller of
-/// [`crate::tree::SessionTree::derive`] must pick one; there is no implicit
+/// [`crate::tree::SessionTree::derive`] /
+/// [`crate::tree::SessionTree::reparent`] must pick one; there is no implicit
 /// "history follows" fallback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,7 +62,7 @@ impl ParentEdge {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TreeEdge {
-    /// The parent node (exists and was Live at derivation time).
+    /// The parent node.
     pub parent: SessionId,
     /// The child node.
     pub child: SessionId,
@@ -83,20 +72,8 @@ pub struct TreeEdge {
 
 #[cfg(test)]
 mod tests {
-    use super::{EdgeKind, NodeState, ParentEdge};
+    use super::{EdgeKind, ParentEdge};
     use serde_json::json;
-
-    #[test]
-    fn node_state_serde_is_camel_case() {
-        assert_eq!(
-            serde_json::to_value(NodeState::Live).unwrap(),
-            json!("live")
-        );
-        assert_eq!(
-            serde_json::to_value(NodeState::Tombstoned).unwrap(),
-            json!("tombstoned")
-        );
-    }
 
     #[test]
     fn edge_kind_serde_is_camel_case() {
