@@ -1,12 +1,13 @@
-//! Spawn ports: the `TreeChild` derivation port and the spawn budget.
+//! Spawn port: the `TreeChild` derivation port.
 //!
-//! v0 **declares, not enforces** — depth / per-turn budget enforcement belongs to
-//! the v1 runner; the derive-side implementation of [`SessionSpawner`] belongs to
+//! v0 ships only the derive port. **Spawn caps are deliberately absent**: budget
+//! is product policy, not mechanism — the v1 runner will consult an injected
+//! `SpawnPolicy` port (mechanism asks, product answers; no shape prescribed
+//! here). The derive-side implementation of [`SessionSpawner`] belongs to
 //! `phi-ext-tree-agent` or a product.
 
 use async_trait::async_trait;
 use phi_kernel::SessionId;
-use serde::{Deserialize, Serialize};
 
 /// Creates a **derived child session node** for [`crate::subagent::SubagentRequest::TreeChild`] delegations.
 ///
@@ -37,28 +38,9 @@ pub trait SessionSpawner: Send + Sync {
     async fn spawn_child(&self, parent_session_id: &SessionId) -> Result<SessionId, String>;
 }
 
-/// Caps on subagent spawning, enforced by the **v1 runner**.
-///
-/// **No [`Default`]** — a budget is explicit policy, and the repo rule is that
-/// policy has no implicit default. Construct via struct literal so every call
-/// site states both caps; v1 enforces them before each spawn.
-///
-/// **Injection path:** the budget is the **v1 runner's composition config**
-/// (constructor-injected, same posture as kernel [`phi_kernel::AgentPorts`]) —
-/// not a per-delegation field on [`crate::subagent::SubagentRequest`]; v0
-/// builds no source port for it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpawnBudget {
-    /// Maximum delegation nesting depth (`0` = no subagents at all).
-    pub max_depth: u32,
-    /// Maximum spawns per parent turn.
-    pub max_per_turn: u32,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{SessionSpawner, SpawnBudget};
+    use super::SessionSpawner;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -74,19 +56,6 @@ mod tests {
         async fn spawn_child(&self, _parent_session_id: &SessionId) -> Result<SessionId, String> {
             Ok((*self.child).clone())
         }
-    }
-
-    #[test]
-    fn spawn_budget_is_explicit_pair_of_caps() {
-        let budget = SpawnBudget {
-            max_depth: 2,
-            max_per_turn: 4,
-        };
-        assert_eq!(budget.max_depth, 2);
-        assert_eq!(budget.max_per_turn, 4);
-        // Copy: the budget travels with the request without surprises.
-        let copy = budget;
-        assert_eq!(copy.max_per_turn, budget.max_per_turn);
     }
 
     #[tokio::test]

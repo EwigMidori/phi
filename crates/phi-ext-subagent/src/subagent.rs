@@ -6,8 +6,11 @@
 //! ([`SubagentResult`] with an explicit [`ToolResultStatus`]). No stream and no
 //! partial updates — a delegation is a single request/result round trip.
 //!
-//! Dispatch is **per-call**: [`SubagentResolver`] resolves each delegation from a
-//! [`DelegationContext`] (a deliberate proper subset of the request); the
+//! Dispatch is **caller-first, resolver-last**: the initiator decides whether a
+//! call is a delegation at all, and which [`Subagent`] executes it when one is
+//! already known; [`SubagentResolver`] is consulted only for a confirmed
+//! delegation with no explicitly chosen subagent, resolving from a
+//! [`DelegationContext`] (a deliberate proper subset of the request). The
 //! execution form (`mode`) is decided by the initiator, never by the resolver.
 
 use std::collections::HashMap;
@@ -172,32 +175,45 @@ impl DelegationContext {
     }
 }
 
-/// Per-call [`Subagent`] resolver for one delegation.
+/// Resolves the [`Subagent`] for one delegation.
 ///
-/// **Per-call resolver, not a per-session stable binding** — deliberately
-/// unlike [`phi_kernel::AgentPrefixSource`], which binds prefix material per
-/// session and stays stable across calls. Subagent dispatch is dynamic per
-/// call: the resolver receives the call's [`DelegationContext`] and may key on
-/// anything it carries (`tool_name`, `input` content, or other facts) — the
-/// codebase does not prescribe a key. It only answers "which [`Subagent`]
-/// executes this call": not the execution form (`mode` stays with the
-/// initiator) and not permission (ACL is product-side).
+/// **Consulted as the last resort, not the first authority.** The side
+/// initiating the call decides first whether the call is a delegation at all,
+/// and which [`Subagent`] executes it when one is already known. The resolver
+/// is consulted only for a confirmed delegation with no explicitly chosen
+/// subagent — so it must always return a [`Subagent`]: "no answer" is a
+/// configuration error on the caller's side, never a normal outcome.
+///
+/// **Per-call, not a per-session stable binding** — deliberately unlike
+/// [`phi_kernel::AgentPrefixSource`], which binds prefix material per session
+/// and stays stable across calls. The resolver receives the call's
+/// [`DelegationContext`] and may key on anything it carries (`tool_name`,
+/// `input` content, or other facts) — the codebase does not prescribe a key.
+/// It answers only "which [`Subagent`] executes this call": not the execution
+/// form (`mode` stays with the initiator) and not permission (ACL is
+/// product-side).
 ///
 /// Named a **Resolver**, not a `Source`: the kernel's `AgentPrefixSource` /
 /// `ToolCallSealSource` are per-session stable bindings, while subagent
 /// dispatch is per-call — the name says what it does.
 pub trait SubagentResolver: Send + Sync {
-    /// Resolve the [`Subagent`] for one delegation, or `None` if unhandled.
-    fn resolve(&self, ctx: &DelegationContext) -> Option<Arc<dyn Subagent>>;
+    /// Resolve the [`Subagent`] for a confirmed, unbound delegation.
+    fn resolve(&self, ctx: &DelegationContext) -> Arc<dyn Subagent>;
 }
 
-/// Empty resolver: every delegation resolves to `None` (tests / default assembly).
+/// No subagents configured: consulting this resolver is a configuration error.
+///
+/// Composition sentinel for products that never delegate — the initiator must
+/// not confirm a delegation while this resolver is in place. Being consulted
+/// is a caller-side bug and panics loudly rather than guessing.
 #[derive(Clone, Debug, Default)]
 pub struct NoSubagents;
 
 impl SubagentResolver for NoSubagents {
-    fn resolve(&self, _ctx: &DelegationContext) -> Option<Arc<dyn Subagent>> {
-        None
+    fn resolve(&self, _ctx: &DelegationContext) -> Arc<dyn Subagent> {
+        panic!(
+            "NoSubagents was consulted: a delegation was confirmed but no subagent resolver is configured"
+        )
     }
 }
 
@@ -205,12 +221,17 @@ impl SubagentResolver for NoSubagents {
 ///
 /// Keys on [`DelegationContext::tool_name`]; products compose real subagents
 /// here, tests inject doubles. Lookup only — resolution order is irrelevant.
+/// The caller must consult it only for a tool present in the map: a miss is a
+/// configuration error and panics rather than guessing.
 #[derive(Clone)]
 pub struct MapSubagents(pub HashMap<ToolName, Arc<dyn Subagent>>);
 
 impl SubagentResolver for MapSubagents {
-    fn resolve(&self, ctx: &DelegationContext) -> Option<Arc<dyn Subagent>> {
-        self.0.get(&ctx.tool_name).cloned()
+    fn resolve(&self, ctx: &DelegationContext) -> Arc<dyn Subagent> {
+        self.0
+            .get(&ctx.tool_name)
+            .cloned()
+            .expect("MapSubagents consulted for a tool name that is not bound")
     }
 }
 
@@ -254,14 +275,15 @@ mod tests {
     }
 
     /// Test double: dispatches on `ctx.input["name"]` between two subagents.
+    /// Unroutable content is a configuration error — panics, never guesses.
     struct ContentDispatchSource;
 
     impl SubagentResolver for ContentDispatchSource {
-        fn resolve(&self, ctx: &DelegationContext) -> Option<Arc<dyn Subagent>> {
+        fn resolve(&self, ctx: &DelegationContext) -> Arc<dyn Subagent> {
             match ctx.input.get("name").and_then(Value::as_str) {
-                Some("research") => Some(Arc::new(EchoSubagent)),
-                Some("translate") => Some(Arc::new(TagSubagent("translate"))),
-                _ => None,
+                Some("research") => Arc::new(EchoSubagent),
+                Some("translate") => Arc::new(TagSubagent("translate")),
+                _ => panic!("ContentDispatchSource consulted for an unroutable name"),
             }
         }
     }
@@ -307,31 +329,47 @@ mod tests {
     }
 
     #[test]
-    fn subagent_source_resolves_bound_tool_and_misses_unknown() {
+    fn map_resolver_resolves_bound_tool_without_option() {
         let source = MapSubagents(HashMap::from([(
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));
-        assert!(source.resolve(&ctx("research", "graphs")).is_some());
-        assert!(source.resolve(&ctx("unknown", "x")).is_none());
-        assert!(NoSubagents.resolve(&ctx("any", "x")).is_none());
+        // The resolver always answers for the tool it is consulted on.
+        let _subagent: Arc<dyn Subagent> = source.resolve(&ctx("research", "graphs"));
+    }
+
+    #[test]
+    #[should_panic(expected = "not bound")]
+    fn map_resolver_panics_on_unbound_tool() {
+        let source = MapSubagents(HashMap::from([(
+            ToolName::new("research"),
+            Arc::new(EchoSubagent) as Arc<dyn Subagent>,
+        )]));
+        let _ = source.resolve(&ctx("unknown", "x"));
+    }
+
+    #[test]
+    #[should_panic(expected = "no subagent resolver is configured")]
+    fn no_subagents_panics_when_consulted() {
+        let _ = NoSubagents.resolve(&ctx("any", "x"));
     }
 
     #[tokio::test]
-    async fn subagent_source_can_dispatch_on_input_content() {
+    async fn resolver_can_dispatch_on_input_content() {
         let source = ContentDispatchSource;
         let req = ephemeral_request();
-        let research = source
-            .resolve(&ctx("anything", "research"))
-            .expect("name=research resolves to the echo subagent");
+        let research = source.resolve(&ctx("anything", "research"));
         assert_eq!(research.run(&req).await.output, json!({"q": "graphs"}));
-        let translate = source
-            .resolve(&ctx("anything", "translate"))
-            .expect("name=translate resolves to the tagged subagent");
+        let translate = source.resolve(&ctx("anything", "translate"));
         let tagged = translate.run(&req).await;
         assert_eq!(tagged.output["tag"], "translate");
-        // Unhandled content resolves to `None` — the resolver routes, never guesses.
-        assert!(source.resolve(&ctx("anything", "other")).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "unroutable")]
+    fn resolver_panics_on_unroutable_content() {
+        // Unroutable content is a configuration error — the resolver never guesses.
+        let _ = ContentDispatchSource.resolve(&ctx("anything", "other"));
     }
 
     #[test]

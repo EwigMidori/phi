@@ -10,7 +10,7 @@ final; the runner lands in v1.
 |------|-----|
 | Delegation | `SubagentRequest` (`TreeChild` / `Ephemeral`), `SubagentResult`, `Subagent` |
 | Dispatch | `DelegationContext`, `SubagentResolver`, `NoSubagents`, `MapSubagents` |
-| Spawn | `SessionSpawner`, `SpawnBudget` |
+| Spawn | `SessionSpawner` |
 
 **Tool-shaped delegation:** from the parent turn's view one subagent invocation is
 exactly one tool call — `SubagentRequest` carries the kernel `ToolCallId` +
@@ -25,11 +25,14 @@ partials.
 carries `origin_session_id` — **not a parent**, only binding-material
 preparation for the child generation.
 
-**Per-call dispatch:** `SubagentResolver` resolves each delegation from a
-`DelegationContext` (a deliberate proper subset of the request — `mode` is
-decided by the initiator, never by the resolver). Resolution may key on
-`tool_name`, `input` content, or other facts — it is **not** a per-session
-binding.
+**Caller-first dispatch:** the initiator decides whether a call is a delegation
+and which subagent executes it when one is known. `SubagentResolver` is
+consulted only for a confirmed delegation with no explicitly chosen subagent,
+resolving from a `DelegationContext` (a deliberate proper subset of the request
+— `mode` is decided by the initiator, never by the resolver), and **always
+answers** — an unresolved case is a configuration error, never a normal
+outcome. Resolution may key on `tool_name`, `input` content, or other facts —
+it is **not** a per-session binding.
 
 **v0 boundary:** no runner, no execution. `Subagent` is implemented by
 products/adapters; `SessionSpawner` (the `TreeChild` derive port) is wired by
@@ -43,7 +46,7 @@ products/adapters; `SessionSpawner` (the `TreeChild` derive port) is wired by
 | `input` / `output` | Opaque `serde_json::Value` — never interpreted |
 | Subagent dispatch | `SubagentResolver` (**per-call resolver** via `DelegationContext`, not ACL — permission is product-side) |
 | `TreeChild` derive | `SessionSpawner` — v1: `phi-ext-tree-agent` / product |
-| Spawn budget enforcement | v1 runner (this crate declares `SpawnBudget` only) |
+| Spawn caps | **Not in v0** — v1 runner consults an injected `SpawnPolicy` port (product policy; mechanism prescribes no shape) |
 
 ## Out of scope
 
