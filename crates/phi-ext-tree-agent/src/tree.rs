@@ -152,6 +152,11 @@ impl SessionTree {
 
     /// Create the root node (no parent).
     ///
+    /// The caller supplies the id because the root is usually a session that
+    /// **pre-exists the tree** (already created in the kernel / product store)
+    /// and must stay addressable by that id — unlike [`Self::derive`], which
+    /// mints a brand-new child id.
+    ///
     /// Duplicates are **loud errors, not silent no-ops**: an id already in the
     /// tree fails with `NodeAlreadyExists`, and any other id when a root exists
     /// fails with `RootAlreadyExists` — a tree has exactly one root, and an
@@ -404,6 +409,18 @@ impl SessionTree {
     ///
     /// Explicit only — mutations never write implicitly (same stance as the
     /// events: the caller projects and persists).
+    ///
+    /// **Point-in-time contract:** `persist` captures a **point-in-time
+    /// snapshot of the tree at the moment of the call** — it is **not a
+    /// consistency barrier**. The snapshot is cloned under the tree lock and
+    /// then saved after the lock is released, so any concurrent mutation that
+    /// lands after the snapshot is taken is **not** included in the saved
+    /// state. Callers that need a consistent on-disk state coordinate it
+    /// themselves (e.g. call during a no-concurrent-writers window, or guard
+    /// with their own external barrier). The store I/O deliberately happens
+    /// **outside** the tree lock — saving while holding the lock would block
+    /// the whole tree behind the backend — and there is deliberately no
+    /// write-through on mutations.
     pub fn persist(&self) -> Result<()> {
         let snapshot = self.snapshot();
         self.store.save(&snapshot)

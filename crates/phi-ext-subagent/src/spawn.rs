@@ -5,7 +5,7 @@
 //! `phi-ext-tree-agent` or a product.
 
 use async_trait::async_trait;
-use phi_kernel::{SessionId, ToolName};
+use phi_kernel::SessionId;
 use serde::{Deserialize, Serialize};
 
 /// Creates a **derived child session node** for `SpawnMode::TreeChild` delegations.
@@ -25,17 +25,16 @@ use serde::{Deserialize, Serialize};
 pub trait SessionSpawner: Send + Sync {
     /// Derive a child session from `parent_session_id` and return the new id.
     ///
-    /// `tool_name` labels the derivation (the child's reason for existing).
-    /// The derivation is **with-history** (`WithHistory`) per the trait doc;
-    /// exact semantics are the wiring side's, not this port's. Errors follow the
-    /// kernel `AgentRuntime::run` convention (`String`): spawn failure is infra
-    /// failure and becomes a [`phi_kernel::ToolResultStatus::Error`] result in
-    /// the v1 runner.
-    async fn spawn_child(
-        &self,
-        parent_session_id: &SessionId,
-        tool_name: &ToolName,
-    ) -> Result<SessionId, String>;
+    /// The port carries only facts the receiver needs — `tool_name` has **no
+    /// consumer** here: a tree-agent `SessionTree::derive(parent, WithHistory)`
+    /// stores no label, and the delegation's catalog name is already held by the
+    /// runner on [`crate::subagent::SubagentRequest::tool_name`]. The derivation
+    /// is **with-history** (`WithHistory`) per the trait doc; exact semantics
+    /// are the wiring side's, not this port's. Errors follow the kernel
+    /// `AgentRuntime::run` convention (`String`): spawn failure is infra failure
+    /// and becomes a [`phi_kernel::ToolResultStatus::Error`] result in the v1
+    /// runner.
+    async fn spawn_child(&self, parent_session_id: &SessionId) -> Result<SessionId, String>;
 }
 
 /// Caps on subagent spawning, enforced by the **v1 runner**.
@@ -43,6 +42,11 @@ pub trait SessionSpawner: Send + Sync {
 /// **No [`Default`]** — a budget is explicit policy, and the repo rule is that
 /// policy has no implicit default. Construct via struct literal so every call
 /// site states both caps; v1 enforces them before each spawn.
+///
+/// **Injection path:** the budget is the **v1 runner's composition config**
+/// (constructor-injected, same posture as kernel [`phi_kernel::AgentPorts`]) —
+/// not a per-delegation field on [`crate::subagent::SubagentRequest`]; v0
+/// builds no source port for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnBudget {
@@ -58,7 +62,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use phi_kernel::{SessionId, ToolName};
+    use phi_kernel::SessionId;
 
     /// Test double: returns a fixed derived child session id.
     struct FixedChildSpawner {
@@ -67,11 +71,7 @@ mod tests {
 
     #[async_trait]
     impl SessionSpawner for FixedChildSpawner {
-        async fn spawn_child(
-            &self,
-            _parent_session_id: &SessionId,
-            _tool_name: &ToolName,
-        ) -> Result<SessionId, String> {
+        async fn spawn_child(&self, _parent_session_id: &SessionId) -> Result<SessionId, String> {
             Ok((*self.child).clone())
         }
     }
@@ -96,10 +96,7 @@ mod tests {
         let spawner = FixedChildSpawner {
             child: Arc::new(child.clone()),
         };
-        let child_session = spawner
-            .spawn_child(&parent, &ToolName::new("research"))
-            .await
-            .unwrap();
+        let child_session = spawner.spawn_child(&parent).await.unwrap();
         assert_eq!(child_session, child);
         assert_ne!(child_session, parent);
     }

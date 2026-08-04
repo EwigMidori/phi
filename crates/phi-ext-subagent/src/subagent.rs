@@ -94,7 +94,14 @@ pub struct SubagentResult {
 #[async_trait]
 pub trait Subagent: Send + Sync {
     /// Execute one delegation and close it with a [`SubagentResult`].
-    async fn run(&self, request: SubagentRequest) -> SubagentResult;
+    ///
+    /// `request` is **borrowed**: after the `await` the v1 runner still needs
+    /// `request.tool_call_id` to backfill the parent's tool ledger — an owning
+    /// argument would force an early `clone`, and "extract the id or lose the
+    /// correlation" is an interface-induced error class that borrowing removes
+    /// at the type level. Implementations emit a fresh child-generation output,
+    /// so borrowing costs nothing.
+    async fn run(&self, request: &SubagentRequest) -> SubagentResult;
 }
 
 /// Resolves the [`Subagent`] bound to a tool name.
@@ -147,10 +154,10 @@ mod tests {
 
     #[async_trait]
     impl Subagent for EchoSubagent {
-        async fn run(&self, request: SubagentRequest) -> SubagentResult {
+        async fn run(&self, request: &SubagentRequest) -> SubagentResult {
             SubagentResult {
                 status: ToolResultStatus::Ok,
-                output: request.input,
+                output: request.input.clone(),
             }
         }
     }
@@ -169,9 +176,12 @@ mod tests {
     #[tokio::test]
     async fn subagent_run_closes_with_status_and_output() {
         let subagent = Arc::new(EchoSubagent) as Arc<dyn Subagent>;
-        let result = subagent.run(request(SpawnMode::Ephemeral)).await;
+        let req = request(SpawnMode::Ephemeral);
+        let result = subagent.run(&req).await;
         assert_eq!(result.status, ToolResultStatus::Ok);
         assert_eq!(result.output, json!({"q": "graphs"}));
+        // The borrowed request survives the await — correlation is never lost.
+        assert_eq!(req.tool_call_id, ToolCallId::new("tc-1"));
     }
 
     #[test]

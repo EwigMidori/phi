@@ -2,8 +2,8 @@
 //!
 //! Parent/child agent **delegation protocol** for [phi](https://github.com/ewigmidori/phi):
 //! **tool-shaped** subagent spawn. v0 ships the **interface face only** — the
-//! types and ports below are final; the runner (an `AgentRuntime` +
-//! `TurnMaterials` composition) lands in v1.
+//! types and ports below are final, converged through two review rounds; the
+//! runner (an `AgentRuntime` + `TurnMaterials` composition) lands in v1.
 //!
 //! | Area | Surface |
 //! |------|---------|
@@ -19,6 +19,11 @@
 //!
 //! **Not in this crate:** the runner (v1), ACL / permission engines (product),
 //! session-graph derive (`phi-ext-tree-agent`).
+//!
+//! **Spawn budget:** [`SpawnBudget`] is the **v1 runner's composition config**
+//! (constructor-injected, same posture as kernel [`phi_kernel::AgentPorts`]) —
+//! not a per-delegation field on [`SubagentRequest`]; v0 builds no source port
+//! for it.
 //!
 //! **Naming:** spawn / delegate / result vocabulary — never "mailbox" (reserved
 //! for a future agent async-notification bus).
@@ -51,10 +56,10 @@ mod integration {
 
     #[async_trait]
     impl Subagent for EchoSubagent {
-        async fn run(&self, request: SubagentRequest) -> SubagentResult {
+        async fn run(&self, request: &SubagentRequest) -> SubagentResult {
             SubagentResult {
                 status: ToolResultStatus::Ok,
-                output: request.input,
+                output: request.input.clone(),
             }
         }
     }
@@ -68,17 +73,18 @@ mod integration {
         let subagent = source
             .subagent_for(&ToolName::new("research"))
             .expect("bound tool resolves");
-        let result = subagent
-            .run(SubagentRequest {
-                tool_call_id: ToolCallId::new("tc-1"),
-                tool_name: ToolName::new("research"),
-                input: json!({"q": "graphs"}),
-                parent_session_id: SessionId::generate(),
-                mode: SpawnMode::TreeChild,
-            })
-            .await;
+        let req = SubagentRequest {
+            tool_call_id: ToolCallId::new("tc-1"),
+            tool_name: ToolName::new("research"),
+            input: json!({"q": "graphs"}),
+            parent_session_id: SessionId::generate(),
+            mode: SpawnMode::TreeChild,
+        };
+        let result = subagent.run(&req).await;
         assert_eq!(result.status, ToolResultStatus::Ok);
         assert_eq!(result.output, json!({"q": "graphs"}));
+        // The borrowed request survives the await — correlation is never lost.
+        assert_eq!(req.tool_call_id, ToolCallId::new("tc-1"));
         assert!(source.subagent_for(&ToolName::new("missing")).is_none());
     }
 }
