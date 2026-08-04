@@ -1,0 +1,16 @@
+[package]
+name = "phi-ext-tree-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "phi ext — session tree aggregate: pure topology, atomic structure-preserving ops (derive/remove/remove_subtree/reparent), snapshot persistence via TreeStore, tree events (tree only, no graph)"
+readme = "README.md"
+
+[dependencies]
+phi-kernel = { path = "../phi-kernel" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

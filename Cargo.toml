@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/phi-kernel"]
+members = ["crates/phi-kernel", "crates/phi-ext-tree-agent", "crates/phi-ext-subagent"]
 resolver = "2"
 
 [workspace.package]
