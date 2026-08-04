@@ -1,12 +1,12 @@
 //! Delegation contract: request / result shapes and the [`Subagent`] /
-//! [`SubagentSource`] ports.
+//! [`SubagentResolver`] ports.
 //!
 //! One subagent invocation is **tool-shaped**: it opens like a tool call
 //! (`ToolCallId` + `ToolName` + opaque `input`) and closes like a tool result
 //! ([`SubagentResult`] with an explicit [`ToolResultStatus`]). No stream and no
 //! partial updates — a delegation is a single request/result round trip.
 //!
-//! Dispatch is **per-call**: [`SubagentSource`] resolves each delegation from a
+//! Dispatch is **per-call**: [`SubagentResolver`] resolves each delegation from a
 //! [`DelegationContext`] (a deliberate proper subset of the request); the
 //! execution form (`mode`) is decided by the initiator, never by the resolver.
 
@@ -33,8 +33,9 @@ use serde_json::Value;
 /// - `tool_call_id`: the parent turn's tool ledger correlates delegations by
 ///   kernel [`ToolCallId`]; the v1 runner must report the outcome against
 ///   exactly this call, so the id rides on the request.
-/// - `tool_name`: the delegation's **address** — [`SubagentSource`] resolves the
-///   [`Subagent`] by it, and it matches the parent's tool catalog name.
+/// - `tool_name`: the delegation's **address** — the tool name in the parent's
+///   tool catalog; one of the facts a resolver may key on (the codebase does
+///   not prescribe a key — see [`SubagentResolver`]).
 /// - `input`: opaque tool input (kernel discipline: `input` / `output` are
 ///   `serde_json::Value`, never interpreted by this crate).
 ///
@@ -137,7 +138,7 @@ pub trait Subagent: Send + Sync {
     async fn run(&self, request: &SubagentRequest) -> SubagentResult;
 }
 
-/// Facts handed to [`SubagentSource`] to resolve one delegation.
+/// Facts handed to [`SubagentResolver`] to resolve one delegation.
 ///
 /// A **deliberate proper subset** of [`SubagentRequest`]: it omits `mode` — the
 /// execution form is decided by the side initiating the call, and the resolver
@@ -181,17 +182,21 @@ impl DelegationContext {
 /// codebase does not prescribe a key. It only answers "which [`Subagent`]
 /// executes this call": not the execution form (`mode` stays with the
 /// initiator) and not permission (ACL is product-side).
-pub trait SubagentSource: Send + Sync {
+///
+/// Named a **Resolver**, not a `Source`: the kernel's `AgentPrefixSource` /
+/// `ToolCallSealSource` are per-session stable bindings, while subagent
+/// dispatch is per-call — the name says what it does.
+pub trait SubagentResolver: Send + Sync {
     /// Resolve the [`Subagent`] for one delegation, or `None` if unhandled.
-    fn subagent_for(&self, ctx: &DelegationContext) -> Option<Arc<dyn Subagent>>;
+    fn resolve(&self, ctx: &DelegationContext) -> Option<Arc<dyn Subagent>>;
 }
 
 /// Empty resolver: every delegation resolves to `None` (tests / default assembly).
 #[derive(Clone, Debug, Default)]
 pub struct NoSubagents;
 
-impl SubagentSource for NoSubagents {
-    fn subagent_for(&self, _ctx: &DelegationContext) -> Option<Arc<dyn Subagent>> {
+impl SubagentResolver for NoSubagents {
+    fn resolve(&self, _ctx: &DelegationContext) -> Option<Arc<dyn Subagent>> {
         None
     }
 }
@@ -203,8 +208,8 @@ impl SubagentSource for NoSubagents {
 #[derive(Clone)]
 pub struct MapSubagents(pub HashMap<ToolName, Arc<dyn Subagent>>);
 
-impl SubagentSource for MapSubagents {
-    fn subagent_for(&self, ctx: &DelegationContext) -> Option<Arc<dyn Subagent>> {
+impl SubagentResolver for MapSubagents {
+    fn resolve(&self, ctx: &DelegationContext) -> Option<Arc<dyn Subagent>> {
         self.0.get(&ctx.tool_name).cloned()
     }
 }
@@ -213,7 +218,7 @@ impl SubagentSource for MapSubagents {
 mod tests {
     use super::{
         DelegationContext, EphemeralRequest, MapSubagents, NoSubagents, Subagent, SubagentRequest,
-        SubagentResult, SubagentSource, TreeChildRequest,
+        SubagentResolver, SubagentResult, TreeChildRequest,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -251,8 +256,8 @@ mod tests {
     /// Test double: dispatches on `ctx.input["name"]` between two subagents.
     struct ContentDispatchSource;
 
-    impl SubagentSource for ContentDispatchSource {
-        fn subagent_for(&self, ctx: &DelegationContext) -> Option<Arc<dyn Subagent>> {
+    impl SubagentResolver for ContentDispatchSource {
+        fn resolve(&self, ctx: &DelegationContext) -> Option<Arc<dyn Subagent>> {
             match ctx.input.get("name").and_then(Value::as_str) {
                 Some("research") => Some(Arc::new(EchoSubagent)),
                 Some("translate") => Some(Arc::new(TagSubagent("translate"))),
@@ -307,9 +312,9 @@ mod tests {
             ToolName::new("research"),
             Arc::new(EchoSubagent) as Arc<dyn Subagent>,
         )]));
-        assert!(source.subagent_for(&ctx("research", "graphs")).is_some());
-        assert!(source.subagent_for(&ctx("unknown", "x")).is_none());
-        assert!(NoSubagents.subagent_for(&ctx("any", "x")).is_none());
+        assert!(source.resolve(&ctx("research", "graphs")).is_some());
+        assert!(source.resolve(&ctx("unknown", "x")).is_none());
+        assert!(NoSubagents.resolve(&ctx("any", "x")).is_none());
     }
 
     #[tokio::test]
@@ -317,16 +322,16 @@ mod tests {
         let source = ContentDispatchSource;
         let req = ephemeral_request();
         let research = source
-            .subagent_for(&ctx("anything", "research"))
+            .resolve(&ctx("anything", "research"))
             .expect("name=research resolves to the echo subagent");
         assert_eq!(research.run(&req).await.output, json!({"q": "graphs"}));
         let translate = source
-            .subagent_for(&ctx("anything", "translate"))
+            .resolve(&ctx("anything", "translate"))
             .expect("name=translate resolves to the tagged subagent");
         let tagged = translate.run(&req).await;
         assert_eq!(tagged.output["tag"], "translate");
         // Unhandled content resolves to `None` — the resolver routes, never guesses.
-        assert!(source.subagent_for(&ctx("anything", "other")).is_none());
+        assert!(source.resolve(&ctx("anything", "other")).is_none());
     }
 
     #[test]

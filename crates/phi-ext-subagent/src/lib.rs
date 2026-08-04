@@ -8,7 +8,7 @@
 //! | Area | Surface |
 //! |------|---------|
 //! | Delegation | [`SubagentRequest`] (`TreeChild` / `Ephemeral`), [`SubagentResult`], [`Subagent`] |
-//! | Binding | [`SubagentSource`], [`NoSubagents`], [`MapSubagents`] |
+//! | Dispatch | [`SubagentResolver`], [`NoSubagents`], [`MapSubagents`] |
 //! | Spawn | [`SessionSpawner`], [`SpawnBudget`] |
 //!
 //! **Tool-shaped delegation:** from the parent turn's view one subagent invocation
@@ -36,7 +36,7 @@ pub mod subagent;
 pub use spawn::{SessionSpawner, SpawnBudget};
 pub use subagent::{
     DelegationContext, EphemeralRequest, MapSubagents, NoSubagents, Subagent, SubagentRequest,
-    SubagentResult, SubagentSource, TreeChildRequest,
+    SubagentResolver, SubagentResult, TreeChildRequest,
 };
 
 #[cfg(test)]
@@ -49,8 +49,8 @@ mod integration {
     use serde_json::json;
 
     use super::{
-        DelegationContext, MapSubagents, Subagent, SubagentRequest, SubagentResult, SubagentSource,
-        TreeChildRequest,
+        DelegationContext, MapSubagents, Subagent, SubagentRequest, SubagentResolver,
+        SubagentResult, TreeChildRequest,
     };
 
     /// Test double: echoes the request input back as the delegation output.
@@ -82,7 +82,7 @@ mod integration {
             unreachable!("fixture is TreeChild")
         };
         let subagent = source
-            .subagent_for(&DelegationContext::new(
+            .resolve(&DelegationContext::new(
                 inner.tool_name.clone(),
                 inner.input.clone(),
                 inner.parent_session_id.clone(),
@@ -95,7 +95,7 @@ mod integration {
         assert_eq!(req.tool_call_id(), &ToolCallId::new("tc-1"));
         assert!(
             source
-                .subagent_for(&DelegationContext::new(
+                .resolve(&DelegationContext::new(
                     ToolName::new("missing"),
                     json!({}),
                     inner.parent_session_id.clone(),
