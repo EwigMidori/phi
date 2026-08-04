@@ -10,12 +10,12 @@ First package of **[phi](../../README.md)**: minimal agent **mechanisms**.
 | Errors | `KernelError` |
 | Agent contract | `AgentRuntime`, `TurnRequest`, `AgentEvent`, `AgentPrefix`, `TurnMaterials`, `AgentPorts` |
 | Generation | **`SendQueue`**, `GenerationJob`, `SessionDirectory` (`AgentPorts` = runtime + materials) |
-| History | `Transcript` (`ensure_live`, record, `truncate_from`, load_dialogue), `InMemoryTranscript` |
+| History | `Transcript` (`ensure_live`, record, `truncate_from`, `load_turn_history`), `InMemoryTranscript` |
 | Events | `KernelEvent` (generation-class only), `EventBus` |
 
 **Stream commit:** `EffectBatch` writes are recorded then **projected** to tool bus events; pure `notices` follow. Terminal jobs use `TurnOutcome` (`apply_terminal`), not `EffectBatch`. Tool success path is write-only in the turn (no dual-built Record+Emit).
 
-**`DialogueRole::System`:** reserved on the agent contract for injected context; baseline `InMemoryTranscript` does not persist System rows yet (future ext / product store).
+**Turn history:** `TurnRequest.history` is the full interleaved sequence (user / assistant / tool rows in transcript order) — one ordered `Vec<TurnItem>`, no separate dialogue / tool projections to reassemble. Tool `input` / `output` stay opaque to the kernel.
 
 ## Boundary: tools / approval / prefix (kernel vs adapter)
 
@@ -26,7 +26,7 @@ First package of **[phi](../../README.md)**: minimal agent **mechanisms**.
 | `AgentEvent::ToolApprovalRequired` | Stream **observation shape only** (not a policy engine) |
 | `TurnMaterials` / `SourcesTurnMaterials` | `prepare` → `TurnRequest` (prefix + seal snapshots); sources stay ISP-split underneath |
 | `AgentPorts` | Plumbing bag: `agent` + `materials` (not a domain aggregate) |
-| `ToolCallSealPolicy` / `ToolCallSealSource` | Incomplete tool **ledger seal** (via materials; no enum default; not ACL) |
+| `ToolCallSealPolicy` / `ToolCallSealSource` | Incomplete tool **ledger seal** — **opt-in** (default posture: `LeaveOpen`; via materials; no enum default; not ACL) |
 | `AgentPrefix` (`preamble` sections, `tools`, `skill_index`) | **Binding** via `AgentPrefixSource`; Turn carries a snapshot only |
 | Preamble render | `AgentPrefix::render_preamble()` → `<name>content</name>` per section |
 | Skill index | `BTreeMap<SkillSlug, SkillDesc>` — catalog only; **no** skill bodies |

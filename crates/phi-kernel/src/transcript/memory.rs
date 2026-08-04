@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use crate::agent::{DialogueRole, DialogueTurn, ToolCallId, ToolName, ToolResultStatus};
+use crate::agent::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
 use crate::error::{KernelError, Result};
 use crate::ids::{MessageId, SessionId};
 
@@ -42,7 +42,6 @@ struct MemoryInner {
 /// In-memory transcript authority (reference implementation of [`Transcript`]).
 ///
 /// Baseline store: user / assistant / tool rows only.
-/// [`DialogueRole::System`](DialogueRole::System) is contract-reserved; not stored here yet.
 ///
 /// [`Clone`] shares the in-memory store (`Arc`); it does **not** snapshot-fork
 /// sessions or message history.
@@ -165,25 +164,54 @@ impl Transcript for InMemoryTranscript {
         Ok(self.lock().version)
     }
 
-    fn load_dialogue(&self, session_id: &SessionId) -> Result<Vec<DialogueTurn>> {
+    fn load_turn_history(&self, session_id: &SessionId) -> Result<Vec<TurnItem>> {
         let g = self.lock();
         let Some(s) = g.sessions.get(session_id.as_str()) else {
             return Err(KernelError::SessionNotFound(session_id.to_string()));
         };
-        Ok(s.messages
-            .iter()
-            .filter_map(|m| match m.role {
-                StoredRole::User => Some(DialogueTurn {
-                    role: DialogueRole::User,
+        let mut history = Vec::with_capacity(s.messages.len());
+        for m in &s.messages {
+            let item = match m.role {
+                StoredRole::User => TurnItem::User {
                     content: m.content.clone(),
-                }),
-                StoredRole::Assistant => Some(DialogueTurn {
-                    role: DialogueRole::Assistant,
+                },
+                StoredRole::Assistant => TurnItem::Assistant {
                     content: m.content.clone(),
-                }),
-                StoredRole::ToolCall | StoredRole::ToolResult => None,
-            })
-            .collect())
+                },
+                StoredRole::ToolCall => {
+                    // Ad-hoc blob written by `record_tool_call` — same-module invariant.
+                    let row: Value =
+                        serde_json::from_str(&m.content).expect("tool-call row is stored JSON");
+                    TurnItem::ToolCall {
+                        tool_call_id: ToolCallId::new(
+                            row["toolCallId"].as_str().expect("stored call carries toolCallId"),
+                        ),
+                        tool_name: ToolName::new(
+                            row["toolName"].as_str().expect("stored call carries toolName"),
+                        ),
+                        input: row["input"].clone(),
+                    }
+                }
+                StoredRole::ToolResult => {
+                    // Ad-hoc blob written by `record_tool_result` — same-module invariant.
+                    let row: Value =
+                        serde_json::from_str(&m.content).expect("tool-result row is stored JSON");
+                    TurnItem::ToolResult {
+                        tool_call_id: ToolCallId::new(
+                            row["toolCallId"].as_str().expect("stored result carries toolCallId"),
+                        ),
+                        tool_name: ToolName::new(
+                            row["toolName"].as_str().expect("stored result carries toolName"),
+                        ),
+                        output: row["output"].clone(),
+                        status: serde_json::from_value(row["status"].clone())
+                            .expect("stored result carries a parseable status"),
+                    }
+                }
+            };
+            history.push(item);
+        }
+        Ok(history)
     }
 
     fn record_user(&self, session_id: &SessionId, text: &str) -> Result<RecordResult> {

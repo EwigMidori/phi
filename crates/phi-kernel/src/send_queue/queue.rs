@@ -212,15 +212,15 @@ impl SendQueue {
                 continue;
             }
 
-            let dialogue = transcript.load_dialogue(&session_id)?;
-            let turn = GenerationTurn::begin(job, claimed_epoch, dialogue);
+            let history = transcript.load_turn_history(&session_id)?;
+            let turn = GenerationTurn::begin(job, claimed_epoch, history);
             applier.commit(CommitUnit::Stream {
                 job_id: turn.job_id(),
                 batch: turn.start_effects(),
             })?;
 
             // Precondition fault → Failed (error message), not Aborted.
-            if turn.dialogue().is_empty() {
+            if turn.history().is_empty() {
                 self.finish_outcome(turn.into_failed("no dialogue for agent"), &applier)?;
                 continue;
             }
@@ -234,7 +234,7 @@ impl SendQueue {
             let request = ports.materials.prepare(
                 &session_id,
                 turn.job_id().clone(),
-                turn.dialogue().to_vec(),
+                turn.history().to_vec(),
                 cancel.clone(),
             );
             let tool_call_seal = request.tool_call_seal;

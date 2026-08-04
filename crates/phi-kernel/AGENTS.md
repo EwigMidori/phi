@@ -10,7 +10,7 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 - `AgentRuntime` / `TurnRequest` / `AgentEvent`
 - `AgentPorts` = runtime + `TurnMaterials` (pump inject); `SourcesTurnMaterials` = default prepare from sources
 - `AgentPrefix` / `AgentPrefixSource` / `PreambleSection` / `SkillSlug` / `SkillDesc` / `ToolSpec`
-- `ToolCallSealPolicy` / `ToolCallSealSource` (seal; no enum default; usually behind materials)
+- `ToolCallSealPolicy` / `ToolCallSealSource` (seal; **opt-in** — default posture `LeaveOpen`; no enum default; usually behind materials)
 - **`SendQueue`** / `GenerationJob` / `SessionDirectory` (never call this "mailbox")
 - `Transcript` / `truncate_from` (trait in `transcript/`); reference impl `transcript::memory::InMemoryTranscript` (re-exported)
 
@@ -19,7 +19,7 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 | Layer | Fields | Owner |
 |-------|--------|--------|
 | **Prefix** | `preamble` (`Vec<PreambleSection>`), `tools`, `skill_index` (`BTreeMap<SkillSlug, SkillDesc>`) | Session/agent **binding** via `AgentPrefixSource`; `TurnRequest.prefix` is a **read-only snapshot** |
-| **Turn** | `dialogue`, `cancel`, `job_id`, `tool_call_seal` (snapshot) | This generation; assembled by `TurnMaterials::prepare` |
+| **Turn** | `history` (`Vec<TurnItem>`), `cancel`, `job_id`, `tool_call_seal` (snapshot) | This generation; assembled by `TurnMaterials::prepare` |
 | **Pump inject** | `AgentPorts` { agent, materials } | Directory/queue plumbing — not a domain aggregate |
 
 - `AgentPrefix::render_preamble()` → `<section-name>content</section-name>` per section, joined by `\n`
@@ -34,13 +34,13 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 - **Sole commit path:** `EffectApplier` (`apply_stream(job_id, batch)` for stream/start/seal; `apply_terminal` for Done/Stopped/Error; optional `commit(CommitUnit)`)
 - **`apply_stream` hard order:** for each write: `record_*` then immediately projected tool notice; then all `batch.notices`
 - `GenerationTurn::drive` owns the agent stream loop; `SendQueue::run_until_idle` is claim → begin → applier → `agent.run` → drive → mark_finished + apply_terminal
-- Open tools: `ToolLedger` (open/close/seal); seal policy comes from `TurnRequest` after `materials.prepare` (typically `SourcesTurnMaterials` → `ToolCallSealSource`)
+- Open tools: `ToolLedger` (open/close; seal opt-in via `ToolCallSealPolicy`, default posture `LeaveOpen`); seal policy comes from `TurnRequest` after `materials.prepare` (typically `SourcesTurnMaterials` → `ToolCallSealSource`)
 
 ## Allowed (tools / policy shapes)
 
 - `AgentEvent` tool shapes (`ToolCall`, `ToolResult`, `ToolApprovalRequired` as stream observation only)
 - `ToolCallId` (provider correlation key, not document PK) / `ToolName` (catalog name); ledger is `HashMap<ToolCallId, ToolName>`
-- `ToolCallSealPolicy` incomplete-tool ledger seal (not ACL)
+- `ToolCallSealPolicy` incomplete-tool ledger seal (**opt-in**; not ACL)
 - Adapter pass-through of `AgentPrefix` (may be empty tools/skills)
 - Tool-result **outcome** is `ToolResultStatus` on `AgentEvent::ToolResult` / `KernelEvent::GenerationToolResult` / `Transcript::record_tool_result` only
 - `output` is opaque JSON for model/UI; kernel never interprets its keys

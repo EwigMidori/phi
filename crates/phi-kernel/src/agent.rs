@@ -8,7 +8,7 @@
 //!   policy engine.
 //! - Tool-result outcome is [`ToolResultStatus`] on the event; `output` is opaque.
 //! - Prefix material ([`AgentPrefix`]) is **session/binding** owned; Turn carries a
-//!   read-only snapshot. Turn-owned mechanics: [`ToolCallSealPolicy`], cancel, dialogue.
+//!   read-only snapshot. Turn-owned mechanics: [`ToolCallSealPolicy`], cancel, history.
 //! - Ban: `stream(text) -> text` as the stable public boundary
 //! - No Handout / tree / graph types here
 
@@ -24,23 +24,34 @@ use serde_json::Value;
 
 use crate::ids::{JobId, SessionId};
 
-// ── Dialogue projection ────────────────────────────────────────────────────
+// ── Turn history projection ────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DialogueRole {
-    User,
-    Assistant,
-    /// Contract-reserved injected context (e.g. future handout / ext summary).
-    /// Baseline [`crate::transcript::InMemoryTranscript`] does **not** store System rows yet.
-    System,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DialogueTurn {
-    pub role: DialogueRole,
-    pub content: String,
+/// One stored turn row in transcript order. The model context is the full
+/// interleaved sequence (user / assistant / tool rows), so [`TurnRequest::history`]
+/// carries a single ordered [`Vec`] — no separate dialogue / tool projections
+/// to reassemble.
+///
+/// `input` / `output` stay opaque `Value`s (kernel discipline: never sniffed).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum TurnItem {
+    #[serde(rename_all = "camelCase")]
+    User { content: String },
+    #[serde(rename_all = "camelCase")]
+    Assistant { content: String },
+    #[serde(rename_all = "camelCase")]
+    ToolCall {
+        tool_call_id: ToolCallId,
+        tool_name: ToolName,
+        input: Value,
+    },
+    #[serde(rename_all = "camelCase")]
+    ToolResult {
+        tool_call_id: ToolCallId,
+        tool_name: ToolName,
+        output: Value,
+        status: ToolResultStatus,
+    },
 }
 
 // ── Tools / tool-result status ─────────────────────────────────────────────
@@ -72,6 +83,11 @@ pub enum ToolResultStatus {
 }
 
 /// How the pump closes tool calls that never received a [`AgentEvent::ToolResult`].
+///
+/// **Opt-in mechanism, not a default policy.** The kernel's default posture is
+/// [`Self::LeaveOpen`] — no auto-seal. The "every open call gets a terminal row"
+/// closed-record invariant is a **product choice**: products that want it opt
+/// into [`Self::SealOnStreamEnd`] / [`Self::SealAlways`].
 ///
 /// **Turn / pump mechanism** (not model-prefix material). No [`Default`] — product must
 /// choose explicitly via [`ToolCallSealSource`] (resolved per generation, not frozen
@@ -237,13 +253,14 @@ impl TurnCancel {
 
 /// Input to [`AgentRuntime::run`].
 ///
-/// - [`Self::prefix`]: snapshot of binding prefix (not “this turn’s policy”)
-/// - [`Self::tool_call_seal`]: this generation’s pump seal policy
+/// - [`Self::history`]: full interleaved turn history (user / assistant / tool rows)
+/// - [`Self::prefix`]: snapshot of binding prefix (not "this turn's policy")
+/// - [`Self::tool_call_seal`]: this generation's pump seal policy
 #[derive(Clone, Debug)]
 pub struct TurnRequest {
     pub session_id: SessionId,
     pub job_id: JobId,
-    pub dialogue: Vec<DialogueTurn>,
+    pub history: Vec<TurnItem>,
     pub prefix: AgentPrefix,
     pub tool_call_seal: ToolCallSealPolicy,
     pub cancel: TurnCancel,
@@ -342,7 +359,7 @@ pub trait TurnMaterials: Send + Sync {
         &self,
         session_id: &SessionId,
         job_id: JobId,
-        dialogue: Vec<DialogueTurn>,
+        history: Vec<TurnItem>,
         cancel: TurnCancel,
     ) -> TurnRequest;
 }
@@ -371,13 +388,13 @@ impl TurnMaterials for SourcesTurnMaterials {
         &self,
         session_id: &SessionId,
         job_id: JobId,
-        dialogue: Vec<DialogueTurn>,
+        history: Vec<TurnItem>,
         cancel: TurnCancel,
     ) -> TurnRequest {
         TurnRequest {
             session_id: session_id.clone(),
             job_id,
-            dialogue,
+            history,
             prefix: self.prefix.prefix_for(session_id),
             tool_call_seal: self.tool_call_seal.tool_call_seal_for(session_id),
             cancel,
@@ -483,7 +500,7 @@ mod tests {
         let req = materials.prepare(&sid, job_id.clone(), Vec::new(), TurnCancel::new());
         assert_eq!(req.session_id, sid);
         assert_eq!(req.job_id, job_id);
-        assert!(req.dialogue.is_empty());
+        assert!(req.history.is_empty());
         assert!(req.prefix.tools.is_empty());
         assert_eq!(req.tool_call_seal, ToolCallSealPolicy::SealAlways);
     }

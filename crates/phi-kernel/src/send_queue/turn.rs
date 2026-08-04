@@ -14,8 +14,8 @@
 use futures::StreamExt;
 
 use crate::agent::{
-    AgentEvent, AgentEventStream, DialogueTurn, ToolCallId, ToolCallSealPolicy, ToolName,
-    ToolResultStatus, TurnCancel,
+    AgentEvent, AgentEventStream, ToolCallId, ToolCallSealPolicy, ToolName, ToolResultStatus,
+    TurnCancel, TurnItem,
 };
 use crate::error::Result;
 use crate::events::KernelEvent;
@@ -32,7 +32,7 @@ pub(crate) struct GenerationTurn {
     job: GenerationJob,
     assistant_message_id: MessageId,
     claimed_epoch: Epoch,
-    dialogue: Vec<DialogueTurn>,
+    history: Vec<TurnItem>,
     buffer: String,
     tool_ledger: ToolLedger,
 }
@@ -42,13 +42,13 @@ impl GenerationTurn {
     pub(crate) fn begin(
         job: GenerationJob,
         claimed_epoch: Epoch,
-        dialogue: Vec<DialogueTurn>,
+        history: Vec<TurnItem>,
     ) -> Self {
         Self {
             job,
             assistant_message_id: MessageId::generate(),
             claimed_epoch,
-            dialogue,
+            history,
             buffer: String::new(),
             tool_ledger: ToolLedger::new(),
         }
@@ -65,8 +65,8 @@ impl GenerationTurn {
     }
 
     #[must_use]
-    pub(crate) fn dialogue(&self) -> &[DialogueTurn] {
-        &self.dialogue
+    pub(crate) fn history(&self) -> &[TurnItem] {
+        &self.history
     }
 
     #[must_use]
@@ -222,6 +222,7 @@ impl GenerationTurn {
     }
 
     /// Seal still-open tools: durable Incomplete results only (projection in applier).
+    /// Opt-in via [`ToolCallSealPolicy`] — the default posture is `LeaveOpen`.
     fn seal_incomplete_effects(&mut self) -> EffectBatch {
         let open = self.tool_ledger.seal_incomplete();
         if open.is_empty() {

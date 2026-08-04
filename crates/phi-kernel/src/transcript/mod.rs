@@ -14,7 +14,7 @@ pub use memory::InMemoryTranscript;
 
 use serde_json::Value;
 
-use crate::agent::{DialogueTurn, ToolCallId, ToolName, ToolResultStatus};
+use crate::agent::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
 use crate::error::Result;
 use crate::ids::{MessageId, SessionId};
 
@@ -52,8 +52,9 @@ pub trait Transcript: Send + Sync {
     /// assistant writes (`wrote: false`).
     fn version(&self) -> Result<u64>;
 
-    /// Load dialogue turns for the agent context (user / assistant; not tool rows).
-    fn load_dialogue(&self, session_id: &SessionId) -> Result<Vec<DialogueTurn>>;
+    /// Load the full turn history in transcript order — user / assistant / tool
+    /// call / tool result interleaved. One ordered sequence; no reassembly.
+    fn load_turn_history(&self, session_id: &SessionId) -> Result<Vec<TurnItem>>;
 
     /// Append a user message. Requires a live session.
     fn record_user(&self, session_id: &SessionId, text: &str) -> Result<RecordResult>;

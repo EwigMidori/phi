@@ -40,10 +40,9 @@ pub mod transcript;
 
 pub use agent::{
     AgentEvent, AgentEventStream, AgentPorts, AgentPrefix, AgentPrefixSource, AgentRuntime,
-    DialogueRole, DialogueTurn, EmptyAgentPrefix, FixedAgentPrefix, FixedToolCallSeal,
-    PreambleSection, SkillDesc, SkillSlug, SourcesTurnMaterials, ToolCallId, ToolCallSealPolicy,
-    ToolCallSealSource, ToolName, ToolResultStatus, ToolSpec, TurnCancel, TurnMaterials,
-    TurnRequest,
+    EmptyAgentPrefix, FixedAgentPrefix, FixedToolCallSeal, PreambleSection, SkillDesc, SkillSlug,
+    SourcesTurnMaterials, ToolCallId, ToolCallSealPolicy, ToolCallSealSource, ToolName,
+    ToolResultStatus, ToolSpec, TurnCancel, TurnItem, TurnMaterials, TurnRequest,
 };
 pub use error::{KernelError, Result};
 pub use events::{EventBus, KernelEvent};
@@ -73,8 +72,8 @@ mod integration {
     impl AgentRuntime for FixedTextAgent {
         async fn run(&self, request: TurnRequest) -> std::result::Result<AgentEventStream, String> {
             assert!(
-                !request.dialogue.is_empty(),
-                "dialogue required for generation"
+                !request.history.is_empty(),
+                "history required for generation"
             );
             let text = self.0.to_owned();
             Ok(Box::pin(stream::iter([
@@ -124,7 +123,7 @@ mod integration {
         AgentPorts::from_sources(
             agent,
             Arc::new(EmptyAgentPrefix),
-            Arc::new(FixedToolCallSeal(ToolCallSealPolicy::SealOnStreamEnd)),
+            Arc::new(FixedToolCallSeal(ToolCallSealPolicy::LeaveOpen)),
         )
     }
 
@@ -147,11 +146,13 @@ mod integration {
 
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 
-        let dialogue = store.load_dialogue(&sid).unwrap();
-        let assistants: Vec<_> = dialogue
+        let history = store.load_turn_history(&sid).unwrap();
+        let assistants: Vec<_> = history
             .iter()
-            .filter(|t| t.role == DialogueRole::Assistant)
-            .map(|t| t.content.as_str())
+            .filter_map(|t| match t {
+                TurnItem::Assistant { content } => Some(content.as_str()),
+                _ => None,
+            })
             .collect();
         assert_eq!(assistants, ["reply", "reply"]);
         assert!(store.version().unwrap() >= 4);
@@ -213,10 +214,9 @@ mod integration {
         release.notify_one();
         handle.await.unwrap();
 
-        let dialogue = store.load_dialogue(&sid).unwrap();
-        assert_eq!(dialogue.len(), 1);
-        assert_eq!(dialogue[0].role, DialogueRole::User);
-        assert_eq!(dialogue[0].content, "keep me");
+        let history = store.load_turn_history(&sid).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(matches!(&history[0], TurnItem::User { content } if content == "keep me"));
     }
 
     #[tokio::test]
@@ -239,26 +239,28 @@ mod integration {
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 
-        let before = store.load_dialogue(&sid).unwrap();
+        let before = store.load_turn_history(&sid).unwrap();
         assert_eq!(before.len(), 4); // U1 A1 U2 A2
 
         dir.stop(&sid);
         let _ = dir.cancel_pending(&sid, None);
         let cut = store.truncate_from(&sid, &u2_id).unwrap();
         assert_eq!(cut.removed_count, 2); // U2 + A2
-        assert_eq!(store.load_dialogue(&sid).unwrap().len(), 2);
+        assert_eq!(store.load_turn_history(&sid).unwrap().len(), 2);
 
         let u2b = store.record_user(&sid, "two-edited").unwrap();
         dir.enqueue(&sid, GenerationJob::new(sid.clone(), u2b.message_id))
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 
-        let dialogue = store.load_dialogue(&sid).unwrap();
-        assert_eq!(dialogue.len(), 4);
-        assert_eq!(dialogue[0].content, "one");
-        assert_eq!(dialogue[2].content, "two-edited");
-        assert_eq!(dialogue[3].content, "new-reply");
-        assert!(!dialogue.iter().any(|t| t.content == "two"));
+        let history = store.load_turn_history(&sid).unwrap();
+        assert_eq!(history.len(), 4);
+        assert!(matches!(&history[0], TurnItem::User { content } if content == "one"));
+        assert!(matches!(&history[2], TurnItem::User { content } if content == "two-edited"));
+        assert!(matches!(&history[3], TurnItem::Assistant { content } if content == "new-reply"));
+        assert!(!history
+            .iter()
+            .any(|t| matches!(t, TurnItem::User { content } if content == "two")));
     }
 
     #[tokio::test]
@@ -277,7 +279,7 @@ mod integration {
                 }],
                 skill_index: BTreeMap::default(),
             })),
-            Arc::new(FixedToolCallSeal(ToolCallSealPolicy::SealOnStreamEnd)),
+            Arc::new(FixedToolCallSeal(ToolCallSealPolicy::LeaveOpen)),
         ));
         dir.activate(&sid);
         let events = bus();
@@ -286,14 +288,136 @@ mod integration {
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 
-        let dialogue = store.load_dialogue(&sid).unwrap();
+        let history = store.load_turn_history(&sid).unwrap();
         assert!(
-            dialogue
+            history
                 .iter()
-                .any(|t| t.role == DialogueRole::Assistant && t.content == "after-tool")
+                .any(|t| matches!(t, TurnItem::Assistant { content } if content == "after-tool"))
         );
-        // tool rows are not in dialogue projection; version advanced past user+tools+assistant
+        // tool rows are part of turn history; version advanced past user+tools+assistant
         assert!(store.version().unwrap() >= 4);
+    }
+
+    #[tokio::test]
+    async fn leave_open_posture_writes_no_incomplete_row() {
+        // Sealing is opt-in: under the LeaveOpen default posture, a turn that ends
+        // with an open tool leaves no fabricated ToolResult row in the history.
+        struct ToolCallOnlyAgent;
+
+        #[async_trait]
+        impl AgentRuntime for ToolCallOnlyAgent {
+            async fn run(
+                &self,
+                _request: TurnRequest,
+            ) -> std::result::Result<AgentEventStream, String> {
+                Ok(Box::pin(stream::iter([
+                    Ok(AgentEvent::ToolCall {
+                        tool_call_id: ToolCallId::new("tc1"),
+                        tool_name: ToolName::new("search"),
+                        input: serde_json::json!({"q": "x"}),
+                    }),
+                    Ok(AgentEvent::Finished {
+                        reason: Some("stop".into()),
+                    }),
+                ])))
+            }
+        }
+
+        let store = InMemoryTranscript::new();
+        let sid = SessionId::generate();
+        store.ensure_live(&sid).unwrap();
+        let dir = SessionDirectory::new(AgentPorts::from_sources(
+            Arc::new(ToolCallOnlyAgent),
+            Arc::new(EmptyAgentPrefix),
+            Arc::new(FixedToolCallSeal(ToolCallSealPolicy::LeaveOpen)),
+        ));
+        dir.activate(&sid);
+        let events = bus();
+
+        let u = store.record_user(&sid, "use tool").unwrap();
+        dir.enqueue(&sid, GenerationJob::new(sid.clone(), u.message_id))
+            .unwrap();
+        dir.run_until_idle(&sid, &store, &events).await.unwrap();
+
+        let history = store.load_turn_history(&sid).unwrap();
+        assert!(matches!(&history[0], TurnItem::User { .. }));
+        assert!(matches!(&history[1], TurnItem::ToolCall { .. }));
+        // No fabricated Incomplete result row under the default posture.
+        assert!(!history.iter().any(|t| matches!(t, TurnItem::ToolResult { .. })));
+    }
+
+    #[tokio::test]
+    async fn orchestrated_tool_rows_reach_next_turn_history() {
+        // Regression: orchestration writes tool call + result rows between turns;
+        // the next run_until_idle must deliver them to the model in transcript
+        // order (interleaved, not dropped).
+        use std::sync::Mutex;
+
+        struct CaptureAgent {
+            last: Arc<Mutex<Option<TurnRequest>>>,
+        }
+
+        #[async_trait]
+        impl AgentRuntime for CaptureAgent {
+            async fn run(
+                &self,
+                request: TurnRequest,
+            ) -> std::result::Result<AgentEventStream, String> {
+                *self.last.lock().unwrap() = Some(request);
+                Ok(Box::pin(stream::iter([
+                    Ok(AgentEvent::TextDelta {
+                        text: "done".into(),
+                    }),
+                    Ok(AgentEvent::Finished {
+                        reason: Some("stop".into()),
+                    }),
+                ])))
+            }
+        }
+
+        let store = InMemoryTranscript::new();
+        let sid = SessionId::generate();
+        store.ensure_live(&sid).unwrap();
+        let last = Arc::new(Mutex::new(None));
+        let dir = SessionDirectory::new(test_ports(Arc::new(CaptureAgent {
+            last: last.clone(),
+        })));
+        dir.activate(&sid);
+        let events = bus();
+
+        let u = store.record_user(&sid, "use tool").unwrap();
+        let tc = ToolCallId::new("tc1");
+        let name = ToolName::new("echo");
+        // Orchestration writes the tool round-trip directly (external execution).
+        store
+            .record_tool_call(&sid, &tc, &name, &serde_json::json!({"x": 1}))
+            .unwrap();
+        store
+            .record_tool_result(
+                &sid,
+                &tc,
+                &name,
+                &serde_json::json!({"echo": {"x": 1}}),
+                ToolResultStatus::Ok,
+            )
+            .unwrap();
+        dir.enqueue(&sid, GenerationJob::new(sid.clone(), u.message_id))
+            .unwrap();
+        dir.run_until_idle(&sid, &store, &events).await.unwrap();
+
+        let req = last.lock().unwrap().clone().expect("agent ran");
+        // Interleaved order preserved: user → tool call → tool result.
+        assert!(matches!(&req.history[0], TurnItem::User { content } if content == "use tool"));
+        assert!(matches!(
+            &req.history[1],
+            TurnItem::ToolCall { tool_call_id, tool_name, .. }
+                if tool_call_id.as_str() == "tc1" && tool_name.as_str() == "echo"
+        ));
+        assert!(matches!(
+            &req.history[2],
+            TurnItem::ToolResult { tool_call_id, status: ToolResultStatus::Ok, .. }
+                if tool_call_id.as_str() == "tc1"
+        ));
     }
 
     #[test]
