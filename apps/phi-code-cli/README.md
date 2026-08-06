@@ -2,13 +2,25 @@
 
 Thin binary entry for phi-code.
 
-| Layer | Crate / module |
-|-------|----------------|
-| Product runtime | `phi-code-core` |
-| TUI objects | `phi-code-ui` |
-| Shell + panes | `shell`, `scrollback_pane`, `prompt_pane`, `turn_driver` |
-| Terminal host | `main` (`run_terminal_host`) |
+## LLM config
 
-```bash
+Reads **only** the process cwd’s `.env` via `dotenvy` (no parent-directory walk), plus already-exported env vars.
+
+```powershell
+# From a directory that contains .env with AGENT_LLM__*:
+cd path\to\dir-with-dotenv
+cargo run -p phi-code-cli --manifest-path E:\...\open-source\Cargo.toml
+```
+
+Or export env explicitly:
+
+```powershell
+$env:AGENT_LLM__API_KEY = "sk-..."
+$env:AGENT_LLM__MODEL = "deepseek-v4-flash"
+$env:AGENT_LLM__BASE_URL = "https://api.deepseek.com"
+$env:AGENT_LLM__API_STYLE = "responses"
+
 cargo run -p phi-code-cli
 ```
+
+Do **not** commit API keys.

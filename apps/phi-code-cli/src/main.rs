@@ -1,4 +1,6 @@
 //! phi-code CLI — terminal host over [`AgentShell`].
+//!
+//! Tokio runtime hosts LLM stream tasks; the TUI loop stays tick-driven.
 
 mod prompt_pane;
 mod scrollback_pane;
@@ -14,11 +16,17 @@ use crossterm::event::{
 use crossterm::execute;
 use shell::AgentShell;
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    // Only the process cwd's `.env` — never walk parent monorepo dirs.
+    let _ = dotenvy::dotenv();
     run_terminal_host()
 }
 
 /// Own terminal lifecycle; all product behavior lives on [`AgentShell`].
+///
+/// Must run inside a Tokio runtime so [`phi_code_core::SessionTurnRunner`] can
+/// `tokio::spawn` the LLM stream.
 fn run_terminal_host() -> io::Result<()> {
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableBracketedPaste, EnableMouseCapture)?;

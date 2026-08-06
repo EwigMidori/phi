@@ -35,12 +35,17 @@ impl AgentShell {
     pub fn new() -> Self {
         // TextArea gets its own clipboard provider; pane also holds one for selection copy.
         let prompt = PromptPane::new(Box::new(SystemClipboard::new()));
+        let driver = TurnDriver::from_env();
+        let status_note = driver
+            .config_error()
+            .map(|e| format!("warn: {e}"))
+            .unwrap_or_default();
         Self {
             focus: Focus::Prompt,
-            status_note: String::new(),
+            status_note,
             prompt,
             scrollback: ScrollbackPane::new(),
-            driver: TurnDriver::new(),
+            driver,
             quit: false,
         }
     }
@@ -92,7 +97,8 @@ impl AgentShell {
         };
         frame.render_widget(
             Paragraph::new(format!(
-                " focus:{focus_label}  {mode}  {stream}  turns:{}  h:{}{note} ",
+                " focus:{focus_label}  {mode}  {stream}  model:{}  turns:{}  h:{}{note} ",
+                self.driver.model_label(),
                 self.scrollback.scrollback().items().len(),
                 self.scrollback.scrollback().total_height()
             )),

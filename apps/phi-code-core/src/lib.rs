@@ -1,13 +1,21 @@
 //! # phi-code-core
 //!
-//! Product runtime for phi-code (agent orchestration, session policy).
+//! Product runtime for phi-code (agent orchestration, LLM adapters).
 //!
 //! Terminal UI lives in `phi-code-ui` — this crate must not grow TUI
 //! view/layout/paint responsibilities.
 
 #![forbid(unsafe_code)]
 
-pub use phi_kernel::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
+pub mod llm;
+pub mod turn_runner;
+
+pub use llm::{ApiStyle, LlmConfig, LlmConfigError, OpenAiCompatRuntime};
+pub use phi_kernel::{
+    AgentEvent, AgentRuntime, JobId, SessionId, ToolCallId, ToolName, ToolResultStatus, TurnItem,
+    TurnRequest,
+};
+pub use turn_runner::{SessionTurnRunner, TurnProgress};
 
 pub const CORE_NAME: &str = "phi-code-core";
 

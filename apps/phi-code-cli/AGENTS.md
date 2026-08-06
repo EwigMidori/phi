@@ -10,7 +10,7 @@ Thin **terminal host** over `phi-code-core` + `phi-code-ui`.
 | `shell.rs` | `AgentShell` — tick / draw / handle routing |
 | `scrollback_pane.rs` | History, selection, scrollbar, nav keys |
 | `prompt_pane.rs` | TextArea + paste policy |
-| `turn_driver.rs` | Submit user → stream assistant (demo echo; core later) |
+| `turn_driver.rs` | Submit user → `SessionTurnRunner` / OpenAI-compat LLM |
 
 ## Forbidden
 
