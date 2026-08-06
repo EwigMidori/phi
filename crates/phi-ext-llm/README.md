@@ -4,7 +4,8 @@ OpenAI-compatible HTTP/SSE → kernel `AgentRuntime`.
 
 | API | Role |
 |-----|------|
-| `LlmConfig` | base / key / model / style |
+| `LlmConfig` | `ApiBase` + `ApiKey` + `ModelId` + `ApiStyle` |
+| `ApiBase` / `ApiKey` / `ModelId` | validated wire config newtypes (`try_new`) |
 | `ApiStyle` | `responses` \| `completions` |
 | `HistoryProjector` | optional strategy **port** (product implements) |
 | `PassThrough` | default projector (no filter) |

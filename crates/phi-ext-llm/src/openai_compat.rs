@@ -3,6 +3,7 @@
 //! **Mechanism objects** (Kay): encode + HTTP/SSE. Context policy is product-owned —
 //! inject a [`HistoryProjector`]. Default is [`PassThrough`] (D3: no baked-in policy).
 
+use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -35,29 +36,135 @@ pub enum ApiStyle {
     Completions,
 }
 
+/// Provider model id (e.g. `gpt-4o-mini`). Non-empty after trim.
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct ModelId(String);
+
+impl ModelId {
+    /// Reject empty / whitespace-only.
+    pub fn try_new(value: impl AsRef<str>) -> Result<Self, String> {
+        let s = value.as_ref().trim();
+        if s.is_empty() {
+            return Err("model id empty".into());
+        }
+        Ok(Self(s.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ModelId").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for ModelId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// API root URL without a trailing slash (e.g. `https://api.openai.com/v1`).
+///
+/// Non-empty after trim; trailing `/` stripped. Scheme is not enforced (hosts may
+/// use proxies or placeholders).
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct ApiBase(String);
+
+impl ApiBase {
+    /// Trim, reject empty, strip trailing `/`.
+    pub fn try_new(value: impl AsRef<str>) -> Result<Self, String> {
+        let s = value.as_ref().trim().trim_end_matches('/');
+        if s.is_empty() {
+            return Err("api base empty".into());
+        }
+        Ok(Self(s.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ApiBase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ApiBase").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for ApiBase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for ApiBase {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Bearer credential. Non-empty after trim. [`Debug`] redacts the secret.
+#[derive(Clone, Eq, PartialEq, Hash)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    /// Reject empty / whitespace-only.
+    pub fn try_new(value: impl AsRef<str>) -> Result<Self, String> {
+        let s = value.as_ref().trim();
+        if s.is_empty() {
+            return Err("api key empty".into());
+        }
+        Ok(Self(s.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ApiKey(***)")
+    }
+}
+
+impl AsRef<str> for ApiKey {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 /// Endpoint settings for [`OpenAiCompatRuntime`].
 ///
-/// Construct explicitly; product binaries map env / config files → this struct.
+/// Construct with typed fields; product hosts map env / config files → these newtypes.
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
-    pub api_base: String,
-    pub api_key: String,
-    pub model: String,
+    pub api_base: ApiBase,
+    pub api_key: ApiKey,
+    pub model: ModelId,
     pub api_style: ApiStyle,
 }
 
 impl LlmConfig {
     #[must_use]
-    pub fn new(
-        api_base: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-        api_style: ApiStyle,
-    ) -> Self {
+    pub fn new(api_base: ApiBase, api_key: ApiKey, model: ModelId, api_style: ApiStyle) -> Self {
         Self {
-            api_base: api_base.into(),
-            api_key: api_key.into(),
-            model: model.into(),
+            api_base,
+            api_key,
+            model,
             api_style,
         }
     }
@@ -200,7 +307,7 @@ impl OpenAiCompatRuntime {
     fn endpoint_url(&self) -> String {
         format!(
             "{}/{}",
-            self.config.api_base,
+            self.config.api_base.as_str(),
             self.codec.endpoint_path()
         )
     }
@@ -210,15 +317,17 @@ impl OpenAiCompatRuntime {
 impl AgentRuntime for OpenAiCompatRuntime {
     async fn run(&self, request: TurnRequest) -> Result<AgentEventStream, String> {
         let history = self.projector.project(&request.history);
-        let body = self
-            .codec
-            .request_body(&self.config.model, &request.prefix, &history);
+        let body = self.codec.request_body(
+            self.config.model.as_str(),
+            &request.prefix,
+            &history,
+        );
         let url = self.endpoint_url();
 
         let response = self
             .client
             .post(&url)
-            .bearer_auth(&self.config.api_key)
+            .bearer_auth(self.config.api_key.as_str())
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -502,5 +611,35 @@ impl SseReader {
         } else {
             Some(usage)
         }
+    }
+}
+
+#[cfg(test)]
+mod config_newtype_tests {
+    use super::{ApiBase, ApiKey, ModelId};
+
+    #[test]
+    fn model_id_rejects_empty() {
+        assert!(ModelId::try_new("").is_err());
+        assert!(ModelId::try_new("   ").is_err());
+        assert_eq!(ModelId::try_new(" gpt ").unwrap().as_str(), "gpt");
+    }
+
+    #[test]
+    fn api_base_strips_trailing_slash_and_rejects_empty() {
+        assert!(ApiBase::try_new("").is_err());
+        assert!(ApiBase::try_new("///").is_err());
+        assert_eq!(
+            ApiBase::try_new("https://api.openai.com/v1/").unwrap().as_str(),
+            "https://api.openai.com/v1"
+        );
+    }
+
+    #[test]
+    fn api_key_rejects_empty_and_redacts_debug() {
+        assert!(ApiKey::try_new("").is_err());
+        let key = ApiKey::try_new("sk-secret").unwrap();
+        assert_eq!(key.as_str(), "sk-secret");
+        assert_eq!(format!("{key:?}"), "ApiKey(***)");
     }
 }

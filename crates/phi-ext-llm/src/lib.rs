@@ -5,7 +5,7 @@
 //!
 //! | Area | Surface |
 //! |------|---------|
-//! | Config | [`LlmConfig`], [`ApiStyle`] |
+//! | Config | [`LlmConfig`], [`ApiStyle`], [`ModelId`], [`ApiBase`], [`ApiKey`] |
 //! | Strategy port | [`HistoryProjector`], default [`PassThrough`] |
 //! | Runtime | [`OpenAiCompatRuntime`] |
 //!
@@ -20,7 +20,8 @@
 mod openai_compat;
 
 pub use openai_compat::{
-    ApiStyle, HistoryProjector, LlmConfig, OpenAiCompatRuntime, PassThrough,
+    ApiBase, ApiKey, ApiStyle, HistoryProjector, LlmConfig, ModelId, OpenAiCompatRuntime,
+    PassThrough,
 };
 
 pub const EXT_LLM_NAME: &str = "phi-ext-llm";

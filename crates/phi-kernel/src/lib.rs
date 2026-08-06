@@ -274,7 +274,7 @@ mod integration {
             Arc::new(FixedAgentPrefix(AgentPrefix {
                 preamble: Vec::new(),
                 tools: vec![ToolSpec {
-                    name: "echo".into(),
+                    name: ToolName::new("echo"),
                     description: "echo".into(),
                     parameters: None,
                 }],

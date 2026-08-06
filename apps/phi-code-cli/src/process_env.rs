@@ -2,7 +2,9 @@
 //!
 //! Not UI. Not phi-code-core. Side effects (env reads) live on [`ProcessEnv`] methods.
 
-use phi_code_core::{ApiStyle, LlmConfig, TurnDriver};
+use phi_code_core::{
+    ApiBase, ApiKey, ApiStyle, ContextWindowSize, LlmConfig, ModelId, TurnDriver,
+};
 
 /// Process-boundary product config (`PHI_*`).
 pub struct ProcessEnv;
@@ -20,22 +22,24 @@ impl ProcessEnv {
 
     /// Product-owned env mapping (not in `phi-ext-llm` / `phi-code-core`).
     fn load_llm_config() -> Result<LlmConfig, String> {
-        let api_key = Self::env_trim("PHI_API_KEY");
-        if api_key.is_empty() {
-            return Err("set PHI_API_KEY to call a real model".into());
-        }
-        let api_base = Self::env_trim("PHI_API_BASE");
-        let api_base = if api_base.is_empty() {
-            "https://api.openai.com/v1".into()
+        let api_key = ApiKey::try_new(Self::env_trim("PHI_API_KEY"))
+            .map_err(|_| "set PHI_API_KEY to call a real model".to_owned())?;
+
+        let base_raw = Self::env_trim("PHI_API_BASE");
+        let api_base = if base_raw.is_empty() {
+            ApiBase::try_new("https://api.openai.com/v1")
+                .expect("default api base is non-empty")
         } else {
-            api_base.trim_end_matches('/').to_owned()
+            ApiBase::try_new(base_raw)?
         };
-        let model = Self::env_trim("PHI_MODEL");
-        let model = if model.is_empty() {
-            "gpt-4o-mini".into()
+
+        let model_raw = Self::env_trim("PHI_MODEL");
+        let model = if model_raw.is_empty() {
+            ModelId::try_new("gpt-4o-mini").expect("default model is non-empty")
         } else {
-            model
+            ModelId::try_new(model_raw)?
         };
+
         let style_raw = Self::env_trim("PHI_API_STYLE");
         let api_style = if style_raw.is_empty() {
             ApiStyle::default()
@@ -46,21 +50,20 @@ impl ProcessEnv {
                 )
             })?
         };
-        Ok(LlmConfig {
-            api_base,
-            api_key,
-            model,
-            api_style,
-        })
+
+        Ok(LlmConfig::new(api_base, api_key, model, api_style))
     }
 
-    /// Context window denominator (`PHI_CONTEXT_WINDOW`, default 128000).
-    fn load_context_window() -> u64 {
+    /// Context window denominator (`PHI_CONTEXT_WINDOW`, default [`ContextWindowSize::DEFAULT`]).
+    fn load_context_window() -> ContextWindowSize {
         let raw = Self::env_trim("PHI_CONTEXT_WINDOW");
         if raw.is_empty() {
-            return 128_000;
+            return ContextWindowSize::DEFAULT;
         }
-        raw.parse::<u64>().unwrap_or(128_000).max(1)
+        match raw.parse::<u64>() {
+            Ok(n) => ContextWindowSize::try_new(n).unwrap_or(ContextWindowSize::DEFAULT),
+            Err(_) => ContextWindowSize::DEFAULT,
+        }
     }
 
     fn env_trim(key: &str) -> String {

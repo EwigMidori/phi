@@ -20,8 +20,9 @@ Depends on `phi-kernel` + `phi-ext-llm`. UI is `phi-code-ui`. Process env is hos
 - `SessionHost` — `submit_user` / `poll_events` → `PollBatch` / `history` → `Result` / `is_busy`
 - `PollBatch` — `events`, `lagged` (must resync history), `pump_error` (host-private, not a bus forge)
 - `TurnDriver` — product session driver: `from_config` / `unconfigured`, submit/tick, usage counts
-- DTOs: `SubmitOutcome`, `TickResult`, `ChannelInfo`, `UsageInfo`
-- Re-exports: `LlmConfig`, `ApiStyle`, `KernelEvent`, `TurnItem`, `SessionId`, …
+- `ContextWindowSize` — token window size (≥1); host-supplied, not read from env here
+- DTOs: `SubmitOutcome`, `TickResult`, `ChannelInfo` (`ModelId` / `Option<ApiStyle>` / `ApiBase` / `ContextWindowSize`), `UsageInfo`
+- Re-exports: `LlmConfig`, `ModelId`, `ApiBase`, `ApiKey`, `ApiStyle`, `KernelEvent`, `TurnItem`, `SessionId`, …
 
 ## Pump rules
 

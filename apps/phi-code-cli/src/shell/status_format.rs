@@ -8,7 +8,7 @@ use phi_code_core::{ChannelInfo, UsageInfo};
 /// Compact bar fragment: `used / window` (e.g. `12K / 128K`). Always shows window.
 #[must_use]
 pub fn usage_bar(usage: &UsageInfo) -> String {
-    let window = format_token_qty(usage.context_window);
+    let window = format_token_qty(usage.context_window.get());
     match usage.context_used() {
         Some(used) => format!("{} / {}", format_token_qty(used), window),
         None => format!("— / {window}"),
@@ -18,14 +18,19 @@ pub fn usage_bar(usage: &UsageInfo) -> String {
 /// Expanded panel: channel identity lines.
 #[must_use]
 pub fn channel_detail_lines(ch: &ChannelInfo) -> Vec<String> {
+    let style = ch
+        .api_style
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "—".into());
+    let window = ch.context_window.get();
     vec![
-        format!("  model:  {}", ch.model_id),
-        format!("  style:  {}", ch.api_style),
+        format!("  model:  {}", ch.model),
+        format!("  style:  {style}"),
         format!("  base:   {}", ch.api_base),
         format!(
             "  window: {} ({} tokens)",
-            format_token_qty(ch.context_window),
-            ch.context_window
+            format_token_qty(window),
+            window
         ),
     ]
 }
@@ -33,19 +38,20 @@ pub fn channel_detail_lines(ch: &ChannelInfo) -> Vec<String> {
 /// Expanded panel: usage detail lines.
 #[must_use]
 pub fn usage_detail_lines(usage: &UsageInfo) -> Vec<String> {
+    let window = usage.context_window.get();
     let mut lines = Vec::new();
     match usage.context_used() {
         Some(used) => lines.push(format!(
             "  context: {} / {} ({} / {} tokens)",
             format_token_qty(used),
-            format_token_qty(usage.context_window),
+            format_token_qty(window),
             used,
-            usage.context_window
+            window
         )),
         None => lines.push(format!(
             "  context: — / {} (window {}; waiting for provider usage)",
-            format_token_qty(usage.context_window),
-            usage.context_window
+            format_token_qty(window),
+            window
         )),
     }
     if let Some(u) = &usage.last {

@@ -70,7 +70,8 @@ pub enum TurnItem {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolSpec {
-    pub name: String,
+    /// Catalog name — same type as event/ledger [`ToolName`] (do not reintroduce bare `String`).
+    pub name: ToolName,
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Value>,
@@ -165,7 +166,7 @@ string_newtype! {
 }
 
 string_newtype! {
-    /// Tool catalog name (aligns with [`ToolSpec::name`]). Not a document identity.
+    /// Tool catalog name — the type of [`ToolSpec::name`] and tool events. Not a document identity.
     pub struct ToolName
 }
 

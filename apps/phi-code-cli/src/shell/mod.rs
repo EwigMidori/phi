@@ -200,7 +200,7 @@ impl AgentShell {
         let usage = self.driver.usage();
         StatusSnapshot {
             stream,
-            model_id: channel.model_id.clone(),
+            model: channel.model.to_string(),
             usage_bar: status_format::usage_bar(&usage),
             multiline: self.prompt.is_multiline(),
             channel_lines: status_format::channel_detail_lines(&channel),

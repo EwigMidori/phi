@@ -6,7 +6,9 @@ LLM **provider adapters** for **phi**: HTTP/SSE → `AgentRuntime` / `AgentEvent
 
 ## Public surface
 
-- `LlmConfig` / `ApiStyle`
+- `LlmConfig` — `ApiBase` + `ApiKey` + `ModelId` + `ApiStyle` (typed; no bare config strings)
+- `ApiBase` / `ApiKey` / `ModelId` — `try_new` rejects empty; `ApiBase` strips trailing `/`; `ApiKey` Debug redacted
+- `ApiStyle` — `responses` \| `completions`
 - `HistoryProjector` (strategy **port** only) + default `PassThrough`
 - `OpenAiCompatRuntime` — mechanism object (codec + HTTP + SSE)
 

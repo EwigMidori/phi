@@ -6,12 +6,47 @@
 //!
 //! Side effects (host, meters) live on [`TurnDriver`] methods — not free functions.
 
+use std::fmt;
 use std::sync::Arc;
 
-use phi_ext_llm::{HistoryProjector, LlmConfig, OpenAiCompatRuntime};
+use phi_ext_llm::{ApiBase, ApiStyle, HistoryProjector, LlmConfig, ModelId, OpenAiCompatRuntime};
 
 use crate::session::SessionHost;
 use crate::{KernelEvent, TurnItem, Usage};
+
+/// Context window size in tokens (denominator for usage chrome). Always ≥ 1.
+#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+pub struct ContextWindowSize(u64);
+
+impl ContextWindowSize {
+    /// Product default when host does not specify a window.
+    pub const DEFAULT: Self = Self(128_000);
+
+    /// Reject zero.
+    pub fn try_new(tokens: u64) -> Result<Self, String> {
+        if tokens == 0 {
+            return Err("context window must be ≥ 1".into());
+        }
+        Ok(Self(tokens))
+    }
+
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Debug for ContextWindowSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ContextWindowSize").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for ContextWindowSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Result of [`TurnDriver::submit`] — shell clears the prompt only on [`Accepted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,23 +73,38 @@ pub struct TickResult {
     pub generation_finished: bool,
 }
 
-/// Channel identity for the status chrome (raw product fields, no paint formatting).
+/// Channel identity for the status chrome (typed product fields, no paint formatting).
+///
+/// Reuses wire types [`ModelId`] / [`ApiBase`] / [`ApiStyle`] — no parallel string aliases.
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
-    pub model_id: String,
-    pub api_style: String,
-    pub api_base: String,
-    pub context_window: u64,
+    pub model: ModelId,
+    /// [`None`] when the driver is unconfigured (no live channel).
+    pub api_style: Option<ApiStyle>,
+    pub api_base: ApiBase,
+    pub context_window: ContextWindowSize,
 }
 
 /// Token usage for the status chrome (raw counts only).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UsageInfo {
     pub last: Option<Usage>,
     pub session_prompt: u64,
     pub session_completion: u64,
     pub session_total: u64,
-    pub context_window: u64,
+    pub context_window: ContextWindowSize,
+}
+
+impl Default for UsageInfo {
+    fn default() -> Self {
+        Self {
+            last: None,
+            session_prompt: 0,
+            session_completion: 0,
+            session_total: 0,
+            context_window: ContextWindowSize::DEFAULT,
+        }
+    }
 }
 
 impl UsageInfo {
@@ -89,7 +139,7 @@ impl UsageMeter {
         self.last = Some(usage);
     }
 
-    fn info(&self, context_window: u64) -> UsageInfo {
+    fn info(&self, context_window: ContextWindowSize) -> UsageInfo {
         UsageInfo {
             last: self.last.clone(),
             session_prompt: self.session_prompt,
@@ -104,10 +154,10 @@ impl UsageMeter {
 pub struct TurnDriver {
     host: Option<SessionHost>,
     config_error: Option<String>,
-    model_id: String,
-    api_style: String,
-    api_base: String,
-    context_window: u64,
+    model: ModelId,
+    api_style: Option<ApiStyle>,
+    api_base: ApiBase,
+    context_window: ContextWindowSize,
     /// Last status (errors, approval, pump) — not injected into transcript.
     last_note: Option<String>,
     usage: UsageMeter,
@@ -116,9 +166,9 @@ pub struct TurnDriver {
 impl TurnDriver {
     /// Build a live driver from host-supplied LLM config (no env reads).
     #[must_use]
-    pub fn from_config(cfg: LlmConfig, context_window: u64) -> Self {
-        let model_id = cfg.model.clone();
-        let api_style = cfg.api_style.as_ref().to_owned();
+    pub fn from_config(cfg: LlmConfig, context_window: ContextWindowSize) -> Self {
+        let model = cfg.model.clone();
+        let api_style = Some(cfg.api_style);
         let api_base = cfg.api_base.clone();
         // Product strategy: lean chat context (not owned by phi-ext-llm).
         let agent = Arc::new(
@@ -127,7 +177,7 @@ impl TurnDriver {
         Self {
             host: Some(SessionHost::new(agent)),
             config_error: None,
-            model_id,
+            model,
             api_style,
             api_base,
             context_window,
@@ -138,13 +188,16 @@ impl TurnDriver {
 
     /// Unconfigured driver — same failure shape as a missing host at submit time.
     #[must_use]
-    pub fn unconfigured(error: impl Into<String>, context_window: u64) -> Self {
+    pub fn unconfigured(error: impl Into<String>, context_window: ContextWindowSize) -> Self {
+        // Placeholders are valid typed values for chrome; host is absent.
+        let model = ModelId::try_new("unconfigured").expect("literal non-empty");
+        let api_base = ApiBase::try_new("—").expect("literal non-empty");
         Self {
             host: None,
             config_error: Some(error.into()),
-            model_id: "unconfigured".into(),
-            api_style: "—".into(),
-            api_base: "—".into(),
+            model,
+            api_style: None,
+            api_base,
             context_window,
             last_note: None,
             usage: UsageMeter::default(),
@@ -154,8 +207,8 @@ impl TurnDriver {
     #[must_use]
     pub fn channel(&self) -> ChannelInfo {
         ChannelInfo {
-            model_id: self.model_id.clone(),
-            api_style: self.api_style.clone(),
+            model: self.model.clone(),
+            api_style: self.api_style,
             api_base: self.api_base.clone(),
             context_window: self.context_window,
         }
@@ -302,5 +355,17 @@ impl HistoryProjector for ChatTextOnly {
             })
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ContextWindowSize;
+
+    #[test]
+    fn context_window_rejects_zero() {
+        assert!(ContextWindowSize::try_new(0).is_err());
+        assert_eq!(ContextWindowSize::try_new(1).unwrap().get(), 1);
+        assert_eq!(ContextWindowSize::DEFAULT.get(), 128_000);
     }
 }

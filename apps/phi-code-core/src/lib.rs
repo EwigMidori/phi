@@ -11,13 +11,15 @@ mod session;
 mod turn_driver;
 
 // Crate root is the public surface; modules stay private.
-pub use phi_ext_llm::{ApiStyle, LlmConfig};
+pub use phi_ext_llm::{ApiBase, ApiKey, ApiStyle, LlmConfig, ModelId};
 pub use phi_kernel::{
     AgentEvent, AgentRuntime, InMemoryTranscript, KernelEvent, SessionId, Transcript, TurnItem,
     Usage,
 };
 pub use session::{PollBatch, SessionHost};
-pub use turn_driver::{ChannelInfo, SubmitOutcome, TickResult, TurnDriver, UsageInfo};
+pub use turn_driver::{
+    ChannelInfo, ContextWindowSize, SubmitOutcome, TickResult, TurnDriver, UsageInfo,
+};
 
 pub const CORE_NAME: &str = "phi-code-core";
 

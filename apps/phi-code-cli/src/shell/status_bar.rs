@@ -38,7 +38,8 @@ pub struct StatusNote {
 #[derive(Debug, Clone)]
 pub struct StatusSnapshot {
     pub stream: StreamKind,
-    pub model_id: String,
+    /// Display form of product [`phi_code_core::ModelId`] (paint-time string only).
+    pub model: String,
     /// Compact usage for the bar; empty = omit segment.
     pub usage_bar: String,
     /// Only set when multi-line input is on; single-line omits the segment.
@@ -166,7 +167,7 @@ fn build_summary_line(
     });
     segs.push(stream_segment(snap.stream));
     segs.push(Segment {
-        text: snap.model_id.clone(),
+        text: snap.model.clone(),
         style: Style::default().fg(Color::Cyan),
         glue_next: false,
     });

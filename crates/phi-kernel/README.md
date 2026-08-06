@@ -32,7 +32,7 @@ First package of **[phi](../../README.md)**: minimal agent **mechanisms**.
 | Skill index | `BTreeMap<SkillSlug, SkillDesc>` — catalog only; **no** skill bodies |
 | Prefix change cost | Changing prefix across turns can bust cache and dominate cost at large contexts — explicit binding updates |
 | Tool-result outcome | Explicit `ToolResultStatus` on event / record / observation — `output` is **opaque** (never sniffed) |
-| `ToolCallId` / `ToolName` | Provider correlation key + tool catalog name (not document PKs); used on events, ledger, transcript |
+| `ToolCallId` / `ToolName` | Provider correlation key + tool catalog name (`ToolSpec.name` is `ToolName`); used on events, ledger, transcript |
 
 ## Out of scope
 
