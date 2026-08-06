@@ -5,8 +5,12 @@
 //!
 //! | Area | Surface |
 //! |------|---------|
-//! | Config | [`LlmConfig`], [`ApiStyle`], [`HistoryProjection`] |
-//! | Runtime | [`OpenAiCompatRuntime`] (`responses` / `completions`) |
+//! | Config | [`LlmConfig`], [`ApiStyle`] |
+//! | Strategy port | [`HistoryProjector`], default [`PassThrough`] |
+//! | Runtime | [`OpenAiCompatRuntime`] |
+//!
+//! Context policy is **product-owned** (inject a projector). This crate is wire
+//! mechanism only.
 //!
 //! **Not in this crate:** product turn orchestration (`SessionHost` / SendQueue),
 //! TUI, tool hosts, permission engines. Kernel stays free of provider loops.
@@ -15,7 +19,9 @@
 
 mod openai_compat;
 
-pub use openai_compat::{ApiStyle, HistoryProjection, LlmConfig, OpenAiCompatRuntime};
+pub use openai_compat::{
+    ApiStyle, HistoryProjector, LlmConfig, OpenAiCompatRuntime, PassThrough,
+};
 
 pub const EXT_LLM_NAME: &str = "phi-ext-llm";
 

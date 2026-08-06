@@ -6,18 +6,22 @@ LLM **provider adapters** for **phi**: HTTP/SSE → `AgentRuntime` / `AgentEvent
 
 ## Public surface
 
-- `LlmConfig` / `ApiStyle` / `HistoryProjection`
-- `OpenAiCompatRuntime`
+- `LlmConfig` / `ApiStyle`
+- `HistoryProjector` (strategy **port** only) + default `PassThrough`
+- `OpenAiCompatRuntime` — mechanism object (codec + HTTP + SSE)
 
 ## Rules
 
-- Implement only `AgentRuntime`
-- History → wire via explicit [`HistoryProjection`] (no silent drops)
-- Env key names are **product-owned** (CLI maps `PHI_*` → `LlmConfig`)
+- Implement only `AgentRuntime` (+ wire collaborators as private objects)
+- **No baked-in product history policy** — default projector is PassThrough
+- Products inject `HistoryProjector` (or filter before `TurnRequest`)
+- Env key names are **product-owned**
+- Prefer Kay objects / messages over free-function pipelines
 - Kernel remains free of HTTP
 
 ## Forbidden
 
 - Product turn / SendQueue ownership
+- Owning “correct” context policy (ChatTextOnly etc. belongs in product)
 - TUI
 - `da-*` imports

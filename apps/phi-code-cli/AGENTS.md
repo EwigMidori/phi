@@ -10,7 +10,7 @@ Thin **terminal host** over `phi-code-core` + `phi-code-ui`.
 | `shell.rs` | `AgentShell` — tick / draw / handle routing |
 | `scrollback_pane.rs` | History, selection, scrollbar, nav keys |
 | `prompt_pane.rs` | TextArea + paste policy |
-| `turn_driver.rs` | Env → `phi-ext-llm` + `SessionHost` (SendQueue); `SubmitOutcome` |
+| `turn_driver.rs` | Env → runtime + product `ChatTextOnly` projector; `SessionHost`; `SubmitOutcome` |
 
 ## Forbidden
 

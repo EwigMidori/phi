@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use phi_code_core::{KernelEvent, SessionHost};
+use phi_code_core::{KernelEvent, SessionHost, TurnItem};
 use phi_code_ui::Scrollback;
-use phi_ext_llm::{ApiStyle, LlmConfig, OpenAiCompatRuntime};
+use phi_ext_llm::{ApiStyle, HistoryProjector, LlmConfig, OpenAiCompatRuntime};
 
 /// Result of [`TurnDriver::submit`] — shell clears the prompt only on [`Accepted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +34,11 @@ impl TurnDriver {
             Ok(cfg) => {
                 let model_label =
                     format!("{} ({}) @ {}", cfg.model, cfg.api_style.as_ref(), cfg.api_base);
-                let agent = Arc::new(OpenAiCompatRuntime::new(cfg));
+                // Product strategy: lean chat context (not owned by phi-ext-llm).
+                let agent = Arc::new(
+                    OpenAiCompatRuntime::new(cfg)
+                        .with_projector(Arc::new(ChatTextOnly)),
+                );
                 Self {
                     host: Some(SessionHost::new(agent)),
                     config_error: None,
@@ -213,6 +217,30 @@ impl TurnDriver {
             }
         }
         finished
+    }
+}
+
+// ── Product history strategy (phi-code owns this policy) ───────────────────
+
+/// Lean multi-turn context: user + non-empty assistant only.
+///
+/// Reasoning / tool rows stay in transcript for UI; they are not re-sent on this
+/// product’s default chat path. Other hosts inject their own [`HistoryProjector`].
+struct ChatTextOnly;
+
+impl HistoryProjector for ChatTextOnly {
+    fn project(&self, history: &[TurnItem]) -> Vec<TurnItem> {
+        history
+            .iter()
+            .filter(|item| match item {
+                TurnItem::User { .. } => true,
+                TurnItem::Assistant { content } => !content.is_empty(),
+                TurnItem::Reasoning { .. }
+                | TurnItem::ToolCall { .. }
+                | TurnItem::ToolResult { .. } => false,
+            })
+            .cloned()
+            .collect()
     }
 }
 

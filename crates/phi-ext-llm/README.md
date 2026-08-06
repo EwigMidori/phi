@@ -4,12 +4,17 @@ OpenAI-compatible HTTP/SSE → kernel `AgentRuntime`.
 
 | API | Role |
 |-----|------|
-| `LlmConfig` | base / key / model / style (construct explicitly) |
+| `LlmConfig` | base / key / model / style |
 | `ApiStyle` | `responses` \| `completions` |
-| `HistoryProjection` | how `TurnItem` history maps to the wire |
-| `OpenAiCompatRuntime` | `AgentRuntime` impl |
+| `HistoryProjector` | optional strategy **port** (product implements) |
+| `PassThrough` | default projector (no filter) |
+| `OpenAiCompatRuntime` | mechanism: project → encode → stream |
 
-Products own env vars (e.g. phi-code CLI `PHI_*`).
+Products own env vars and history policy, e.g.:
+
+```rust
+OpenAiCompatRuntime::new(cfg).with_projector(Arc::new(MyChatTextOnly));
+```
 
 ```bash
 cargo test -p phi-ext-llm
