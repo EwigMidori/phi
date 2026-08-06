@@ -1,10 +1,11 @@
 //! phi-code CLI — terminal host.
 //!
-//! Layers: [`turn_driver`] (application) · [`shell`] (UI chrome) · this file (I/O loop).
-//! Tokio hosts LLM stream tasks; the TUI loop stays tick-driven.
+//! Layers: `phi-code-core` (application) · [`shell`] (UI chrome) · this file (I/O loop).
+//! Process env (`PHI_*`) is loaded via [`process_env`]. Tokio hosts LLM stream tasks;
+//! the TUI loop stays tick-driven.
 
+mod process_env;
 mod shell;
-mod turn_driver;
 
 use std::io::{self, stdout};
 use std::time::Duration;

@@ -1,9 +1,9 @@
 //! Format application channel/usage snapshots into status chrome strings.
 //!
 //! **Pure free functions only** (inputs → strings; no object or process I/O).
-//! Token *aggregation* stays in [`crate::turn_driver`].
+//! Token *aggregation* stays in `phi-code-core` (`TurnDriver`).
 
-use crate::turn_driver::{ChannelInfo, UsageInfo};
+use phi_code_core::{ChannelInfo, UsageInfo};
 
 /// Compact bar fragment: `used / window` (e.g. `12K / 128K`). Always shows window.
 #[must_use]

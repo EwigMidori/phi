@@ -2,7 +2,7 @@
 //!
 //! Owns presentation of stream / model / usage / notes / multi-line tip from a
 //! paint-time [`StatusSnapshot`]. String formatting of channel/usage snapshots
-//! lives in [`super::status_format`]; token aggregation stays in `turn_driver`.
+//! lives in [`super::status_format`]; token aggregation stays in `phi-code-core`.
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

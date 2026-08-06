@@ -4,7 +4,8 @@
 //!
 //! | Layer | Where | Responsibility |
 //! |-------|--------|----------------|
-//! | **Model / application** | [`crate::turn_driver`] | LLM session, submit/tick, usage *counts*, product policy |
+//! | **Model / application** | `phi-code-core` ([`TurnDriver`]) | LLM session, submit/tick, usage *counts*, product history policy |
+//! | **Process env** | [`crate::process_env`] | `PHI_*` → `TurnDriver` (host boundary only) |
 //! | **View + chrome** | **this package** | layout, paint, focus, panes, status *formatting*, event→scrollback projection |
 //! | **Host** | [`crate`] `main` | terminal lifecycle, event poll loop |
 //!
@@ -18,15 +19,15 @@
 //! - Focus routing, mouse hit tests, keyboard→pane dispatch
 //! - Prompt / scrollback / status **presentation** objects
 //! - Host chrome protocols (e.g. double-Ctrl+C quit arming)
-//! - Mapping [`crate::turn_driver::TickResult`] / history onto scrollback via
+//! - Mapping [`phi_code_core::TickResult`] / history onto scrollback via
 //!   [`scrollback_pane::ScrollbackPane`] methods (not free functions with side effects)
-//! - Formatting raw [`crate::turn_driver::ChannelInfo`] / [`UsageInfo`] into status
+//! - Formatting raw [`phi_code_core::ChannelInfo`] / [`UsageInfo`] into status
 //!   strings via **pure** helpers in [`status_format`]
 //!
 //! # Forbidden in `shell/` (reject in review)
 //!
-//! **Do not put application / domain logic in this directory.** Move it to
-//! [`crate::turn_driver`] (or further into `phi-code-core` / product crates).
+//! **Do not put application / domain logic in this directory.** It lives in
+//! `phi-code-core` (`TurnDriver`). Env loading lives in [`crate::process_env`].
 //!
 //! Specifically **do not**:
 //!
@@ -39,7 +40,7 @@
 //!   Side-effecting behavior is a method on the object that owns the state.
 //!   Free functions may only be pure (args → value).
 //!
-//! # Forbidden in `turn_driver` (mirror rule)
+//! # Forbidden in `phi-code-core` TurnDriver (mirror rule)
 //!
 //! Application code must **not** import `phi_code_ui`, ratatui, or format status chrome.
 //! If it mutates scrollback or paints, it belongs here instead.
@@ -51,7 +52,8 @@
 //! - History / selection / event→view → [`scrollback_pane::ScrollbackPane`]
 //! - Prompt / paste → [`prompt_pane::PromptPane`]
 //! - Double-Ctrl+C quit → [`quit_protocol::QuitProtocol`]
-//! - Turns / LLM / usage counts / config → [`crate::turn_driver::TurnDriver`] (**outside** this package)
+//! - Turns / LLM / usage counts → [`phi_code_core::TurnDriver`] (**outside** this package)
+//! - Env → [`crate::process_env::ProcessEnv`] (**outside** this package)
 //!
 //! If you are about to write product policy or env loading here — **stop**.
 
@@ -64,6 +66,7 @@ mod status_format;
 use crossterm::event::{
     Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
+use phi_code_core::{SubmitOutcome, TurnDriver};
 use phi_code_ui::SystemClipboard;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -71,7 +74,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use xai_ratatui_textarea::ClipboardProvider;
 
-use crate::turn_driver::{SubmitOutcome, TurnDriver};
+use crate::process_env::ProcessEnv;
 
 use prompt_pane::PromptPane;
 use quit_protocol::{IdleCtrlC, QuitProtocol, QUIT_REMINDER};
@@ -90,7 +93,7 @@ pub struct AgentShell {
     quit: QuitProtocol,
     prompt: PromptPane,
     scrollback: ScrollbackPane,
-    /// Application model — lives in [`crate::turn_driver`], only composed here.
+    /// Application model — lives in `phi-code-core`, only composed here.
     driver: TurnDriver,
     status: StatusBar,
 }
@@ -99,7 +102,7 @@ impl AgentShell {
     #[must_use]
     pub fn new() -> Self {
         let prompt = PromptPane::new(Box::new(SystemClipboard::new()));
-        let driver = TurnDriver::from_env();
+        let driver = ProcessEnv::open_turn_driver();
         let mut status = StatusBar::new();
         if let Some(err) = driver.config_error() {
             status.set_note(NoteKind::Warn, format!("warn: {err}"));

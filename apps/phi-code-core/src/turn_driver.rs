@@ -1,18 +1,17 @@
-//! Application / product layer for the CLI host.
+//! Product session driver: [`SessionHost`] + usage + notes.
 //!
-//! Env → `phi-ext-llm` runtime → [`SessionHost`] → kernel events + durable history.
+//! Composes `phi-ext-llm` runtime → [`SessionHost`] → kernel events + durable history.
+//! **No UI. No process env.** Hosts (CLI, etc.) load config and call
+//! [`TurnDriver::from_config`] / [`TurnDriver::unconfigured`].
 //!
-//! **No UI.** This module must not import `phi_code_ui`, ratatui, crossterm, or
-//! format status-bar chrome. The shell projects [`TickResult`] / history into
-//! scrollback and formats [`ChannelInfo`] / [`UsageInfo`] for paint.
-//!
-//! Side effects (env, host, meters) live on [`TurnDriver`] methods — not free
-//! functions. Owned by the binary root; never re-home under `crate::shell`.
+//! Side effects (host, meters) live on [`TurnDriver`] methods — not free functions.
 
 use std::sync::Arc;
 
-use phi_code_core::{KernelEvent, SessionHost, TurnItem, Usage};
-use phi_ext_llm::{ApiStyle, HistoryProjector, LlmConfig, OpenAiCompatRuntime};
+use phi_ext_llm::{HistoryProjector, LlmConfig, OpenAiCompatRuntime};
+
+use crate::session::SessionHost;
+use crate::{KernelEvent, TurnItem, Usage};
 
 /// Result of [`TurnDriver::submit`] — shell clears the prompt only on [`Accepted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,40 +114,40 @@ pub struct TurnDriver {
 }
 
 impl TurnDriver {
-    /// Build from process env (`PHI_*`). Config lives in the product binary.
+    /// Build a live driver from host-supplied LLM config (no env reads).
     #[must_use]
-    pub fn from_env() -> Self {
-        let context_window = Self::load_context_window_from_env();
-        match Self::load_llm_config_from_env() {
-            Ok(cfg) => {
-                let model_id = cfg.model.clone();
-                let api_style = cfg.api_style.as_ref().to_owned();
-                let api_base = cfg.api_base.clone();
-                // Product strategy: lean chat context (not owned by phi-ext-llm).
-                let agent = Arc::new(
-                    OpenAiCompatRuntime::new(cfg).with_projector(Arc::new(ChatTextOnly)),
-                );
-                Self {
-                    host: Some(SessionHost::new(agent)),
-                    config_error: None,
-                    model_id,
-                    api_style,
-                    api_base,
-                    context_window,
-                    last_note: None,
-                    usage: UsageMeter::default(),
-                }
-            }
-            Err(e) => Self {
-                host: None,
-                config_error: Some(e),
-                model_id: "unconfigured".into(),
-                api_style: "—".into(),
-                api_base: "—".into(),
-                context_window,
-                last_note: None,
-                usage: UsageMeter::default(),
-            },
+    pub fn from_config(cfg: LlmConfig, context_window: u64) -> Self {
+        let model_id = cfg.model.clone();
+        let api_style = cfg.api_style.as_ref().to_owned();
+        let api_base = cfg.api_base.clone();
+        // Product strategy: lean chat context (not owned by phi-ext-llm).
+        let agent = Arc::new(
+            OpenAiCompatRuntime::new(cfg).with_projector(Arc::new(ChatTextOnly)),
+        );
+        Self {
+            host: Some(SessionHost::new(agent)),
+            config_error: None,
+            model_id,
+            api_style,
+            api_base,
+            context_window,
+            last_note: None,
+            usage: UsageMeter::default(),
+        }
+    }
+
+    /// Unconfigured driver — same failure shape as a missing host at submit time.
+    #[must_use]
+    pub fn unconfigured(error: impl Into<String>, context_window: u64) -> Self {
+        Self {
+            host: None,
+            config_error: Some(error.into()),
+            model_id: "unconfigured".into(),
+            api_style: "—".into(),
+            api_base: "—".into(),
+            context_window,
+            last_note: None,
+            usage: UsageMeter::default(),
         }
     }
 
@@ -170,59 +169,6 @@ impl TurnDriver {
     #[must_use]
     pub fn config_error(&self) -> Option<&str> {
         self.config_error.as_deref()
-    }
-
-    /// Product-owned env mapping (not in `phi-ext-llm`).
-    fn load_llm_config_from_env() -> Result<LlmConfig, String> {
-        let api_key = Self::env_trim("PHI_API_KEY");
-        if api_key.is_empty() {
-            return Err("set PHI_API_KEY to call a real model".into());
-        }
-        let api_base = Self::env_trim("PHI_API_BASE");
-        let api_base = if api_base.is_empty() {
-            "https://api.openai.com/v1".into()
-        } else {
-            api_base.trim_end_matches('/').to_owned()
-        };
-        let model = Self::env_trim("PHI_MODEL");
-        let model = if model.is_empty() {
-            "gpt-4o-mini".into()
-        } else {
-            model
-        };
-        let style_raw = Self::env_trim("PHI_API_STYLE");
-        let api_style = if style_raw.is_empty() {
-            ApiStyle::default()
-        } else {
-            style_raw.parse::<ApiStyle>().map_err(|_| {
-                format!(
-                    "invalid PHI_API_STYLE `{style_raw}` (use `responses` or `completions`)"
-                )
-            })?
-        };
-        Ok(LlmConfig {
-            api_base,
-            api_key,
-            model,
-            api_style,
-        })
-    }
-
-    /// Context window denominator (`PHI_CONTEXT_WINDOW`, default 128000).
-    fn load_context_window_from_env() -> u64 {
-        let raw = Self::env_trim("PHI_CONTEXT_WINDOW");
-        if raw.is_empty() {
-            return 128_000;
-        }
-        raw.parse::<u64>().unwrap_or(128_000).max(1)
-    }
-
-    fn env_trim(key: &str) -> String {
-        std::env::var(key)
-            .ok()
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty())
-            .unwrap_or_default()
     }
 
     /// Take the latest status note; clears the slot.
@@ -335,7 +281,7 @@ impl TurnDriver {
     }
 }
 
-// ── Product history strategy (phi-code owns this policy) ───────────────────
+// ── Product history strategy (phi-code-core owns this policy) ───────────────
 
 /// Lean multi-turn context: user + non-empty assistant only.
 ///

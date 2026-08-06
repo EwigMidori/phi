@@ -1864,7 +1864,6 @@ dependencies = [
  "dotenvy",
  "phi-code-core",
  "phi-code-ui",
- "phi-ext-llm",
  "ratatui",
  "tokio",
  "xai-ratatui-textarea",
@@ -1874,6 +1873,7 @@ dependencies = [
 name = "phi-code-core"
 version = "0.0.0"
 dependencies = [
+ "phi-ext-llm",
  "phi-kernel",
  "tokio",
 ]

@@ -7,7 +7,7 @@ Open-source **agent kernel** (+ future extensions). Daan (`crates/da-*`, `web/`)
 | **Project** | `phi` |
 | **Kernel** | [`phi-kernel`](./crates/phi-kernel/) |
 | **Extensions** | `phi-ext-tree-agent` · `phi-ext-subagent` · **`phi-ext-llm`** (provider wire → `AgentRuntime`) |
-| **Product** | `apps/phi-code-core` (turn runner) + `apps/phi-code-ui` (TUI) + `apps/phi-code-cli` (`phi-code` binary) |
+| **Product** | `apps/phi-code-core` (SessionHost + TurnDriver) + `apps/phi-code-ui` (TUI) + `apps/phi-code-cli` (thin host + env) |
 | **Status** | Dense vertical slice in progress |
 
 ## Layers
@@ -33,9 +33,9 @@ phi/
     phi-ext-subagent/
     phi-ext-llm/            # OpenAI-compat SSE → AgentRuntime
   apps/
-    phi-code-core/          # product turn orchestration
+    phi-code-core/          # product turn orchestration (SessionHost + TurnDriver)
     phi-code-ui/            # TUI objects (scrollback, selection, paint, paste)
-    phi-code-cli/           # bin: phi-code (thin coordinator + inject runtime)
+    phi-code-cli/           # bin: phi-code (thin host + process env + TUI loop)
       vendor/               # Grok UI crates as-is (textarea, inline, markdown)
 ```
 

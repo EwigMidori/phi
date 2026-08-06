@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use phi_code_core::KernelEvent;
+use phi_code_core::{KernelEvent, TickResult, TurnDriver};
 use phi_code_ui::{
     AutoScrollDirection, HistoryScrollbar, HorizontalLayout, Scrollback, ScrollbackPainter,
     Selection, SystemClipboard,
@@ -16,8 +16,6 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-
-use crate::turn_driver::{TickResult, TurnDriver};
 
 /// Owns scrollback collaboration objects; Shell only routes messages here.
 pub struct ScrollbackPane {

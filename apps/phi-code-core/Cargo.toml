@@ -3,11 +3,12 @@ name = "phi-code-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "phi-code product runtime (session host over kernel SendQueue)"
+description = "phi-code product runtime (SessionHost + TurnDriver)"
 readme = "README.md"
 
 [dependencies]
 phi-kernel = { path = "../../crates/phi-kernel" }
+phi-ext-llm = { path = "../../crates/phi-ext-llm" }
 tokio.workspace = true
 
 [lints]

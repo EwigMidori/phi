@@ -1,8 +1,9 @@
 # phi-code-core
 
-Product session host: kernel `SendQueue` + `Transcript` + `EventBus`.
+Product runtime: `SessionHost` + `TurnDriver` over kernel `SendQueue` / `Transcript` / `EventBus`.
 
-LLM adapters: [`phi-ext-llm`](../../crates/phi-ext-llm). TUI: [`phi-code-ui`](../phi-code-ui).
+Depends on [`phi-kernel`](../../crates/phi-kernel) and [`phi-ext-llm`](../../crates/phi-ext-llm).
+Terminal UI: [`phi-code-ui`](../phi-code-ui). Process env (`PHI_*`) is loaded by the host (CLI), not this crate.
 
 ```bash
 cargo test -p phi-code-core

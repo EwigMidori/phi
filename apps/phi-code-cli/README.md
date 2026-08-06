@@ -1,11 +1,12 @@
 # phi-code-cli
 
-Thin binary entry for phi-code.
+Thin binary entry for phi-code: process env + terminal host over `phi-code-core` + `phi-code-ui`.
 
 ## LLM config
 
-Wire adapter: **`phi-ext-llm`** (`OpenAiCompatRuntime`). Composition is in this
-binary; `phi-code-core` only runs turns.
+Product runtime: **`phi-code-core`** (`TurnDriver` + `SessionHost`). Wire adapter:
+**`phi-ext-llm`** (composed inside core). This binary only loads `PHI_*` via
+`ProcessEnv` and runs the TUI loop.
 
 Reads **only** the process cwd’s `.env` via `dotenvy` (no parent-directory walk), plus already-exported env vars.
 

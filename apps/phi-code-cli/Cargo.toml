@@ -15,7 +15,6 @@ crossterm.workspace = true
 dotenvy = "0.15"
 phi-code-core = { path = "../phi-code-core" }
 phi-code-ui = { path = "../phi-code-ui" }
-phi-ext-llm = { path = "../../crates/phi-ext-llm" }
 ratatui.workspace = true
 tokio.workspace = true
 xai-ratatui-textarea.workspace = true
