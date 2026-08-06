@@ -439,7 +439,7 @@ impl<'a> EntryView<'a> {
             return 1;
         }
         match self.item {
-            TurnItem::Assistant { content } => self.markdown.height(content),
+            TurnItem::Assistant { content } => self.markdown.height(content, width),
             _ => self.display_lines(width).len().max(1),
         }
     }
@@ -451,7 +451,7 @@ impl<'a> EntryView<'a> {
         let width = width.max(1);
         match self.item {
             TurnItem::User { content } => Self::wrap_text(&format!("› {content}"), width),
-            TurnItem::Assistant { content } => self.markdown.plain_lines(content),
+            TurnItem::Assistant { content } => self.markdown.plain_lines(content, width),
             TurnItem::ToolCall {
                 tool_name, input, ..
             } => {
@@ -582,7 +582,7 @@ mod tests {
         sb.push_assistant(md);
         sb.prepare(60, 40);
         let lines = sb.entry_lines(0);
-        let h = sb.markdown().height(md);
+        let h = sb.markdown().height(md, 60);
         assert_eq!(
             lines.len(),
             h,
@@ -593,5 +593,20 @@ mod tests {
             !joined.contains("###"),
             "pretty plain lines should not expose raw heading markers: {joined:?}"
         );
+    }
+
+    #[test]
+    fn assistant_long_line_wraps_in_layout() {
+        let long = format!("prefix {}", "x".repeat(200));
+        let mut sb = Scrollback::new();
+        sb.push_assistant(&long);
+        sb.prepare(40, 80);
+        let lines = sb.entry_lines(0);
+        assert!(
+            lines.len() > 1,
+            "assistant layout must wrap long content: {} lines",
+            lines.len()
+        );
+        assert!(sb.total_height() > 1);
     }
 }

@@ -2,10 +2,15 @@
 //!
 //! Owns pretty-mode style (HIDDEN outers). Height, paint, and plain-text for
 //! copy all ask this object so they cannot diverge.
+//!
+//! Rendered markdown is word-wrapped to the content column width (Grok-style),
+//! so long paragraphs and CJK without spaces still reflow in the terminal.
 
 use anstyle::Style;
 use ratatui::text::Line;
 use xai_grok_markdown::{render_markdown_ratatui, MarkdownStyle, StreamingMarkdownRenderer};
+use xai_ratatui_textarea::render::line_utils::line_to_static;
+use xai_ratatui_textarea::wrapping::word_wrap_line;
 
 /// Pretty markdown collaborator shared by scrollback layout and the painter.
 #[derive(Debug, Clone)]
@@ -61,19 +66,37 @@ impl ProductMarkdown {
         self.style
     }
 
-    /// Styled pretty lines for painting.
+    /// Styled pretty lines for painting, wrapped to `width` columns.
     #[must_use]
-    pub fn pretty_lines(&self, content: &str) -> Vec<Line<'static>> {
+    pub fn pretty_lines(&self, content: &str, width: usize) -> Vec<Line<'static>> {
         if content.is_empty() {
             return vec![Line::from("")];
         }
-        render_markdown_ratatui(content, self.style, true, None).0
+        let unwrapped = render_markdown_ratatui(content, self.style, true, None).0;
+        Self::wrap_lines(&unwrapped, width)
     }
 
-    /// Plain text of pretty lines (selection / copy geometry).
+    /// Word-wrap already-rendered markdown lines (streaming or static).
     #[must_use]
-    pub fn plain_lines(&self, content: &str) -> Vec<String> {
-        let lines = self.pretty_lines(content);
+    pub fn wrap_lines(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        let mut out: Vec<Line<'static>> = Vec::new();
+        for line in lines {
+            let wrapped = word_wrap_line(line, width);
+            for piece in wrapped {
+                out.push(line_to_static(&piece));
+            }
+        }
+        if out.is_empty() {
+            out.push(Line::from(""));
+        }
+        out
+    }
+
+    /// Plain text of pretty lines (selection / copy geometry), same wrap as paint.
+    #[must_use]
+    pub fn plain_lines(&self, content: &str, width: usize) -> Vec<String> {
+        let lines = self.pretty_lines(content, width);
         let mut plains: Vec<String> = lines.iter().map(Self::plain_of_line).collect();
         if plains.is_empty() {
             plains.push(String::new());
@@ -81,13 +104,13 @@ impl ProductMarkdown {
         plains
     }
 
-    /// Display height in terminal rows.
+    /// Display height in terminal rows at `width`.
     #[must_use]
-    pub fn height(&self, content: &str) -> usize {
+    pub fn height(&self, content: &str, width: usize) -> usize {
         if content.is_empty() {
             return 1;
         }
-        self.pretty_lines(content).len().max(1)
+        self.pretty_lines(content, width).len().max(1)
     }
 
     /// Spawn a streaming renderer bound to this style.
@@ -109,11 +132,12 @@ impl ProductMarkdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn pretty_hides_heading_markers() {
         let md = ProductMarkdown::new();
-        let joined = md.plain_lines("### Title\n\nbody").join("\n");
+        let joined = md.plain_lines("### Title\n\nbody", 80).join("\n");
         assert!(
             !joined.contains("###"),
             "pretty plain must hide outer markers: {joined:?}"
@@ -124,6 +148,50 @@ mod tests {
     fn height_matches_plain_line_count() {
         let md = ProductMarkdown::new();
         let content = "# T\n\n- a\n- b\n\n```\ncode\n```\n";
-        assert_eq!(md.height(content), md.plain_lines(content).len().max(1));
+        assert_eq!(
+            md.height(content, 60),
+            md.plain_lines(content, 60).len().max(1)
+        );
+    }
+
+    #[test]
+    fn long_paragraph_wraps_to_width() {
+        let md = ProductMarkdown::new();
+        let content = "word ".repeat(40); // ~200 cols of ascii
+        let width = 40usize;
+        let lines = md.plain_lines(content.trim_end(), width);
+        assert!(
+            lines.len() > 1,
+            "expected multi-line wrap, got {} lines: {lines:?}",
+            lines.len()
+        );
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.width() <= width,
+                "line {i} width {} > {width}: {line:?}",
+                line.width()
+            );
+        }
+    }
+
+    #[test]
+    fn cjk_paragraph_wraps_to_width() {
+        let md = ProductMarkdown::new();
+        // Continuous CJK with no spaces — still must reflow (break_words).
+        let content = "中文输出需要在终端宽度处自动换行否则会全部挤在一行里看不到后面的内容".repeat(3);
+        let width = 20usize;
+        let lines = md.plain_lines(&content, width);
+        assert!(
+            lines.len() > 1,
+            "CJK must wrap, got {} lines",
+            lines.len()
+        );
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.width() <= width,
+                "line {i} width {} > {width}: {line:?}",
+                line.width()
+            );
+        }
     }
 }

@@ -128,7 +128,8 @@ impl ScrollbackPainter {
             return;
         }
 
-        let (paint_lines, plain_lines) = self.resolve_lines(scrollback, seg);
+        let width = content.width.max(1) as usize;
+        let (paint_lines, plain_lines) = self.resolve_lines(scrollback, seg, width);
 
         let start = seg.clip_top.min(paint_lines.len());
         let end = (start + seg.visible_rows).min(paint_lines.len());
@@ -168,18 +169,20 @@ impl ScrollbackPainter {
         &self,
         scrollback: &Scrollback,
         seg: &VisibleSegment,
+        width: usize,
     ) -> (Vec<Line<'static>>, Vec<String>) {
         match &seg.item {
             TurnItem::Assistant { content } if !seg.folded => {
                 let md = if seg.streaming {
-                    self.stream_lines_for(seg.entry_index)
-                        .unwrap_or_else(|| self.markdown.pretty_lines(content))
+                    self.stream_lines_for(seg.entry_index, width)
+                        .unwrap_or_else(|| self.markdown.pretty_lines(content, width))
                 } else {
-                    self.markdown.pretty_lines(content)
+                    self.markdown.pretty_lines(content, width)
                 };
                 let plains = if seg.streaming {
                     md.iter().map(ProductMarkdown::plain_of_line).collect()
                 } else {
+                    // Same width as prepare()'s layout_width → matches height / copy.
                     scrollback.entry_lines(seg.entry_index)
                 };
                 (md, plains)
@@ -206,12 +209,12 @@ impl ScrollbackPainter {
         }
     }
 
-    fn stream_lines_for(&self, entry: usize) -> Option<Vec<Line<'static>>> {
+    fn stream_lines_for(&self, entry: usize, width: usize) -> Option<Vec<Line<'static>>> {
         if self.stream_entry != Some(entry) {
             return None;
         }
         let view = self.stream_renderer.as_ref()?.view();
-        Some(view.lines.to_vec())
+        Some(ProductMarkdown::wrap_lines(&view.lines, width))
     }
 
     fn accent_color(&self, accent: Accent) -> Color {
