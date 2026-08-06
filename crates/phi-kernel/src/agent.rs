@@ -27,16 +27,27 @@ use crate::ids::{JobId, SessionId};
 // ── Turn history projection ────────────────────────────────────────────────
 
 /// One stored turn row in transcript order. The model context is the full
-/// interleaved sequence (user / assistant / tool rows), so [`TurnRequest::history`]
-/// carries a single ordered [`Vec`] — no separate dialogue / tool projections
-/// to reassemble.
+/// interleaved sequence (user / assistant / tool / reasoning rows), so
+/// [`TurnRequest::history`] carries a single ordered [`Vec`] — no separate
+/// dialogue / tool projections to reassemble.
 ///
 /// `input` / `output` stay opaque `Value`s (kernel discipline: never sniffed).
+///
+/// **Reasoning is a sibling row**, not a field on [`TurnItem::Assistant`]
+/// (Grok / Responses-API aligned):
+/// - preserves interleaved order `[reasoning, tool, reasoning, …, assistant]`
+/// - allows N parallel reasoning items without last-write-wins on one string
+/// - products decide whether to re-send reasoning rows to the provider
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TurnItem {
     #[serde(rename_all = "camelCase")]
     User { content: String },
+    /// Model chain-of-thought / reasoning summary for this span of the turn.
+    /// Sits **before** (or between tool rows preceding) the answering
+    /// [`TurnItem::Assistant`] — not nested inside it.
+    #[serde(rename_all = "camelCase")]
+    Reasoning { content: String },
     #[serde(rename_all = "camelCase")]
     Assistant { content: String },
     #[serde(rename_all = "camelCase")]

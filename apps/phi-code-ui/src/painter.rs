@@ -42,13 +42,15 @@ impl ScrollbackPainter {
         self.stream_renderer = None;
     }
 
-    /// Sync streaming renderer with the scrollback's active assistant entry.
+    /// Sync streaming renderer with the scrollback's active **assistant** entry.
+    /// Reasoning rows do not use the markdown stream renderer.
     pub fn sync_stream(&mut self, scrollback: &Scrollback) {
         let Some(i) = scrollback.streaming_index() else {
             self.clear_stream();
             return;
         };
         let TurnItem::Assistant { content } = &scrollback.items()[i] else {
+            // Streaming a Reasoning (or other) row — no md stream.
             self.clear_stream();
             return;
         };
@@ -172,61 +174,46 @@ impl ScrollbackPainter {
         width: usize,
     ) -> (Vec<Line<'static>>, Vec<String>) {
         match &seg.item {
-            TurnItem::Assistant { content } if !seg.folded => {
+            TurnItem::Reasoning { .. } if !seg.folded => {
                 let plains = scrollback.entry_lines(seg.entry_index);
-                let think = scrollback.thinking_layout(seg.entry_index, width);
-                let think_rows = think.map(crate::scrollback::ThinkingLayout::total_rows).unwrap_or(0);
-
-                let body_md = if content.is_empty() && think_rows > 0 {
-                    Vec::new()
-                } else if seg.streaming {
+                let lay = scrollback.thinking_layout(seg.entry_index, width);
+                let paint: Vec<Line<'static>> = plains
+                    .iter()
+                    .enumerate()
+                    .map(|(i, plain)| {
+                        if lay.is_some_and(|t| t.is_header_row(i)) {
+                            Line::from(Span::styled(
+                                plain.clone(),
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ))
+                        } else {
+                            Line::from(Span::styled(
+                                plain.clone(),
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(ratatui::style::Modifier::DIM)
+                                    .add_modifier(ratatui::style::Modifier::ITALIC),
+                            ))
+                        }
+                    })
+                    .collect();
+                (paint, plains)
+            }
+            TurnItem::Assistant { content } if !seg.folded => {
+                let md = if seg.streaming {
                     self.stream_lines_for(seg.entry_index, width)
                         .unwrap_or_else(|| self.markdown.pretty_lines(content, width))
-                } else if content.is_empty() {
-                    vec![Line::from("")]
                 } else {
                     self.markdown.pretty_lines(content, width)
                 };
-
-                // Prefix thinking lines (header + optional body) so paint ≡ plain.
-                let mut paint: Vec<Line<'static>> = Vec::with_capacity(plains.len());
-                for (i, plain) in plains.iter().enumerate() {
-                    if think.is_some_and(|t| t.is_header_row(i)) {
-                        paint.push(Line::from(Span::styled(
-                            plain.clone(),
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(ratatui::style::Modifier::BOLD),
-                        )));
-                    } else if think.is_some_and(|t| t.is_body_row(i)) {
-                        paint.push(Line::from(Span::styled(
-                            plain.clone(),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(ratatui::style::Modifier::DIM)
-                                .add_modifier(ratatui::style::Modifier::ITALIC),
-                        )));
-                    } else {
-                        // Body: use pretty md when available, else plain.
-                        let body_i = i.saturating_sub(think_rows);
-                        if let Some(line) = body_md.get(body_i) {
-                            paint.push(line.clone());
-                        } else {
-                            paint.push(Line::from(Span::styled(
-                                plain.clone(),
-                                Style::default().fg(Color::Green),
-                            )));
-                        }
-                    }
-                }
-                // Keep lengths aligned for clip/selection.
-                while paint.len() < plains.len() {
-                    paint.push(Line::from(""));
-                }
-                if paint.len() > plains.len() {
-                    paint.truncate(plains.len());
-                }
-                (paint, plains)
+                let plains = if seg.streaming {
+                    md.iter().map(ProductMarkdown::plain_of_line).collect()
+                } else {
+                    scrollback.entry_lines(seg.entry_index)
+                };
+                (md, plains)
             }
             _ => {
                 let plains = scrollback.entry_lines(seg.entry_index);
@@ -236,6 +223,7 @@ impl ScrollbackPainter {
                     .map(|(i, t)| {
                         let fg = match &seg.item {
                             TurnItem::User { .. } => Color::Cyan,
+                            TurnItem::Reasoning { .. } => Color::Yellow,
                             TurnItem::ToolCall { .. } | TurnItem::ToolResult { .. } if i == 0 => {
                                 Color::Magenta
                             }
@@ -262,7 +250,7 @@ impl ScrollbackPainter {
         match accent {
             Accent::User => Color::Cyan,
             Accent::Assistant => Color::Green,
-            Accent::Thinking => Color::Yellow,
+            Accent::Thinking => Color::DarkGray,
             Accent::ToolRunning => Color::Blue,
             Accent::ToolOk => Color::Green,
             Accent::ToolError => Color::Red,

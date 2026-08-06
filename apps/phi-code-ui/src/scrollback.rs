@@ -3,7 +3,7 @@
 //! Collaborators:
 //! - [`ProductMarkdown`] — assistant display height / plain lines
 //! - [`EntryView`] — private: how one turn answers height / lines / accent
-//! - [`ThinkingState`] — UI-only CoT (not in TurnItem / not resent as history)
+//! - [`ThinkingChrome`] — UI-only expand/elapsed for [`TurnItem::Reasoning`] rows
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -20,7 +20,7 @@ use crate::selection::LineSource;
 pub enum Accent {
     User,
     Assistant,
-    /// Collapsed/expanded thinking header (Grok-style Thought block).
+    /// [`TurnItem::Reasoning`] (Grok Thinking block).
     Thinking,
     ToolRunning,
     ToolOk,
@@ -28,10 +28,10 @@ pub enum Accent {
     ToolOther,
 }
 
-/// How many leading display lines of an entry belong to thinking UI.
+/// Layout of a [`TurnItem::Reasoning`] entry for paint / hit-test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThinkingLayout {
-    /// Always 1 when thinking exists (header row).
+    /// Always 1 (header row).
     pub header_rows: usize,
     /// Body rows when expanded; 0 when collapsed.
     pub body_rows: usize,
@@ -78,6 +78,9 @@ pub struct Scrollback {
     items: Vec<TurnItem>,
     folded: HashSet<usize>,
     selected: Option<usize>,
+    /// Model turn open (may not have pushed Reasoning/Assistant yet).
+    response_open: bool,
+    /// Item currently receiving deltas ([`TurnItem::Reasoning`] or Assistant).
     streaming: Option<usize>,
     scroll_offset: usize,
     stick_bottom: bool,
@@ -87,8 +90,8 @@ pub struct Scrollback {
     total_height: usize,
     /// Shared pretty-md collaborator (height ≡ plain lines ≡ paint).
     markdown: ProductMarkdown,
-    /// CoT keyed by assistant entry index — UI-only, never part of TurnItem.
-    thinking: HashMap<usize, ThinkingState>,
+    /// Expand / elapsed for [`TurnItem::Reasoning`] rows only (not content).
+    thinking_chrome: HashMap<usize, ThinkingChrome>,
 }
 
 impl Default for Scrollback {
@@ -104,6 +107,7 @@ impl Scrollback {
             items: Vec::new(),
             folded: HashSet::new(),
             selected: None,
+            response_open: false,
             streaming: None,
             scroll_offset: 0,
             stick_bottom: true,
@@ -112,7 +116,7 @@ impl Scrollback {
             virtual_y: Vec::new(),
             total_height: 0,
             markdown: ProductMarkdown::new(),
-            thinking: HashMap::new(),
+            thinking_chrome: HashMap::new(),
         }
     }
 
@@ -143,7 +147,7 @@ impl Scrollback {
 
     #[must_use]
     pub fn is_streaming(&self) -> bool {
-        self.streaming.is_some()
+        self.response_open || self.streaming.is_some()
     }
 
     #[must_use]
@@ -162,9 +166,10 @@ impl Scrollback {
 
     pub fn set_items(&mut self, items: Vec<TurnItem>) {
         self.items = items;
+        self.response_open = false;
         self.streaming = None;
         self.folded.retain(|&i| i < self.items.len());
-        self.thinking.retain(|&i, _| i < self.items.len());
+        self.thinking_chrome.retain(|&i, _| i < self.items.len());
         if let Some(s) = self.selected
             && s >= self.items.len()
         {
@@ -190,49 +195,76 @@ impl Scrollback {
         });
     }
 
+    pub fn push_reasoning(&mut self, content: impl Into<String>) {
+        self.push(TurnItem::Reasoning {
+            content: content.into(),
+        });
+    }
+
+    /// Open a model response turn. Does **not** push rows yet — first delta
+    /// decides [`TurnItem::Reasoning`] vs [`TurnItem::Assistant`] (Grok order).
     pub fn begin_assistant_stream(&mut self) {
-        if self.streaming.is_some() {
+        if self.is_streaming() {
             self.finish_assistant_stream();
         }
-        self.push_assistant("");
-        self.streaming = Some(self.items.len() - 1);
+        self.response_open = true;
+        self.streaming = None;
         self.scroll_to_bottom();
     }
 
+    /// Append answer text: opens/extends a sibling [`TurnItem::Assistant`] row.
     pub fn append_assistant_delta(&mut self, delta: &str) {
-        let Some(i) = self.streaming else {
+        if !self.response_open {
             return;
-        };
-        if let Some(TurnItem::Assistant { content }) = self.items.get_mut(i) {
-            content.push_str(delta);
+        }
+        self.close_streaming_reasoning_chrome();
+        match self.streaming {
+            Some(i) if matches!(self.items.get(i), Some(TurnItem::Assistant { .. })) => {
+                if let Some(TurnItem::Assistant { content }) = self.items.get_mut(i) {
+                    content.push_str(delta);
+                }
+            }
+            _ => {
+                self.push_assistant(delta);
+                self.streaming = Some(self.items.len() - 1);
+            }
         }
         self.invalidate_layout();
     }
 
-    /// Append chain-of-thought to the streaming assistant (UI-only; not TurnItem).
+    /// Append CoT: opens/extends a sibling [`TurnItem::Reasoning`] row.
     pub fn append_reasoning_delta(&mut self, delta: &str) {
-        let Some(i) = self.streaming else {
-            return;
-        };
-        if delta.is_empty() {
+        if !self.response_open || delta.is_empty() {
             return;
         }
-        self.thinking
-            .entry(i)
-            .or_insert_with(ThinkingState::new_streaming)
-            .text
-            .push_str(delta);
+        match self.streaming {
+            Some(i) if matches!(self.items.get(i), Some(TurnItem::Reasoning { .. })) => {
+                if let Some(TurnItem::Reasoning { content }) = self.items.get_mut(i) {
+                    content.push_str(delta);
+                }
+            }
+            _ => {
+                // New reasoning sibling (before assistant, or after tools later).
+                self.push_reasoning(delta);
+                let i = self.items.len() - 1;
+                self.streaming = Some(i);
+                self.thinking_chrome
+                    .insert(i, ThinkingChrome::new_streaming());
+            }
+        }
         self.invalidate_layout();
     }
 
-    /// Toggle expand/collapse of thinking for an assistant entry (Grok click).
-    ///
-    /// Returns `true` if a thinking block was toggled.
+    /// Toggle expand/collapse of a [`TurnItem::Reasoning`] entry (click).
     pub fn toggle_thinking(&mut self, entry_idx: usize) -> bool {
-        let Some(th) = self.thinking.get_mut(&entry_idx) else {
+        if !matches!(self.items.get(entry_idx), Some(TurnItem::Reasoning { .. })) {
             return false;
-        };
-        th.expanded = !th.expanded;
+        }
+        let chrome = self
+            .thinking_chrome
+            .entry(entry_idx)
+            .or_insert_with(ThinkingChrome::default_collapsed);
+        chrome.expanded = !chrome.expanded;
         self.invalidate_layout();
         true
     }
@@ -247,34 +279,61 @@ impl Scrollback {
             .is_some_and(|lay| lay.is_header_row(line_in_entry))
     }
 
-    /// Layout of the thinking block for paint / hit-test (None if no CoT).
+    /// Layout for a Reasoning entry (None if not reasoning / folded).
     #[must_use]
     pub fn thinking_layout(&self, entry_idx: usize, width: usize) -> Option<ThinkingLayout> {
-        let th = self.thinking.get(&entry_idx)?;
+        let TurnItem::Reasoning { content } = self.items.get(entry_idx)? else {
+            return None;
+        };
         if self.folded.contains(&entry_idx) {
             return None;
         }
-        let body_rows = if th.expanded {
-            EntryView::wrap_text(&th.text, width.max(1)).len()
+        let chrome = self.thinking_chrome.get(&entry_idx);
+        let expanded = chrome.is_some_and(|c| c.expanded);
+        let streaming = self.streaming == Some(entry_idx)
+            && chrome.map(|c| c.streaming).unwrap_or(self.response_open);
+        let body_rows = if expanded {
+            EntryView::wrap_text(content, width.max(1)).len()
         } else {
             0
         };
         Some(ThinkingLayout {
             header_rows: 1,
             body_rows,
-            expanded: th.expanded,
-            streaming: th.streaming,
+            expanded,
+            streaming,
         })
     }
 
     pub fn finish_assistant_stream(&mut self) {
+        self.close_streaming_reasoning_chrome();
+        // Finish chrome on any still-open reasoning rows from this turn.
         if let Some(i) = self.streaming
-            && let Some(th) = self.thinking.get_mut(&i)
+            && let Some(chrome) = self.thinking_chrome.get_mut(&i)
         {
-            th.finish();
+            chrome.finish();
         }
+        for (i, item) in self.items.iter().enumerate() {
+            if matches!(item, TurnItem::Reasoning { .. })
+                && let Some(chrome) = self.thinking_chrome.get_mut(&i)
+            {
+                chrome.finish();
+            }
+        }
+        self.response_open = false;
         self.streaming = None;
         self.invalidate_layout();
+    }
+
+    fn close_streaming_reasoning_chrome(&mut self) {
+        if let Some(i) = self.streaming
+            && matches!(self.items.get(i), Some(TurnItem::Reasoning { .. }))
+        {
+            if let Some(chrome) = self.thinking_chrome.get_mut(&i) {
+                chrome.finish();
+            }
+            self.streaming = None;
+        }
     }
 
     pub fn is_folded(&self, index: usize) -> bool {
@@ -332,7 +391,9 @@ impl Scrollback {
         let i = self.selected?;
         let item = self.items.get(i)?;
         Some(match item {
-            TurnItem::User { content } | TurnItem::Assistant { content } => content.clone(),
+            TurnItem::User { content }
+            | TurnItem::Assistant { content }
+            | TurnItem::Reasoning { content } => content.clone(),
             TurnItem::ToolCall {
                 tool_name, input, ..
             } => format!("{tool_name}\n{input}"),
@@ -421,7 +482,13 @@ impl Scrollback {
             if visible_rows == 0 {
                 continue;
             }
-            let view = EntryView::new(&self.items[i], self.folded.contains(&i), &self.markdown);
+            let view = EntryView::new(
+                &self.items[i],
+                self.folded.contains(&i),
+                &self.markdown,
+                self.thinking_chrome.get(&i),
+                self.streaming == Some(i),
+            );
             out.push(VisibleSegment {
                 entry_index: i,
                 item: self.items[i].clone(),
@@ -447,31 +514,14 @@ impl Scrollback {
         let Some(item) = self.items.get(index) else {
             return Vec::new();
         };
-        let folded = self.folded.contains(&index);
-        if folded {
-            return EntryView::new(item, true, &self.markdown).display_lines(width);
-        }
-
-        let mut lines = Vec::new();
-        if let Some(th) = self.thinking.get(&index) {
-            lines.push(th.header_line());
-            if th.expanded {
-                lines.extend(EntryView::wrap_text(&th.text, width.max(1)));
-            }
-        }
-
-        let body = EntryView::new(item, false, &self.markdown).display_lines(width);
-        // Avoid a blank body row under collapsed Thinking while answer is empty.
-        let body_empty = matches!(item, TurnItem::Assistant { content } if content.is_empty());
-        if body_empty && self.thinking.contains_key(&index) {
-            // thinking-only for now
-        } else {
-            lines.extend(body);
-        }
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines
+        EntryView::new(
+            item,
+            self.folded.contains(&index),
+            &self.markdown,
+            self.thinking_chrome.get(&index),
+            self.streaming == Some(index),
+        )
+        .display_lines(width)
     }
 
     fn entry_height(&self, index: usize, width: usize) -> usize {
@@ -533,42 +583,54 @@ impl LineSource for Scrollback {
 }
 
 // ---------------------------------------------------------------------------
-// ThinkingState — UI-only CoT (Grok ThinkingBlock collapsed-by-default)
+// ThinkingChrome — UI presentation only for TurnItem::Reasoning
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-struct ThinkingState {
-    text: String,
+struct ThinkingChrome {
     /// Default collapsed (Grok).
     expanded: bool,
     streaming: bool,
     started_at: Instant,
-    elapsed_ms: Option<u64>,
+    finished_elapsed_ms: Option<u64>,
 }
 
-impl ThinkingState {
+impl ThinkingChrome {
     fn new_streaming() -> Self {
         Self {
-            text: String::new(),
             expanded: false,
             streaming: true,
             started_at: Instant::now(),
-            elapsed_ms: None,
+            finished_elapsed_ms: None,
+        }
+    }
+
+    fn default_collapsed() -> Self {
+        Self {
+            expanded: false,
+            streaming: false,
+            started_at: Instant::now(),
+            finished_elapsed_ms: None,
         }
     }
 
     fn finish(&mut self) {
         self.streaming = false;
-        if self.elapsed_ms.is_none() {
-            self.elapsed_ms = Some(self.started_at.elapsed().as_millis() as u64);
+        if self.finished_elapsed_ms.is_none() {
+            self.finished_elapsed_ms = Some(self.started_at.elapsed().as_millis() as u64);
         }
+    }
+
+    fn elapsed_ms(&self) -> Option<u64> {
+        self.finished_elapsed_ms
+            .or_else(|| self.streaming.then(|| self.started_at.elapsed().as_millis() as u64))
     }
 
     fn header_line(&self) -> String {
         let chevron = if self.expanded { "▾" } else { "▸" };
         if self.streaming {
             format!("{chevron} Thinking…")
-        } else if let Some(ms) = self.elapsed_ms {
+        } else if let Some(ms) = self.elapsed_ms() {
             let secs = ms as f64 / 1000.0;
             if self.expanded {
                 format!("{chevron} Thought for {secs:.1}s")
@@ -592,20 +654,31 @@ struct EntryView<'a> {
     item: &'a TurnItem,
     folded: bool,
     markdown: &'a ProductMarkdown,
+    thinking_chrome: Option<&'a ThinkingChrome>,
+    is_streaming_target: bool,
 }
 
 impl<'a> EntryView<'a> {
-    fn new(item: &'a TurnItem, folded: bool, markdown: &'a ProductMarkdown) -> Self {
+    fn new(
+        item: &'a TurnItem,
+        folded: bool,
+        markdown: &'a ProductMarkdown,
+        thinking_chrome: Option<&'a ThinkingChrome>,
+        is_streaming_target: bool,
+    ) -> Self {
         Self {
             item,
             folded,
             markdown,
+            thinking_chrome,
+            is_streaming_target,
         }
     }
 
     fn accent(&self) -> Accent {
         match self.item {
             TurnItem::User { .. } => Accent::User,
+            TurnItem::Reasoning { .. } => Accent::Thinking,
             TurnItem::Assistant { .. } => Accent::Assistant,
             TurnItem::ToolCall { .. } => Accent::ToolRunning,
             TurnItem::ToolResult { status, .. } => match status {
@@ -623,6 +696,26 @@ impl<'a> EntryView<'a> {
         let width = width.max(1);
         match self.item {
             TurnItem::User { content } => Self::wrap_text(&format!("› {content}"), width),
+            TurnItem::Reasoning { content } => {
+                let chrome = self.thinking_chrome;
+                let expanded = chrome.is_some_and(|c| c.expanded);
+                let header = chrome.map(ThinkingChrome::header_line).unwrap_or_else(|| {
+                    ThinkingChrome::default_collapsed().header_line()
+                });
+                // Live streaming override when chrome missing mid-frame.
+                let header = if self.is_streaming_target
+                    && chrome.is_none_or(|c| c.streaming)
+                {
+                    "▸ Thinking…".to_string()
+                } else {
+                    header
+                };
+                let mut lines = vec![header];
+                if expanded {
+                    lines.extend(Self::wrap_text(content, width));
+                }
+                lines
+            }
             TurnItem::Assistant { content } => self.markdown.plain_lines(content, width),
             TurnItem::ToolCall {
                 tool_name, input, ..
@@ -649,6 +742,10 @@ impl<'a> EntryView<'a> {
             TurnItem::User { content } => {
                 let one = content.lines().next().unwrap_or("").trim();
                 format!("› {one} …")
+            }
+            TurnItem::Reasoning { content } => {
+                let one = content.lines().next().unwrap_or("").trim();
+                format!("▸ Thought  {one} …")
             }
             TurnItem::Assistant { content } => {
                 let one = content.lines().next().unwrap_or("").trim();
@@ -732,6 +829,7 @@ mod tests {
         }
         sb.finish_assistant_stream();
         assert!(sb.streaming_index().is_none());
+        assert!(!sb.is_streaming());
     }
 
     #[test]
@@ -791,6 +889,9 @@ mod tests {
         sb.finish_assistant_stream();
         sb.prepare(40, 40);
 
+        assert!(matches!(sb.items()[0], TurnItem::Reasoning { .. }));
+        assert!(matches!(sb.items()[1], TurnItem::Assistant { .. }));
+
         let collapsed = sb.entry_lines(0);
         assert!(
             collapsed[0].contains("Thought") || collapsed[0].contains("Thinking"),
@@ -802,29 +903,32 @@ mod tests {
             "body hidden when collapsed: {collapsed:?}"
         );
         assert!(sb.is_thinking_header(0, 0));
-        assert!(!sb.is_thinking_header(0, 1));
+        assert!(!sb.is_thinking_header(1, 0));
 
         assert!(sb.toggle_thinking(0));
         sb.prepare(40, 40);
         let expanded = sb.entry_lines(0);
         assert!(expanded.iter().any(|l| l.contains("step one")));
-        assert!(expanded.iter().any(|l| l.contains("final answer")));
+        let answer = sb.entry_lines(1);
+        assert!(answer.iter().any(|l| l.contains("final answer")));
         assert!(expanded.len() > collapsed.len());
     }
 
     #[test]
-    fn reasoning_not_in_turn_item() {
+    fn reasoning_is_sibling_row_not_assistant_field() {
         let mut sb = Scrollback::new();
         sb.begin_assistant_stream();
         sb.append_reasoning_delta("secret cot");
         sb.append_assistant_delta("visible");
         sb.finish_assistant_stream();
+        assert_eq!(sb.items().len(), 2);
         match &sb.items()[0] {
-            TurnItem::Assistant { content } => {
-                assert_eq!(content, "visible");
-                assert!(!content.contains("secret"));
-            }
-            _ => panic!("assistant"),
+            TurnItem::Reasoning { content } => assert_eq!(content, "secret cot"),
+            _ => panic!("expected Reasoning sibling"),
+        }
+        match &sb.items()[1] {
+            TurnItem::Assistant { content } => assert_eq!(content, "visible"),
+            _ => panic!("expected Assistant"),
         }
     }
 }

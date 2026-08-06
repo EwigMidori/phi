@@ -195,7 +195,11 @@ fn history_to_chat_messages(request: &TurnRequest) -> Vec<Value> {
                     messages.push(json!({"role": "assistant", "content": content}));
                 }
             }
-            TurnItem::ToolCall { .. } | TurnItem::ToolResult { .. } => {}
+            // Sibling reasoning rows: chat-completions has no native slot; skip
+            // (Responses-style re-send is a later product policy).
+            TurnItem::Reasoning { .. }
+            | TurnItem::ToolCall { .. }
+            | TurnItem::ToolResult { .. } => {}
         }
     }
     messages
@@ -215,7 +219,10 @@ fn history_to_responses_input(request: &TurnRequest) -> (String, Vec<Value>) {
                     input.push(json!({"role": "assistant", "content": content}));
                 }
             }
-            TurnItem::ToolCall { .. } | TurnItem::ToolResult { .. } => {}
+            // Keep history lean for now; encrypted/full reasoning round-trip later.
+            TurnItem::Reasoning { .. }
+            | TurnItem::ToolCall { .. }
+            | TurnItem::ToolResult { .. } => {}
         }
     }
     (instructions, input)

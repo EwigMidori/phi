@@ -130,7 +130,7 @@ impl TurnDriver {
                     scrollback.scroll_to_bottom();
                 }
                 TurnProgress::ReasoningDelta(text) => {
-                    // UI-only thinking block (default collapsed); not TurnItem body.
+                    // Sibling TurnItem::Reasoning (default collapsed chrome).
                     self.thinking = true;
                     scrollback.append_reasoning_delta(&text);
                     scrollback.scroll_to_bottom();
