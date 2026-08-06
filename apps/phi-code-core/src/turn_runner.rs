@@ -1,4 +1,7 @@
-//! Session turn runner: spawn `AgentRuntime` stream → pollable progress for the TUI tick.
+//! Session turn runner: spawn `AgentRuntime` stream → pollable [`AgentEvent`]s for the TUI tick.
+//!
+//! No parallel progress enum — the channel carries kernel [`AgentEvent`] so tools /
+//! approvals later need no second wire format.
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -9,22 +12,11 @@ use phi_kernel::{
     TurnItem, TurnRequest,
 };
 
-/// One step of turn progress for the UI driver (not raw provider events).
-#[derive(Debug, Clone)]
-pub enum TurnProgress {
-    /// Answer body → append/open [`TurnItem::Assistant`].
-    TextDelta(String),
-    /// CoT → append/open sibling [`TurnItem::Reasoning`] (not nested in Assistant).
-    ReasoningDelta(String),
-    Error(String),
-    Finished,
-}
-
 /// Owns the active generation: starts async `AgentRuntime::run`, exposes non-blocking poll.
 pub struct SessionTurnRunner {
     agent: Arc<dyn AgentRuntime>,
     session_id: SessionId,
-    progress_rx: Option<Receiver<TurnProgress>>,
+    event_rx: Option<Receiver<AgentEvent>>,
     busy: bool,
 }
 
@@ -34,7 +26,7 @@ impl SessionTurnRunner {
         Self {
             agent,
             session_id: SessionId::generate(),
-            progress_rx: None,
+            event_rx: None,
             busy: false,
         }
     }
@@ -44,7 +36,7 @@ impl SessionTurnRunner {
         Self {
             agent,
             session_id,
-            progress_rx: None,
+            event_rx: None,
             busy: false,
         }
     }
@@ -71,7 +63,7 @@ impl SessionTurnRunner {
         }
 
         let (tx, rx) = mpsc::channel();
-        self.progress_rx = Some(rx);
+        self.event_rx = Some(rx);
         self.busy = true;
 
         let agent = Arc::clone(&self.agent);
@@ -91,56 +83,33 @@ impl SessionTurnRunner {
             let _cancel = cancel;
             match agent.run(request).await {
                 Ok(mut stream) => {
-                    let mut saw_terminal = false;
+                    let mut saw_finished = false;
                     while let Some(item) = stream.next().await {
                         match item {
-                            Ok(AgentEvent::TextDelta { text }) => {
-                                if !text.is_empty()
-                                    && tx.send(TurnProgress::TextDelta(text)).is_err()
-                                {
+                            Ok(ev) => {
+                                let is_finished = matches!(ev, AgentEvent::Finished { .. });
+                                if tx.send(ev).is_err() {
                                     return;
                                 }
-                            }
-                            Ok(AgentEvent::ReasoningDelta { text }) => {
-                                // Sibling TurnItem::Reasoning row (Grok-aligned).
-                                if !text.is_empty()
-                                    && tx.send(TurnProgress::ReasoningDelta(text)).is_err()
-                                {
-                                    return;
+                                if is_finished {
+                                    saw_finished = true;
+                                    break;
                                 }
-                            }
-                            Ok(AgentEvent::Error { message }) => {
-                                let _ = tx.send(TurnProgress::Error(message));
-                                saw_terminal = true;
-                                break;
-                            }
-                            Ok(AgentEvent::Finished { .. }) => {
-                                saw_terminal = true;
-                                break;
-                            }
-                            Ok(
-                                AgentEvent::ToolCall { .. }
-                                | AgentEvent::ToolResult { .. }
-                                | AgentEvent::ToolApprovalRequired { .. }
-                                | AgentEvent::Unknown { .. },
-                            ) => {
-                                // Step-1 text-only.
                             }
                             Err(e) => {
-                                let _ = tx.send(TurnProgress::Error(e));
-                                saw_terminal = true;
+                                let _ = tx.send(AgentEvent::Error { message: e });
                                 break;
                             }
                         }
                     }
-                    if !saw_terminal {
-                        // Stream ended without Finished/Error.
+                    if !saw_finished {
+                        // Stream ended without Finished (error path or abrupt close).
+                        let _ = tx.send(AgentEvent::Finished { reason: None });
                     }
-                    let _ = tx.send(TurnProgress::Finished);
                 }
                 Err(e) => {
-                    let _ = tx.send(TurnProgress::Error(e));
-                    let _ = tx.send(TurnProgress::Finished);
+                    let _ = tx.send(AgentEvent::Error { message: e });
+                    let _ = tx.send(AgentEvent::Finished { reason: None });
                 }
             }
         });
@@ -148,30 +117,33 @@ impl SessionTurnRunner {
         Ok(())
     }
 
-    /// Non-blocking: drain available progress events.
-    pub fn poll(&mut self) -> Vec<TurnProgress> {
-        let Some(rx) = self.progress_rx.as_ref() else {
+    /// Non-blocking: drain available kernel events.
+    pub fn poll(&mut self) -> Vec<AgentEvent> {
+        let Some(rx) = self.event_rx.as_ref() else {
             return Vec::new();
         };
         let mut out = Vec::new();
         loop {
             match rx.try_recv() {
-                Ok(p) => {
-                    let finished = matches!(p, TurnProgress::Finished);
-                    out.push(p);
+                Ok(ev) => {
+                    let finished = matches!(ev, AgentEvent::Finished { .. });
+                    out.push(ev);
                     if finished {
                         self.busy = false;
-                        self.progress_rx = None;
+                        self.event_rx = None;
                         break;
                     }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    if !out.iter().any(|p| matches!(p, TurnProgress::Finished)) {
-                        out.push(TurnProgress::Finished);
+                    if !out
+                        .iter()
+                        .any(|e| matches!(e, AgentEvent::Finished { .. }))
+                    {
+                        out.push(AgentEvent::Finished { reason: None });
                     }
                     self.busy = false;
-                    self.progress_rx = None;
+                    self.event_rx = None;
                     break;
                 }
             }

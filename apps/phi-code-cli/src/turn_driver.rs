@@ -1,10 +1,8 @@
-//! Turn driver: submit user text → [`SessionTurnRunner`] → stream into Scrollback.
+//! Turn driver: submit user text → [`SessionTurnRunner`] → [`AgentEvent`] → Scrollback.
 
 use std::sync::Arc;
 
-use phi_code_core::{
-    LlmConfig, OpenAiCompatRuntime, SessionTurnRunner, TurnProgress,
-};
+use phi_code_core::{AgentEvent, LlmConfig, OpenAiCompatRuntime, SessionTurnRunner};
 use phi_code_ui::Scrollback;
 
 /// Bridges product turn runner to the scrollback view.
@@ -24,11 +22,8 @@ impl TurnDriver {
     pub fn from_env() -> Self {
         match LlmConfig::from_env() {
             Ok(cfg) => {
-                let style = match cfg.api_style {
-                    phi_code_core::ApiStyle::Responses => "responses",
-                    phi_code_core::ApiStyle::Completions => "completions",
-                };
-                let model_label = format!("{} ({style}) @ {}", cfg.model, cfg.api_base);
+                let model_label =
+                    format!("{} ({}) @ {}", cfg.model, cfg.api_style.as_ref(), cfg.api_base);
                 let agent = Arc::new(OpenAiCompatRuntime::new(cfg));
                 Self {
                     runner: Some(SessionTurnRunner::new(agent)),
@@ -109,9 +104,10 @@ impl TurnDriver {
         true
     }
 
-    /// Drain runner progress into scrollback.
+    /// Drain kernel [`AgentEvent`]s into scrollback.
     ///
     /// Returns `true` when a stream finished on this tick (clear painter).
+    /// Tool / approval events are ignored until product hosts them (channel already carries them).
     pub fn tick(&mut self, scrollback: &mut Scrollback) -> bool {
         let Some(runner) = self.runner.as_mut() else {
             return false;
@@ -123,28 +119,38 @@ impl TurnDriver {
         let mut finished = false;
         for ev in events {
             match ev {
-                TurnProgress::TextDelta(text) => {
-                    // Answer body only — reasoning never lands here.
+                AgentEvent::TextDelta { text } => {
+                    if text.is_empty() {
+                        continue;
+                    }
                     self.thinking = false;
                     scrollback.append_assistant_delta(&text);
                     scrollback.scroll_to_bottom();
                 }
-                TurnProgress::ReasoningDelta(text) => {
-                    // Sibling TurnItem::Reasoning (default collapsed chrome).
+                AgentEvent::ReasoningDelta { text } => {
+                    if text.is_empty() {
+                        continue;
+                    }
                     self.thinking = true;
                     scrollback.append_reasoning_delta(&text);
                     scrollback.scroll_to_bottom();
                 }
-                TurnProgress::Error(message) => {
+                AgentEvent::Error { message } => {
                     self.thinking = false;
                     scrollback.append_assistant_delta(&format!("\n\n**Error:** {message}\n"));
                     scrollback.scroll_to_bottom();
                 }
-                TurnProgress::Finished => {
+                AgentEvent::Finished { .. } => {
                     self.thinking = false;
                     scrollback.finish_assistant_stream();
                     scrollback.scroll_to_bottom();
                     finished = true;
+                }
+                AgentEvent::ToolCall { .. }
+                | AgentEvent::ToolResult { .. }
+                | AgentEvent::ToolApprovalRequired { .. }
+                | AgentEvent::Unknown { .. } => {
+                    // Forwarded by runner; UI host for tools/approvals lands later.
                 }
             }
         }

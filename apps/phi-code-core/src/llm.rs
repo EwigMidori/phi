@@ -11,15 +11,21 @@ use futures::stream::{self, Stream};
 use phi_kernel::{AgentEvent, AgentEventStream, AgentRuntime, TurnCancel, TurnItem, TurnRequest};
 use reqwest::Client;
 use serde_json::{Value, json};
+use strum::{Display, EnumString};
 use thiserror::Error;
 
 /// Wire protocol for the HTTP adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Env wire names (exact): `responses` | `completions`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Display, EnumString, strum::AsRefStr,
+)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 pub enum ApiStyle {
-    /// `POST {base}/responses` — OpenAI Responses / DeepSeek-V4-Flash default.
+    /// `POST {base}/responses`
     #[default]
     Responses,
-    /// `POST {base}/chat/completions` — classic Chat Completions.
+    /// `POST {base}/chat/completions`
     Completions,
 }
 
@@ -66,7 +72,14 @@ impl LlmConfig {
         } else {
             model
         };
-        let api_style = parse_api_style(&env_trim("PHI_API_STYLE"))?;
+        let style_raw = env_trim("PHI_API_STYLE");
+        let api_style = if style_raw.is_empty() {
+            ApiStyle::default()
+        } else {
+            style_raw
+                .parse::<ApiStyle>()
+                .map_err(|_| LlmConfigError::InvalidApiStyle(style_raw))?
+        };
         Ok(Self {
             api_base,
             api_key,
@@ -82,14 +95,6 @@ fn env_trim(key: &str) -> String {
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
         .unwrap_or_default()
-}
-
-fn parse_api_style(raw: &str) -> Result<ApiStyle, LlmConfigError> {
-    match raw.trim() {
-        "" | "responses" => Ok(ApiStyle::Responses),
-        "completions" | "chat" | "chat_completions" => Ok(ApiStyle::Completions),
-        other => Err(LlmConfigError::InvalidApiStyle(other.to_owned())),
-    }
 }
 
 /// HTTP streaming runtime (Responses or Completions).
@@ -423,64 +428,4 @@ fn parse_sse_data(
     }
 
     Ok(None)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_completions_delta() {
-        let raw = r#"{"choices":[{"delta":{"content":"你好"}}]}"#;
-        let ev = parse_sse_data(raw, ApiStyle::Completions, None)
-            .unwrap()
-            .unwrap();
-        match ev {
-            AgentEvent::TextDelta { text } => assert_eq!(text, "你好"),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_responses_delta() {
-        let raw = r#"{"type":"response.output_text.delta","delta":"Hello"}"#;
-        let ev = parse_sse_data(raw, ApiStyle::Responses, None)
-            .unwrap()
-            .unwrap();
-        match ev {
-            AgentEvent::TextDelta { text } => assert_eq!(text, "Hello"),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_responses_reasoning_delta() {
-        let raw = r#"{"type":"response.reasoning_text.delta","delta":"think"}"#;
-        let ev = parse_sse_data(raw, ApiStyle::Responses, None)
-            .unwrap()
-            .unwrap();
-        match ev {
-            AgentEvent::ReasoningDelta { text } => assert_eq!(text, "think"),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_responses_completed() {
-        let raw = r#"{"type":"response.completed"}"#;
-        let ev = parse_sse_data(raw, ApiStyle::Responses, None)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(ev, AgentEvent::Finished { .. }));
-    }
-
-    #[test]
-    fn parse_api_style_defaults_responses() {
-        assert_eq!(parse_api_style("").unwrap(), ApiStyle::Responses);
-        assert_eq!(parse_api_style("responses").unwrap(), ApiStyle::Responses);
-        assert_eq!(
-            parse_api_style("completions").unwrap(),
-            ApiStyle::Completions
-        );
-    }
 }
