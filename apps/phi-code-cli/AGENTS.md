@@ -2,10 +2,18 @@
 
 ## Role
 
-Thin binary over `phi-code-core` + `phi-code-ui`. Keep small; coordinate
-objects by message, do not re-implement UI policy here.
+Thin **terminal host** over `phi-code-core` + `phi-code-ui`.
+
+| Module | Object |
+|--------|--------|
+| `main.rs` | Terminal lifecycle only (`run_terminal_host`) |
+| `shell.rs` | `AgentShell` — tick / draw / handle routing |
+| `scrollback_pane.rs` | History, selection, scrollbar, nav keys |
+| `prompt_pane.rs` | TextArea + paste policy |
+| `turn_driver.rs` | Submit user → stream assistant (demo echo; core later) |
 
 ## Forbidden
 
 - Duplicating scrollback / selection / paint / paste logic (belongs in `phi-code-ui`)
+- Growing `main.rs` with event tables again
 - Editing vendored crates under `vendor/` except deliberate upgrades

@@ -2,11 +2,12 @@
 
 Thin binary entry for phi-code.
 
-| Layer | Crate |
-|-------|--------|
+| Layer | Crate / module |
+|-------|----------------|
 | Product runtime | `phi-code-core` |
 | TUI objects | `phi-code-ui` |
-| Binary / event loop | `phi-code-cli` |
+| Shell + panes | `shell`, `scrollback_pane`, `prompt_pane`, `turn_driver` |
+| Terminal host | `main` (`run_terminal_host`) |
 
 ```bash
 cargo run -p phi-code-cli
