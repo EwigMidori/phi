@@ -173,19 +173,60 @@ impl ScrollbackPainter {
     ) -> (Vec<Line<'static>>, Vec<String>) {
         match &seg.item {
             TurnItem::Assistant { content } if !seg.folded => {
-                let md = if seg.streaming {
+                let plains = scrollback.entry_lines(seg.entry_index);
+                let think = scrollback.thinking_layout(seg.entry_index, width);
+                let think_rows = think.map(crate::scrollback::ThinkingLayout::total_rows).unwrap_or(0);
+
+                let body_md = if content.is_empty() && think_rows > 0 {
+                    Vec::new()
+                } else if seg.streaming {
                     self.stream_lines_for(seg.entry_index, width)
                         .unwrap_or_else(|| self.markdown.pretty_lines(content, width))
+                } else if content.is_empty() {
+                    vec![Line::from("")]
                 } else {
                     self.markdown.pretty_lines(content, width)
                 };
-                let plains = if seg.streaming {
-                    md.iter().map(ProductMarkdown::plain_of_line).collect()
-                } else {
-                    // Same width as prepare()'s layout_width → matches height / copy.
-                    scrollback.entry_lines(seg.entry_index)
-                };
-                (md, plains)
+
+                // Prefix thinking lines (header + optional body) so paint ≡ plain.
+                let mut paint: Vec<Line<'static>> = Vec::with_capacity(plains.len());
+                for (i, plain) in plains.iter().enumerate() {
+                    if think.is_some_and(|t| t.is_header_row(i)) {
+                        paint.push(Line::from(Span::styled(
+                            plain.clone(),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                        )));
+                    } else if think.is_some_and(|t| t.is_body_row(i)) {
+                        paint.push(Line::from(Span::styled(
+                            plain.clone(),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(ratatui::style::Modifier::DIM)
+                                .add_modifier(ratatui::style::Modifier::ITALIC),
+                        )));
+                    } else {
+                        // Body: use pretty md when available, else plain.
+                        let body_i = i.saturating_sub(think_rows);
+                        if let Some(line) = body_md.get(body_i) {
+                            paint.push(line.clone());
+                        } else {
+                            paint.push(Line::from(Span::styled(
+                                plain.clone(),
+                                Style::default().fg(Color::Green),
+                            )));
+                        }
+                    }
+                }
+                // Keep lengths aligned for clip/selection.
+                while paint.len() < plains.len() {
+                    paint.push(Line::from(""));
+                }
+                if paint.len() > plains.len() {
+                    paint.truncate(plains.len());
+                }
+                (paint, plains)
             }
             _ => {
                 let plains = scrollback.entry_lines(seg.entry_index);
@@ -221,6 +262,7 @@ impl ScrollbackPainter {
         match accent {
             Accent::User => Color::Cyan,
             Accent::Assistant => Color::Green,
+            Accent::Thinking => Color::Yellow,
             Accent::ToolRunning => Color::Blue,
             Accent::ToolOk => Color::Green,
             Accent::ToolError => Color::Red,

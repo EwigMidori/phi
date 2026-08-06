@@ -14,6 +14,8 @@ pub struct TurnDriver {
     config_error: Option<String>,
     /// Model label for status chrome.
     model_label: String,
+    /// True while the latest turn is still receiving reasoning (CoT) deltas.
+    thinking: bool,
 }
 
 impl TurnDriver {
@@ -32,12 +34,14 @@ impl TurnDriver {
                     runner: Some(SessionTurnRunner::new(agent)),
                     config_error: None,
                     model_label,
+                    thinking: false,
                 }
             }
             Err(e) => Self {
                 runner: None,
                 config_error: Some(e.to_string()),
                 model_label: "unconfigured".into(),
+                thinking: false,
             },
         }
     }
@@ -57,6 +61,12 @@ impl TurnDriver {
         self.runner.as_ref().is_some_and(SessionTurnRunner::is_busy)
     }
 
+    /// True while CoT/reasoning is arriving (answer body may still be empty).
+    #[must_use]
+    pub fn is_thinking(&self) -> bool {
+        self.thinking
+    }
+
     /// Start a turn: push user + begin assistant stream + spawn LLM job.
     ///
     /// Returns `false` when busy or empty. Config/API start failures still return
@@ -73,6 +83,7 @@ impl TurnDriver {
         scrollback.push_user(msg);
         scrollback.begin_assistant_stream();
         scrollback.scroll_to_bottom();
+        self.thinking = false;
 
         if let Some(err) = &self.config_error {
             let err = err.clone();
@@ -93,6 +104,7 @@ impl TurnDriver {
         if let Err(e) = runner.start_turn(history) {
             scrollback.append_assistant_delta(&format!("\n\n**Failed to start turn:** {e}\n"));
             scrollback.finish_assistant_stream();
+            self.thinking = false;
         }
         true
     }
@@ -112,14 +124,24 @@ impl TurnDriver {
         for ev in events {
             match ev {
                 TurnProgress::TextDelta(text) => {
+                    // Answer body only — reasoning never lands here.
+                    self.thinking = false;
                     scrollback.append_assistant_delta(&text);
                     scrollback.scroll_to_bottom();
                 }
+                TurnProgress::ReasoningDelta(text) => {
+                    // UI-only thinking block (default collapsed); not TurnItem body.
+                    self.thinking = true;
+                    scrollback.append_reasoning_delta(&text);
+                    scrollback.scroll_to_bottom();
+                }
                 TurnProgress::Error(message) => {
+                    self.thinking = false;
                     scrollback.append_assistant_delta(&format!("\n\n**Error:** {message}\n"));
                     scrollback.scroll_to_bottom();
                 }
                 TurnProgress::Finished => {
+                    self.thinking = false;
                     scrollback.finish_assistant_stream();
                     scrollback.scroll_to_bottom();
                     finished = true;

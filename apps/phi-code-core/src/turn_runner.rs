@@ -12,7 +12,10 @@ use phi_kernel::{
 /// One step of turn progress for the UI driver (not raw provider events).
 #[derive(Debug, Clone)]
 pub enum TurnProgress {
+    /// Visible assistant answer body (never CoT / reasoning).
     TextDelta(String),
+    /// Model chain-of-thought. Kept separate so UI/history never mix it into answer text.
+    ReasoningDelta(String),
     Error(String),
     Finished,
 }
@@ -99,10 +102,11 @@ impl SessionTurnRunner {
                                 }
                             }
                             Ok(AgentEvent::ReasoningDelta { text }) => {
-                                // Surface CoT in the same stream for step-1 UX
-                                // (DeepSeek responses emit reasoning before final text).
+                                // DeepSeek /responses emits reasoning_text before
+                                // output_text — must NOT collapse into TextDelta or
+                                // CoT pollutes the assistant TurnItem + next-turn history.
                                 if !text.is_empty()
-                                    && tx.send(TurnProgress::TextDelta(text)).is_err()
+                                    && tx.send(TurnProgress::ReasoningDelta(text)).is_err()
                                 {
                                     return;
                                 }

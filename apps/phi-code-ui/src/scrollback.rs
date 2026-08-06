@@ -3,8 +3,10 @@
 //! Collaborators:
 //! - [`ProductMarkdown`] — assistant display height / plain lines
 //! - [`EntryView`] — private: how one turn answers height / lines / accent
+//! - [`ThinkingState`] — UI-only CoT (not in TurnItem / not resent as history)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use phi_kernel::{ToolResultStatus, TurnItem};
 use textwrap::{wrap, Options};
@@ -18,10 +20,41 @@ use crate::selection::LineSource;
 pub enum Accent {
     User,
     Assistant,
+    /// Collapsed/expanded thinking header (Grok-style Thought block).
+    Thinking,
     ToolRunning,
     ToolOk,
     ToolError,
     ToolOther,
+}
+
+/// How many leading display lines of an entry belong to thinking UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinkingLayout {
+    /// Always 1 when thinking exists (header row).
+    pub header_rows: usize,
+    /// Body rows when expanded; 0 when collapsed.
+    pub body_rows: usize,
+    pub expanded: bool,
+    pub streaming: bool,
+}
+
+impl ThinkingLayout {
+    #[must_use]
+    pub fn total_rows(self) -> usize {
+        self.header_rows.saturating_add(self.body_rows)
+    }
+
+    #[must_use]
+    pub fn is_header_row(self, line_in_entry: usize) -> bool {
+        self.header_rows > 0 && line_in_entry == 0
+    }
+
+    #[must_use]
+    pub fn is_body_row(self, line_in_entry: usize) -> bool {
+        line_in_entry >= self.header_rows
+            && line_in_entry < self.header_rows.saturating_add(self.body_rows)
+    }
 }
 
 /// One viewport-visible piece of an entry (may be a vertical clip).
@@ -54,6 +87,8 @@ pub struct Scrollback {
     total_height: usize,
     /// Shared pretty-md collaborator (height ≡ plain lines ≡ paint).
     markdown: ProductMarkdown,
+    /// CoT keyed by assistant entry index — UI-only, never part of TurnItem.
+    thinking: HashMap<usize, ThinkingState>,
 }
 
 impl Default for Scrollback {
@@ -77,6 +112,7 @@ impl Scrollback {
             virtual_y: Vec::new(),
             total_height: 0,
             markdown: ProductMarkdown::new(),
+            thinking: HashMap::new(),
         }
     }
 
@@ -128,6 +164,7 @@ impl Scrollback {
         self.items = items;
         self.streaming = None;
         self.folded.retain(|&i| i < self.items.len());
+        self.thinking.retain(|&i, _| i < self.items.len());
         if let Some(s) = self.selected
             && s >= self.items.len()
         {
@@ -172,7 +209,70 @@ impl Scrollback {
         self.invalidate_layout();
     }
 
+    /// Append chain-of-thought to the streaming assistant (UI-only; not TurnItem).
+    pub fn append_reasoning_delta(&mut self, delta: &str) {
+        let Some(i) = self.streaming else {
+            return;
+        };
+        if delta.is_empty() {
+            return;
+        }
+        self.thinking
+            .entry(i)
+            .or_insert_with(ThinkingState::new_streaming)
+            .text
+            .push_str(delta);
+        self.invalidate_layout();
+    }
+
+    /// Toggle expand/collapse of thinking for an assistant entry (Grok click).
+    ///
+    /// Returns `true` if a thinking block was toggled.
+    pub fn toggle_thinking(&mut self, entry_idx: usize) -> bool {
+        let Some(th) = self.thinking.get_mut(&entry_idx) else {
+            return false;
+        };
+        th.expanded = !th.expanded;
+        self.invalidate_layout();
+        true
+    }
+
+    /// Whether `line_in_entry` is the thinking header row (click target).
+    #[must_use]
+    pub fn is_thinking_header(&self, entry_idx: usize, line_in_entry: usize) -> bool {
+        if self.folded.contains(&entry_idx) {
+            return false;
+        }
+        self.thinking_layout(entry_idx, self.layout_width.max(1) as usize)
+            .is_some_and(|lay| lay.is_header_row(line_in_entry))
+    }
+
+    /// Layout of the thinking block for paint / hit-test (None if no CoT).
+    #[must_use]
+    pub fn thinking_layout(&self, entry_idx: usize, width: usize) -> Option<ThinkingLayout> {
+        let th = self.thinking.get(&entry_idx)?;
+        if self.folded.contains(&entry_idx) {
+            return None;
+        }
+        let body_rows = if th.expanded {
+            EntryView::wrap_text(&th.text, width.max(1)).len()
+        } else {
+            0
+        };
+        Some(ThinkingLayout {
+            header_rows: 1,
+            body_rows,
+            expanded: th.expanded,
+            streaming: th.streaming,
+        })
+    }
+
     pub fn finish_assistant_stream(&mut self) {
+        if let Some(i) = self.streaming
+            && let Some(th) = self.thinking.get_mut(&i)
+        {
+            th.finish();
+        }
         self.streaming = None;
         self.invalidate_layout();
     }
@@ -340,10 +440,42 @@ impl Scrollback {
     #[must_use]
     pub fn entry_lines(&self, index: usize) -> Vec<String> {
         let width = self.layout_width.max(1) as usize;
+        self.entry_display_lines(index, width)
+    }
+
+    fn entry_display_lines(&self, index: usize, width: usize) -> Vec<String> {
         let Some(item) = self.items.get(index) else {
             return Vec::new();
         };
-        EntryView::new(item, self.folded.contains(&index), &self.markdown).display_lines(width)
+        let folded = self.folded.contains(&index);
+        if folded {
+            return EntryView::new(item, true, &self.markdown).display_lines(width);
+        }
+
+        let mut lines = Vec::new();
+        if let Some(th) = self.thinking.get(&index) {
+            lines.push(th.header_line());
+            if th.expanded {
+                lines.extend(EntryView::wrap_text(&th.text, width.max(1)));
+            }
+        }
+
+        let body = EntryView::new(item, false, &self.markdown).display_lines(width);
+        // Avoid a blank body row under collapsed Thinking while answer is empty.
+        let body_empty = matches!(item, TurnItem::Assistant { content } if content.is_empty());
+        if body_empty && self.thinking.contains_key(&index) {
+            // thinking-only for now
+        } else {
+            lines.extend(body);
+        }
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines
+    }
+
+    fn entry_height(&self, index: usize, width: usize) -> usize {
+        self.entry_display_lines(index, width).len().max(1)
     }
 
     fn ensure_entry_visible(&mut self, index: usize, viewport_h: usize) {
@@ -375,10 +507,9 @@ impl Scrollback {
         self.virtual_y.clear();
         let w = width as usize;
         let mut y = 0usize;
-        for (i, item) in self.items.iter().enumerate() {
+        for i in 0..self.items.len() {
             self.virtual_y.push(y);
-            let view = EntryView::new(item, self.folded.contains(&i), &self.markdown);
-            let h = view.height(w);
+            let h = self.entry_height(i, w);
             let gap = usize::from(i + 1 < self.items.len());
             self.entry_heights.push(h + gap);
             y += h + gap;
@@ -398,6 +529,57 @@ impl Scrollback {
 impl LineSource for Scrollback {
     fn lines_of(&self, entry_idx: usize) -> Vec<String> {
         self.entry_lines(entry_idx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ThinkingState — UI-only CoT (Grok ThinkingBlock collapsed-by-default)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct ThinkingState {
+    text: String,
+    /// Default collapsed (Grok).
+    expanded: bool,
+    streaming: bool,
+    started_at: Instant,
+    elapsed_ms: Option<u64>,
+}
+
+impl ThinkingState {
+    fn new_streaming() -> Self {
+        Self {
+            text: String::new(),
+            expanded: false,
+            streaming: true,
+            started_at: Instant::now(),
+            elapsed_ms: None,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.streaming = false;
+        if self.elapsed_ms.is_none() {
+            self.elapsed_ms = Some(self.started_at.elapsed().as_millis() as u64);
+        }
+    }
+
+    fn header_line(&self) -> String {
+        let chevron = if self.expanded { "▾" } else { "▸" };
+        if self.streaming {
+            format!("{chevron} Thinking…")
+        } else if let Some(ms) = self.elapsed_ms {
+            let secs = ms as f64 / 1000.0;
+            if self.expanded {
+                format!("{chevron} Thought for {secs:.1}s")
+            } else {
+                format!("{chevron} Thought for {secs:.1}s  (click to expand)")
+            }
+        } else if self.expanded {
+            format!("{chevron} Thought")
+        } else {
+            format!("{chevron} Thought  (click to expand)")
+        }
     }
 }
 
@@ -431,16 +613,6 @@ impl<'a> EntryView<'a> {
                 ToolResultStatus::Error | ToolResultStatus::Incomplete => Accent::ToolError,
                 ToolResultStatus::Denied | ToolResultStatus::Ask => Accent::ToolOther,
             },
-        }
-    }
-
-    fn height(&self, width: usize) -> usize {
-        if self.folded {
-            return 1;
-        }
-        match self.item {
-            TurnItem::Assistant { content } => self.markdown.height(content, width),
-            _ => self.display_lines(width).len().max(1),
         }
     }
 
@@ -608,5 +780,51 @@ mod tests {
             lines.len()
         );
         assert!(sb.total_height() > 1);
+    }
+
+    #[test]
+    fn thinking_default_collapsed_click_expands() {
+        let mut sb = Scrollback::new();
+        sb.begin_assistant_stream();
+        sb.append_reasoning_delta("step one\nstep two\nstep three that is fairly long");
+        sb.append_assistant_delta("final answer");
+        sb.finish_assistant_stream();
+        sb.prepare(40, 40);
+
+        let collapsed = sb.entry_lines(0);
+        assert!(
+            collapsed[0].contains("Thought") || collapsed[0].contains("Thinking"),
+            "header: {}",
+            collapsed[0]
+        );
+        assert!(
+            !collapsed.iter().any(|l| l.contains("step one")),
+            "body hidden when collapsed: {collapsed:?}"
+        );
+        assert!(sb.is_thinking_header(0, 0));
+        assert!(!sb.is_thinking_header(0, 1));
+
+        assert!(sb.toggle_thinking(0));
+        sb.prepare(40, 40);
+        let expanded = sb.entry_lines(0);
+        assert!(expanded.iter().any(|l| l.contains("step one")));
+        assert!(expanded.iter().any(|l| l.contains("final answer")));
+        assert!(expanded.len() > collapsed.len());
+    }
+
+    #[test]
+    fn reasoning_not_in_turn_item() {
+        let mut sb = Scrollback::new();
+        sb.begin_assistant_stream();
+        sb.append_reasoning_delta("secret cot");
+        sb.append_assistant_delta("visible");
+        sb.finish_assistant_stream();
+        match &sb.items()[0] {
+            TurnItem::Assistant { content } => {
+                assert_eq!(content, "visible");
+                assert!(!content.contains("secret"));
+            }
+            _ => panic!("assistant"),
+        }
     }
 }

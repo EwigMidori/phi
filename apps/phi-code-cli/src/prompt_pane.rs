@@ -113,6 +113,18 @@ impl PromptPane {
         self.textarea.text().trim().to_owned()
     }
 
+    /// Raw composer text (for copy / emptiness checks).
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.textarea.text().to_owned()
+    }
+
+    /// True when the composer has no non-whitespace content.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.textarea.text().trim().is_empty()
+    }
+
     pub fn clear(&mut self) {
         self.textarea.set_text("");
     }

@@ -23,7 +23,7 @@ pub use markdown::ProductMarkdown;
 pub use painter::ScrollbackPainter;
 pub use paste::PastePolicy;
 pub use phi_kernel::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
-pub use scrollback::{Accent, Scrollback, VisibleSegment};
+pub use scrollback::{Accent, Scrollback, ThinkingLayout, VisibleSegment};
 pub use scrollbar::{HistoryScrollbar, ScrollInfo, ScrollbarClick};
 pub use selection::{AutoScrollDirection, DragAutoScrollState, Selection, TextHit, TextSelection};
 

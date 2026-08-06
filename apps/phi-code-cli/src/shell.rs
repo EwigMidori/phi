@@ -1,5 +1,7 @@
 //! Agent shell: routes events among prompt, scrollback, and turn driver.
 
+use std::time::{Duration, Instant};
+
 use crossterm::event::{
     Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
@@ -13,6 +15,9 @@ use xai_ratatui_textarea::ClipboardProvider;
 use crate::prompt_pane::PromptPane;
 use crate::scrollback_pane::ScrollbackPane;
 use crate::turn_driver::TurnDriver;
+
+/// Second Ctrl+C must arrive within this window to quit.
+const QUIT_CTRL_C_WINDOW: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -28,6 +33,8 @@ pub struct AgentShell {
     scrollback: ScrollbackPane,
     driver: TurnDriver,
     quit: bool,
+    /// Instant of the first Ctrl+C in a double-tap quit sequence.
+    ctrl_c_armed_at: Option<Instant>,
 }
 
 impl AgentShell {
@@ -47,6 +54,7 @@ impl AgentShell {
             scrollback: ScrollbackPane::new(),
             driver,
             quit: false,
+            ctrl_c_armed_at: None,
         }
     }
 
@@ -60,6 +68,7 @@ impl AgentShell {
     }
 
     pub fn tick(&mut self) {
+        self.expire_ctrl_c_arm();
         if self.driver.tick(self.scrollback.scrollback_mut()) {
             self.scrollback.clear_stream_renderer();
         }
@@ -81,7 +90,9 @@ impl AgentShell {
         } else {
             "single"
         };
-        let stream = if self.driver.is_busy() || self.scrollback.scrollback().is_streaming() {
+        let stream = if self.driver.is_thinking() {
+            "thinking"
+        } else if self.driver.is_busy() || self.scrollback.scrollback().is_streaming() {
             "streaming"
         } else {
             "idle"
@@ -112,7 +123,7 @@ impl AgentShell {
 
         frame.render_widget(
             Paragraph::new(
-                " select · scrollbar · CJK · pretty md · paste chip · C-v · y/C-c · esc ",
+                " select · y copy · C-c clear prompt · C-c C-c quit (empty) · C-v paste ",
             )
             .style(Style::default().fg(Color::DarkGray)),
             shortcuts,
@@ -162,24 +173,31 @@ impl AgentShell {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
+            // Prompt non-empty → copy+clear (no quit). Empty → double Ctrl+C quit.
+            KeyCode::Char('c' | 'C') if ctrl => {
+                self.handle_ctrl_c();
+            }
+            // Esc only clears selection — never quits.
             KeyCode::Esc => {
                 if self.scrollback.has_selection() {
                     self.scrollback.clear_selection();
                     self.status_note.clear();
-                } else {
-                    self.quit = true;
                 }
+                self.ctrl_c_armed_at = None;
             }
             KeyCode::Tab => {
+                self.ctrl_c_armed_at = None;
                 self.focus = match self.focus {
                     Focus::Prompt => Focus::Scrollback,
                     Focus::Scrollback => Focus::Prompt,
                 };
             }
             KeyCode::Char('m') if ctrl => {
+                self.ctrl_c_armed_at = None;
                 self.prompt.toggle_multiline();
             }
             KeyCode::Char('v' | 'V') if ctrl && matches!(self.focus, Focus::Prompt) => {
+                self.ctrl_c_armed_at = None;
                 let mut clip = SystemClipboard::new();
                 if let Some(text) = ClipboardProvider::get(&mut clip) {
                     self.prompt.apply_paste(&text);
@@ -187,6 +205,7 @@ impl AgentShell {
                 }
             }
             KeyCode::Enter if matches!(self.focus, Focus::Prompt) => {
+                self.ctrl_c_armed_at = None;
                 if shift || alt {
                     self.prompt.insert_newline();
                 } else {
@@ -202,6 +221,7 @@ impl AgentShell {
                 }
             }
             _ if matches!(self.focus, Focus::Scrollback) => {
+                self.ctrl_c_armed_at = None;
                 let mut note = None;
                 let mut notify = |s: String| {
                     note = Some(s);
@@ -213,9 +233,49 @@ impl AgentShell {
                 }
             }
             _ if matches!(self.focus, Focus::Prompt) => {
+                self.ctrl_c_armed_at = None;
                 self.prompt.input_key(key);
             }
             _ => {}
+        }
+    }
+
+    fn handle_ctrl_c(&mut self) {
+        // Non-empty prompt: copy + clear. Does not arm quit.
+        if !self.prompt.is_empty() {
+            self.ctrl_c_armed_at = None;
+            let text = self.prompt.text();
+            let n = text.chars().count();
+            let mut clip = SystemClipboard::new();
+            clip.copy_text(&text);
+            self.prompt.clear();
+            self.notify(format!("copied prompt ({n} chars) · cleared"));
+            return;
+        }
+
+        // Empty prompt: double Ctrl+C within 500ms quits.
+        let now = Instant::now();
+        if let Some(armed_at) = self.ctrl_c_armed_at {
+            if now.duration_since(armed_at) <= QUIT_CTRL_C_WINDOW {
+                self.quit = true;
+                return;
+            }
+        }
+        self.ctrl_c_armed_at = Some(now);
+        self.notify("press Ctrl+C again to quit");
+    }
+
+    /// Drop an expired first Ctrl+C so the status reminder does not linger.
+    fn expire_ctrl_c_arm(&mut self) {
+        let Some(armed_at) = self.ctrl_c_armed_at else {
+            return;
+        };
+        if Instant::now().duration_since(armed_at) <= QUIT_CTRL_C_WINDOW {
+            return;
+        }
+        self.ctrl_c_armed_at = None;
+        if self.status_note == "press Ctrl+C again to quit" {
+            self.status_note.clear();
         }
     }
 }

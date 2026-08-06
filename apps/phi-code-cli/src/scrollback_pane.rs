@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use phi_code_ui::{
     AutoScrollDirection, HistoryScrollbar, HorizontalLayout, Scrollback, ScrollbackPainter,
     Selection, SystemClipboard,
@@ -84,7 +84,7 @@ impl ScrollbackPane {
     pub fn paint(&mut self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
         self.hit_pane = area;
         let hint = if focused {
-            "scrollback · drag select · scrollbar · dbl=word · y copy · f fold"
+            "scrollback · drag select · click Thought · y copy · f fold"
         } else {
             "scrollback"
         };
@@ -161,6 +161,19 @@ impl ScrollbackPane {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.history_sb.on_mouse_up();
+                // Grok-style: click thinking header toggles expand/collapse.
+                if let Some(hit) = self.selection.hit_test(mouse.column, mouse.row)
+                    && self
+                        .scrollback
+                        .is_thinking_header(hit.entry_idx, hit.line_in_entry)
+                {
+                    let _ = self.clicks.register(mouse.column, mouse.row);
+                    if self.scrollback.toggle_thinking(hit.entry_idx) {
+                        self.selection.clear();
+                        self.scrollback.select(hit.entry_idx);
+                    }
+                    return true;
+                }
                 let n = self.clicks.register(mouse.column, mouse.row);
                 match n {
                     2 => {
@@ -199,13 +212,11 @@ impl ScrollbackPane {
     }
 
     /// Scrollback-focused keys. Returns true when handled.
+    ///
+    /// Note: Ctrl+C is handled by the shell (double-tap quit), not here.
+    /// Use `y` to copy the character selection / entry.
     pub fn on_key(&mut self, key: KeyEvent, notify: &mut dyn FnMut(String)) -> bool {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('c' | 'C') if ctrl => {
-                self.copy_char_selection(notify, "");
-                true
-            }
             KeyCode::Char('y') => {
                 if let Some(t) = self.selection.reconstruct_text(&self.scrollback) {
                     self.clipboard.copy_text(&t);
