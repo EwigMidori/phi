@@ -2,8 +2,10 @@
 
 ## Role
 
-Thin binary over `phi-code-core`. Keep small; land CLI behavior one change at a time.
+Thin binary over `phi-code-core` + `phi-code-ui`. Keep small; coordinate
+objects by message, do not re-implement UI policy here.
 
 ## Forbidden
 
-- Multi-feature dumps without stepwise confirmation
+- Duplicating scrollback / selection / paint / paste logic (belongs in `phi-code-ui`)
+- Editing vendored crates under `vendor/` except deliberate upgrades

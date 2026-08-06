@@ -1,8 +1,13 @@
 //! # phi-code-core
 //!
-//! Product runtime for phi-code. Modules land one at a time.
+//! Product runtime for phi-code (agent orchestration, session policy).
+//!
+//! Terminal UI lives in `phi-code-ui` — this crate must not grow TUI
+//! view/layout/paint responsibilities.
 
 #![forbid(unsafe_code)]
+
+pub use phi_kernel::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
 
 pub const CORE_NAME: &str = "phi-code-core";
 

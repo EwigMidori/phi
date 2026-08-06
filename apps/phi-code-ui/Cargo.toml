@@ -1,0 +1,22 @@
+[package]
+name = "phi-code-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "phi-code TUI: scrollback, selection, paint, paste (Kay OOP)"
+readme = "README.md"
+
+[dependencies]
+anstyle.workspace = true
+arboard.workspace = true
+phi-kernel = { path = "../../crates/phi-kernel" }
+ratatui.workspace = true
+textwrap.workspace = true
+tui-scrollbar.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+xai-grok-markdown.workspace = true
+xai-ratatui-textarea.workspace = true
+
+[lints]
+workspace = true

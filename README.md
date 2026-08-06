@@ -7,7 +7,7 @@ Open-source **agent kernel** (+ future extensions). Daan (`crates/da-*`, `web/`)
 | **Project** | `phi` |
 | **Kernel** | [`phi-kernel`](./crates/phi-kernel/) |
 | **Tree agent** | `phi-ext-tree-agent` (v0) + `phi-ext-subagent` (delegation interface) |
-| **Product** | `apps/phi-code-core` (runtime) + `apps/phi-code-cli` (`phi-code` binary) |
+| **Product** | `apps/phi-code-core` (runtime) + `apps/phi-code-ui` (TUI) + `apps/phi-code-cli` (`phi-code` binary) |
 | **Status** | Dense vertical slice in progress |
 
 ## Layers
@@ -32,8 +32,9 @@ phi/
     phi-ext-tree-agent/
     phi-ext-subagent/
   apps/
-    phi-code-core/
-    phi-code-cli/           # bin: phi-code
+    phi-code-core/          # product runtime
+    phi-code-ui/            # TUI objects (scrollback, selection, paint, paste)
+    phi-code-cli/           # bin: phi-code (thin coordinator)
       vendor/               # Grok UI crates as-is (textarea, inline, markdown)
 ```
 

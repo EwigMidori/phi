@@ -4,6 +4,7 @@ members = [
     "crates/phi-ext-tree-agent",
     "crates/phi-ext-subagent",
     "apps/phi-code-core",
+    "apps/phi-code-ui",
     "apps/phi-code-cli",
     # CLI-only vendored Grok UI (as-is; live under apps/phi-code-cli/vendor/).
     "apps/phi-code-cli/vendor/xai-ratatui-textarea",

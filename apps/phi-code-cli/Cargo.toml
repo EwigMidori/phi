@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 crossterm.workspace = true
 phi-code-core = { path = "../phi-code-core" }
+phi-code-ui = { path = "../phi-code-ui" }
 ratatui.workspace = true
 xai-ratatui-textarea.workspace = true
 

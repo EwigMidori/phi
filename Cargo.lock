@@ -1698,6 +1698,7 @@ version = "0.0.0"
 dependencies = [
  "crossterm",
  "phi-code-core",
+ "phi-code-ui",
  "ratatui",
  "xai-ratatui-textarea",
 ]
@@ -1709,6 +1710,22 @@ dependencies = [
  "phi-ext-subagent",
  "phi-ext-tree-agent",
  "phi-kernel",
+]
+
+[[package]]
+name = "phi-code-ui"
+version = "0.0.0"
+dependencies = [
+ "anstyle",
+ "arboard",
+ "phi-kernel",
+ "ratatui",
+ "textwrap",
+ "tui-scrollbar",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
+ "xai-grok-markdown",
+ "xai-ratatui-textarea",
 ]
 
 [[package]]

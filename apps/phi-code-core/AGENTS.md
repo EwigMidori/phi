@@ -3,9 +3,16 @@
 ## Role
 
 phi-code product runtime. Depends on `phi-kernel`, `phi-ext-tree-agent`,
-`phi-ext-subagent`. Features land one module at a time (discuss-as-you-go).
+`phi-ext-subagent`.
+
+## Boundaries
+
+- **SoT for conversation content:** kernel `TurnItem`
+- **UI (scrollback / paint / selection / paste):** `phi-code-ui` only
+- Do not reintroduce TUI layout or markdown view code here
 
 ## Forbidden
 
-- Large multi-module dumps without user confirmation of each step
+- Parallel “chat message” types that duplicate `TurnItem`
+- Owning ratatui / scrollback / selection modules
 - `da-*` imports

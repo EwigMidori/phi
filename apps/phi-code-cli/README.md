@@ -1,19 +1,12 @@
 # phi-code-cli
 
-CLI entry (`phi-code`). Prompt uses vendored **`xai-ratatui-textarea`**
-(see [`vendor/`](./vendor/)).
+Thin binary entry for phi-code.
 
-| Input | Action |
+| Layer | Crate |
 |-------|--------|
-| typing / arrows / undo | TextArea (`xai-ratatui-textarea`) |
-| Enter | send line → scrollback |
-| Shift/Alt+Enter | newline in prompt |
-| paste | bracketed paste → `insert_str` |
-| Ctrl+M | prefer taller prompt |
-| Tab | focus prompt ↔ scrollback |
-| click prompt | focus + TextArea mouse |
-| wheel on scrollback | scroll history |
-| Esc | quit |
+| Product runtime | `phi-code-core` |
+| TUI objects | `phi-code-ui` |
+| Binary / event loop | `phi-code-cli` |
 
 ```bash
 cargo run -p phi-code-cli
