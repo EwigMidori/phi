@@ -88,7 +88,7 @@ impl TurnDriver {
         if let Some(err) = &self.config_error {
             let err = err.clone();
             scrollback.append_assistant_delta(&format!(
-                "**Configuration error**\n\n{err}\n\nSet `AGENT_LLM__API_KEY` / `BASE_URL` / `MODEL` / `API_STYLE` (or PHI_* fallbacks).\n"
+                "**Configuration error**\n\n{err}\n\nSet `PHI_API_KEY` / `PHI_API_BASE` / `PHI_MODEL` / `PHI_API_STYLE`.\n"
             ));
             scrollback.finish_assistant_stream();
             return true;

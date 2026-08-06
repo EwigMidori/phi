@@ -7,18 +7,18 @@ Thin binary entry for phi-code.
 Reads **only** the process cwd’s `.env` via `dotenvy` (no parent-directory walk), plus already-exported env vars.
 
 ```powershell
-# From a directory that contains .env with AGENT_LLM__*:
+# From a directory that contains .env with PHI_*:
 cd path\to\dir-with-dotenv
-cargo run -p phi-code-cli --manifest-path E:\...\open-source\Cargo.toml
+cargo run -p phi-code-cli
 ```
 
 Or export env explicitly:
 
 ```powershell
-$env:AGENT_LLM__API_KEY = "sk-..."
-$env:AGENT_LLM__MODEL = "deepseek-v4-flash"
-$env:AGENT_LLM__BASE_URL = "https://api.deepseek.com"
-$env:AGENT_LLM__API_STYLE = "responses"
+$env:PHI_API_KEY = "sk-..."
+$env:PHI_MODEL = "deepseek-v4-flash"
+$env:PHI_API_BASE = "https://api.deepseek.com"
+$env:PHI_API_STYLE = "responses"
 
 cargo run -p phi-code-cli
 ```

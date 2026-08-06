@@ -14,7 +14,7 @@ phi-code product runtime: LLM adapter + turn runner. Depends on `phi-kernel`.
 
 - `OpenAiCompatRuntime` — OpenAI-compatible SSE
 - `SessionTurnRunner` — non-blocking poll for CLI tick
-- Env: `PHI_API_KEY`, `PHI_API_BASE`, `PHI_MODEL`
+- Env: `PHI_API_KEY`, `PHI_API_BASE`, `PHI_MODEL`, `PHI_API_STYLE`
 
 ## Forbidden
 

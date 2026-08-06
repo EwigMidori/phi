@@ -1,6 +1,6 @@
 //! OpenAI-compatible LLM adapter: Chat Completions **or** Responses API.
 //!
-//! Config mirrors da-server / monorepo env (`AGENT_LLM__*`), with `PHI_*` fallbacks.
+//! Config is env-only via `PHI_*` (see [`LlmConfig::from_env`]).
 
 use std::pin::Pin;
 
@@ -34,42 +34,39 @@ pub struct LlmConfig {
 
 #[derive(Debug, Error)]
 pub enum LlmConfigError {
-    #[error(
-        "API key missing: set AGENT_LLM__API_KEY (or PHI_API_KEY) to call a real model"
-    )]
+    #[error("API key missing: set PHI_API_KEY to call a real model")]
     MissingApiKey,
-    #[error("invalid AGENT_LLM__API_STYLE `{0}` (use `responses` or `completions`)")]
+    #[error("invalid PHI_API_STYLE `{0}` (use `responses` or `completions`)")]
     InvalidApiStyle(String),
 }
 
 impl LlmConfig {
-    /// Load from environment (da-server compatible):
+    /// Load from environment:
     ///
-    /// | Variable | Fallback | Default |
-    /// |----------|----------|---------|
-    /// | `AGENT_LLM__API_KEY` | `PHI_API_KEY` | required |
-    /// | `AGENT_LLM__BASE_URL` | `PHI_API_BASE` | `https://api.openai.com/v1` |
-    /// | `AGENT_LLM__MODEL` | `PHI_MODEL` | `gpt-4o-mini` |
-    /// | `AGENT_LLM__API_STYLE` | `PHI_API_STYLE` | `responses` |
+    /// | Variable | Default |
+    /// |----------|---------|
+    /// | `PHI_API_KEY` | required |
+    /// | `PHI_API_BASE` | `https://api.openai.com/v1` |
+    /// | `PHI_MODEL` | `gpt-4o-mini` |
+    /// | `PHI_API_STYLE` | `responses` |
     pub fn from_env() -> Result<Self, LlmConfigError> {
-        let api_key = first_env(&["AGENT_LLM__API_KEY", "PHI_API_KEY"]);
+        let api_key = env_trim("PHI_API_KEY");
         if api_key.is_empty() {
             return Err(LlmConfigError::MissingApiKey);
         }
-        let api_base = first_env(&["AGENT_LLM__BASE_URL", "PHI_API_BASE"]);
+        let api_base = env_trim("PHI_API_BASE");
         let api_base = if api_base.is_empty() {
             "https://api.openai.com/v1".into()
         } else {
             api_base.trim_end_matches('/').to_owned()
         };
-        let model = first_env(&["AGENT_LLM__MODEL", "PHI_MODEL"]);
+        let model = env_trim("PHI_MODEL");
         let model = if model.is_empty() {
             "gpt-4o-mini".into()
         } else {
             model
         };
-        let style_raw = first_env(&["AGENT_LLM__API_STYLE", "PHI_API_STYLE"]);
-        let api_style = parse_api_style(&style_raw)?;
+        let api_style = parse_api_style(&env_trim("PHI_API_STYLE"))?;
         Ok(Self {
             api_base,
             api_key,
@@ -79,16 +76,12 @@ impl LlmConfig {
     }
 }
 
-fn first_env(keys: &[&str]) -> String {
-    for k in keys {
-        if let Ok(v) = std::env::var(k) {
-            let t = v.trim();
-            if !t.is_empty() {
-                return t.to_owned();
-            }
-        }
-    }
-    String::new()
+fn env_trim(key: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_default()
 }
 
 fn parse_api_style(raw: &str) -> Result<ApiStyle, LlmConfigError> {
