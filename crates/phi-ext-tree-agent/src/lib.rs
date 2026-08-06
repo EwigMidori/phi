@@ -40,11 +40,12 @@
 
 #![forbid(unsafe_code)]
 
-pub mod error;
-pub mod events;
-pub mod model;
-pub mod store;
-pub mod tree;
+// Modules are private; crate root re-exports are the public surface.
+mod error;
+mod events;
+mod model;
+mod store;
+mod tree;
 
 pub use error::{Result, TreeError};
 pub use events::TreeEvent;

@@ -31,12 +31,13 @@
 #[macro_use]
 mod string_newtype;
 
-pub mod agent;
-pub mod error;
-pub mod events;
-pub mod ids;
-pub mod send_queue;
-pub mod transcript;
+// Modules are private; crate root re-exports are the public surface.
+mod agent;
+mod error;
+mod events;
+mod ids;
+mod send_queue;
+mod transcript;
 
 pub use agent::{
     AgentEvent, AgentEventStream, AgentPorts, AgentPrefix, AgentPrefixSource, AgentRuntime,

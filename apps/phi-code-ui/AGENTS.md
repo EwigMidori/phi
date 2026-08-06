@@ -12,6 +12,12 @@ Does **not** own agent runtime / product orchestration (`phi-code-core`).
 - Collaborators hide implementation; callers only send messages.
 - Vendor crates under `phi-code-cli/vendor` stay as-is (no rewrites).
 
+## Public surface
+
+Crate root only (`pub use`). Implementation modules are private — do not depend on
+`phi_code_ui::scrollback::…` paths. Kernel types (`TurnItem`, …) come from
+`phi-kernel`, not re-exported here.
+
 ## Forbidden
 
 - Parallel chat-message enums that duplicate `TurnItem`

@@ -8,21 +8,21 @@
 
 #![forbid(unsafe_code)]
 
-pub mod clipboard;
-pub mod layout;
-pub mod markdown;
-pub mod painter;
-pub mod paste;
-pub mod scrollback;
-pub mod scrollbar;
-pub mod selection;
+mod clipboard;
+mod layout;
+mod markdown;
+mod painter;
+mod paste;
+mod scrollback;
+mod scrollbar;
+mod selection;
 
+// Crate root is the public surface; modules stay private.
 pub use clipboard::SystemClipboard;
 pub use layout::HorizontalLayout;
 pub use markdown::ProductMarkdown;
 pub use painter::ScrollbackPainter;
 pub use paste::PastePolicy;
-pub use phi_kernel::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
 pub use scrollback::{Accent, Scrollback, ThinkingLayout, VisibleSegment};
 pub use scrollbar::{HistoryScrollbar, ScrollInfo, ScrollbarClick};
 pub use selection::{AutoScrollDirection, DragAutoScrollState, Selection, TextHit, TextSelection};

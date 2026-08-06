@@ -37,9 +37,10 @@
 
 #![forbid(unsafe_code)]
 
-pub mod error;
-pub mod spawn;
-pub mod subagent;
+// Modules are private; crate root re-exports are the public surface.
+mod error;
+mod spawn;
+mod subagent;
 #[cfg(test)]
 mod test_util;
 
