@@ -6,17 +6,17 @@ Open-source **agent kernel** (+ future extensions). Daan (`crates/da-*`, `web/`)
 |--|--|
 | **Project** | `phi` |
 | **Kernel** | [`phi-kernel`](./crates/phi-kernel/) |
-| **Tree agent** | `phi-ext-tree-agent` (v0) + `phi-ext-subagent` (delegation interface) |
-| **Product** | `apps/phi-code-core` (runtime) + `apps/phi-code-ui` (TUI) + `apps/phi-code-cli` (`phi-code` binary) |
+| **Extensions** | `phi-ext-tree-agent` · `phi-ext-subagent` · **`phi-ext-llm`** (provider wire → `AgentRuntime`) |
+| **Product** | `apps/phi-code-core` (turn runner) + `apps/phi-code-ui` (TUI) + `apps/phi-code-cli` (`phi-code` binary) |
 | **Status** | Dense vertical slice in progress |
 
 ## Layers
 
 | Layer | Owns |
 |-------|------|
-| **`phi-kernel`** | Agent contract, **SendQueue**, transcript port, generation events |
-| **`phi-ext-*`** | Optional mechanisms (session tree / subagent delegation; tree-agent first) |
-| **Product (Daan)** | Close/fork defaults, HTTP, UI rendering, brand paths |
+| **`phi-kernel`** | Agent contract, **SendQueue**, transcript port, generation events (**no** provider HTTP) |
+| **`phi-ext-*`** | Optional mechanisms (tree, subagent, **LLM wire adapters**) |
+| **Product (phi-code / Daan)** | Composition, UI, product policy — not provider dialects |
 
 ## Naming
 
@@ -31,10 +31,11 @@ phi/
     phi-kernel/
     phi-ext-tree-agent/
     phi-ext-subagent/
+    phi-ext-llm/            # OpenAI-compat SSE → AgentRuntime
   apps/
-    phi-code-core/          # product runtime
+    phi-code-core/          # product turn orchestration
     phi-code-ui/            # TUI objects (scrollback, selection, paint, paste)
-    phi-code-cli/           # bin: phi-code (thin coordinator)
+    phi-code-cli/           # bin: phi-code (thin coordinator + inject runtime)
       vendor/               # Grok UI crates as-is (textarea, inline, markdown)
 ```
 

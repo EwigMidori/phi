@@ -1,0 +1,20 @@
+[package]
+name = "phi-ext-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "phi ext — LLM provider adapters implementing AgentRuntime (OpenAI-compatible wire)"
+readme = "README.md"
+
+[dependencies]
+async-trait.workspace = true
+bytes = "1"
+futures.workspace = true
+phi-kernel = { path = "../phi-kernel" }
+reqwest.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

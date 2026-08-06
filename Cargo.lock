@@ -1864,6 +1864,7 @@ dependencies = [
  "dotenvy",
  "phi-code-core",
  "phi-code-ui",
+ "phi-ext-llm",
  "ratatui",
  "tokio",
  "xai-ratatui-textarea",
@@ -1873,17 +1874,8 @@ dependencies = [
 name = "phi-code-core"
 version = "0.0.0"
 dependencies = [
- "async-trait",
- "bytes",
  "futures",
- "phi-ext-subagent",
- "phi-ext-tree-agent",
  "phi-kernel",
- "reqwest",
- "serde",
- "serde_json",
- "strum 0.28.0",
- "thiserror 2.0.19",
  "tokio",
 ]
 
@@ -1901,6 +1893,20 @@ dependencies = [
  "unicode-width 0.2.0",
  "xai-grok-markdown",
  "xai-ratatui-textarea",
+]
+
+[[package]]
+name = "phi-ext-llm"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "phi-kernel",
+ "reqwest",
+ "serde_json",
+ "strum 0.28.0",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

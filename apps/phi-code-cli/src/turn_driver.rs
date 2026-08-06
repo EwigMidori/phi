@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
-use phi_code_core::{AgentEvent, LlmConfig, OpenAiCompatRuntime, SessionTurnRunner};
+use phi_code_core::{AgentEvent, SessionTurnRunner};
 use phi_code_ui::Scrollback;
+use phi_ext_llm::{LlmConfig, OpenAiCompatRuntime};
 
 /// Bridges product turn runner to the scrollback view.
 pub struct TurnDriver {

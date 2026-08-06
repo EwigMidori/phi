@@ -2,29 +2,31 @@
 
 ## Role
 
-phi-code product runtime: LLM adapter + turn runner. Depends on `phi-kernel`.
+phi-code product runtime: **turn orchestration** only. Depends on `phi-kernel`.
+LLM wire adapters are **`phi-ext-llm`** (framework ext), not this crate.
 
 ## Boundaries
 
 - **SoT for conversation content:** kernel `TurnItem`
 - **Agent contract:** `AgentRuntime` / `AgentEvent` only (no ad-hoc text stream API)
+- **Provider HTTP/SSE:** `phi-ext-llm` only
 - **UI:** `phi-code-ui` only
 
-## Step-1 LLM
+## Step-1 product pieces
 
-- `OpenAiCompatRuntime` — OpenAI-compatible SSE
 - `SessionTurnRunner` — non-blocking poll of kernel `AgentEvent` for CLI tick
-- Env: `PHI_API_KEY`, `PHI_API_BASE`, `PHI_MODEL`, `PHI_API_STYLE`
+- Composition root (CLI) injects `Arc<dyn AgentRuntime>` from `phi-ext-llm`
 
 ## Public surface
 
-Crate root only. Implementation modules (`llm`, `turn_runner`) are private.
-Kernel re-exports only types that appear on this crate’s API (`AgentEvent`,
-`AgentRuntime`, `SessionId`, `TurnItem`).
+Crate root only. Implementation modules (`turn_runner`) are private.
+Kernel re-exports only types on this crate’s API (`AgentEvent`, `AgentRuntime`,
+`SessionId`, `TurnItem`).
 
 ## Forbidden
 
 - Parallel “chat message” types that duplicate `TurnItem`
 - Parallel progress/event enums that duplicate `AgentEvent` (e.g. `TurnProgress`)
+- Owning provider wire parsers / OpenAI-compat SSE
 - Owning ratatui / scrollback modules
 - `da-*` imports

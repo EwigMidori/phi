@@ -2,7 +2,7 @@
 
 ## Role
 
-Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strategy, no provider loop.
+Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strategy, no provider loop (HTTP/SSE adapters live in `phi-ext-llm`).
 
 ## Public surface
 

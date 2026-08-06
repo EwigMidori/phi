@@ -3,21 +3,12 @@ name = "phi-code-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "phi-code product runtime"
+description = "phi-code product runtime (turn orchestration)"
 readme = "README.md"
 
 [dependencies]
-async-trait.workspace = true
-bytes = "1"
 futures.workspace = true
 phi-kernel = { path = "../../crates/phi-kernel" }
-phi-ext-tree-agent = { path = "../../crates/phi-ext-tree-agent" }
-phi-ext-subagent = { path = "../../crates/phi-ext-subagent" }
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-strum.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 
 [lints]

@@ -4,6 +4,9 @@ Thin binary entry for phi-code.
 
 ## LLM config
 
+Wire adapter: **`phi-ext-llm`** (`OpenAiCompatRuntime`). Composition is in this
+binary; `phi-code-core` only runs turns.
+
 Reads **only** the process cwd’s `.env` via `dotenvy` (no parent-directory walk), plus already-exported env vars.
 
 ```powershell

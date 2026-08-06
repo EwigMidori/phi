@@ -1,6 +1,6 @@
-//! OpenAI-compatible LLM adapter: Chat Completions **or** Responses API.
+//! OpenAI-compatible wire: Chat Completions **or** Responses API → kernel events.
 //!
-//! Config is env-only via `PHI_*` (see [`LlmConfig::from_env`]).
+//! Products may build [`LlmConfig`] directly or via [`LlmConfig::from_env`] (`PHI_*`).
 
 use std::pin::Pin;
 

@@ -3,6 +3,7 @@ members = [
     "crates/phi-kernel",
     "crates/phi-ext-tree-agent",
     "crates/phi-ext-subagent",
+    "crates/phi-ext-llm",
     "apps/phi-code-core",
     "apps/phi-code-ui",
     "apps/phi-code-cli",
