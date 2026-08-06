@@ -144,6 +144,7 @@ impl AgentShell {
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         let prompt_hit = self.prompt.hit();
         if rect_contains(prompt_hit, mouse.column, mouse.row) {
+            // Focus only on click — never on mere hover / move.
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.focus = Focus::Prompt;
                 self.scrollback.clear_selection();
@@ -160,7 +161,16 @@ impl AgentShell {
             note = Some(s);
         };
         if self.scrollback.on_mouse(mouse, &mut notify) {
-            self.focus = Focus::Scrollback;
+            // Steal focus only on intentional history interaction (click / drag).
+            // Mouse move and wheel scroll must NOT yank focus off the prompt —
+            // otherwise hovering the transcript makes typing jump to j/k bindings.
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left) => {
+                    self.focus = Focus::Scrollback;
+                }
+                _ => {}
+            }
             if let Some(n) = note {
                 self.notify(n);
             }

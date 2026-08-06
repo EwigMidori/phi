@@ -61,7 +61,7 @@ impl PromptPane {
 
     pub fn paint(&mut self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
         self.hit = area;
-        let title = if focused { " prompt * " } else { " prompt " };
+        let title = if focused { "prompt *" } else { "prompt" };
         let block = Block::default()
             .borders(Borders::TOP)
             .title(title)

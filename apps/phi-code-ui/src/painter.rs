@@ -13,6 +13,12 @@ use crate::markdown::ProductMarkdown;
 use crate::scrollback::{Accent, Scrollback, VisibleSegment};
 use crate::selection::{SelectableLine, Selection};
 
+/// Thinking / `TurnItem::Reasoning` foreground.
+///
+/// Keep this subdued. **Do not** use `Color::Yellow` / `LightYellow` — it steals
+/// focus from the assistant answer. Header and body share this dim palette.
+const THINKING_FG: Color = Color::DarkGray;
+
 /// Paints scrollback into a frame and feeds the selection line map.
 ///
 /// Owns streaming markdown state so stream deltas and paint stay coupled.
@@ -182,17 +188,16 @@ impl ScrollbackPainter {
                     .enumerate()
                     .map(|(i, plain)| {
                         if lay.is_some_and(|t| t.is_header_row(i)) {
+                            // Subdued chrome — see THINKING_FG (not Yellow).
                             Line::from(Span::styled(
                                 plain.clone(),
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                                Style::default().fg(THINKING_FG),
                             ))
                         } else {
                             Line::from(Span::styled(
                                 plain.clone(),
                                 Style::default()
-                                    .fg(Color::DarkGray)
+                                    .fg(THINKING_FG)
                                     .add_modifier(ratatui::style::Modifier::DIM)
                                     .add_modifier(ratatui::style::Modifier::ITALIC),
                             ))
@@ -223,7 +228,8 @@ impl ScrollbackPainter {
                     .map(|(i, t)| {
                         let fg = match &seg.item {
                             TurnItem::User { .. } => Color::Cyan,
-                            TurnItem::Reasoning { .. } => Color::Yellow,
+                            // Subdued — see THINKING_FG (not Yellow).
+                            TurnItem::Reasoning { .. } => THINKING_FG,
                             TurnItem::ToolCall { .. } | TurnItem::ToolResult { .. } if i == 0 => {
                                 Color::Magenta
                             }
@@ -250,7 +256,8 @@ impl ScrollbackPainter {
         match accent {
             Accent::User => Color::Cyan,
             Accent::Assistant => Color::Green,
-            Accent::Thinking => Color::DarkGray,
+            // Subdued gutter — see THINKING_FG (not Yellow).
+            Accent::Thinking => THINKING_FG,
             Accent::ToolRunning => Color::Blue,
             Accent::ToolOk => Color::Green,
             Accent::ToolError => Color::Red,

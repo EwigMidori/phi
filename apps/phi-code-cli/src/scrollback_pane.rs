@@ -122,16 +122,11 @@ impl ScrollbackPane {
         mouse: MouseEvent,
         notify: &mut dyn FnMut(String),
     ) -> bool {
-        if self.history_sb.is_dragging() || self.history_sb.contains(mouse.column, mouse.row) {
+        // Continue an in-progress scrollbar drag even if the pointer leaves the track.
+        if self.history_sb.is_dragging() {
             self.selection.clear();
             let info = self.scrollback.scroll_info(self.view_h);
             match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(off) = self.history_sb.on_mouse_down(mouse.column, mouse.row, info)
-                    {
-                        self.scrollback.set_scroll_offset(off, self.view_h);
-                    }
-                }
                 MouseEventKind::Drag(MouseButton::Left) => {
                     if let Some(off) = self.history_sb.on_mouse_drag(mouse.column, mouse.row, info)
                     {
@@ -141,15 +136,33 @@ impl ScrollbackPane {
                 MouseEventKind::Up(MouseButton::Left) => {
                     self.history_sb.on_mouse_up();
                 }
-                MouseEventKind::ScrollUp => {
-                    self.scrollback.scroll_by(1, self.view_h);
-                }
-                MouseEventKind::ScrollDown => {
-                    self.scrollback.scroll_by(-1, self.view_h);
-                }
                 _ => {}
             }
             return true;
+        }
+
+        if self.history_sb.contains(mouse.column, mouse.row) {
+            let info = self.scrollback.scroll_info(self.view_h);
+            return match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.selection.clear();
+                    if let Some(off) = self.history_sb.on_mouse_down(mouse.column, mouse.row, info)
+                    {
+                        self.scrollback.set_scroll_offset(off, self.view_h);
+                    }
+                    true
+                }
+                MouseEventKind::ScrollUp => {
+                    self.scrollback.scroll_by(1, self.view_h);
+                    true
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scrollback.scroll_by(-1, self.view_h);
+                    true
+                }
+                // Hover / move over track: ignore (must not steal prompt focus).
+                _ => false,
+            };
         }
 
         if !rect_contains(self.hit_content, mouse.column, mouse.row)
@@ -191,24 +204,30 @@ impl ScrollbackPane {
                         }
                     }
                 }
+                true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.selection.on_mouse_drag(mouse.column, mouse.row);
+                true
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.selection.on_mouse_up().is_some() {
                     self.copy_char_selection(notify, "");
                 }
+                true
             }
             MouseEventKind::ScrollUp => {
+                // Scroll history under the pointer without requiring scrollback focus.
                 self.scrollback.scroll_by(1, self.view_h);
+                true
             }
             MouseEventKind::ScrollDown => {
                 self.scrollback.scroll_by(-1, self.view_h);
+                true
             }
-            _ => {}
+            // Moved / other: do not claim the event (keeps prompt focus stable).
+            _ => false,
         }
-        true
     }
 
     /// Scrollback-focused keys. Returns true when handled.
