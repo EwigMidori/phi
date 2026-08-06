@@ -17,6 +17,7 @@ LLM **provider adapters** for **phi**: HTTP/SSE → `AgentRuntime` / `AgentEvent
 - Products inject `HistoryProjector` (or filter before `TurnRequest`)
 - Env key names are **product-owned**
 - Prefer Kay objects / messages over free-function pipelines
+- Map provider `usage` JSON → kernel `Usage` / `AgentEvent::Usage` (no local token estimates)
 - Kernel remains free of HTTP
 
 ## Forbidden

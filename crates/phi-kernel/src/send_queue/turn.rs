@@ -132,6 +132,14 @@ impl GenerationTurn {
                     payload,
                 }),
             ),
+            AgentEvent::Usage { usage } => (
+                Disposition::Continue,
+                EffectBatch::from_notice(KernelEvent::GenerationUsage {
+                    session_id: self.session_id().clone(),
+                    job_id: self.job.job_id.clone(),
+                    usage,
+                }),
+            ),
             AgentEvent::Error { message } => (
                 Disposition::Terminal(TurnTerminal::Failed(message)),
                 EffectBatch::empty(),
@@ -419,6 +427,26 @@ mod tests {
             Disposition::Terminal(TurnTerminal::Finished)
         ));
         assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn handle_usage_is_notice_only() {
+        use crate::agent::Usage;
+        use crate::events::KernelEvent;
+        use crate::ids::MessageId;
+
+        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
+        let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
+        let usage = Usage::new(Some(10), Some(20), Some(30));
+        let (disposition, batch) = turn.handle(AgentEvent::Usage {
+            usage: usage.clone(),
+        });
+        assert!(matches!(disposition, Disposition::Continue));
+        assert!(batch.writes.is_empty());
+        assert!(matches!(
+            batch.notices.as_slice(),
+            [KernelEvent::GenerationUsage { usage: u, .. }] if u == &usage
+        ));
     }
 
     #[test]

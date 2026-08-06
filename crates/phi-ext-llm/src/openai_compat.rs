@@ -12,6 +12,7 @@ use futures::StreamExt;
 use futures::stream::{self, Stream};
 use phi_kernel::{
     AgentEvent, AgentEventStream, AgentPrefix, AgentRuntime, TurnCancel, TurnItem, TurnRequest,
+    Usage,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -123,10 +124,12 @@ impl WireCodec {
                 messages.push(msg);
             }
         }
+        // `include_usage` so the final stream chunk carries provider usage.
         json!({
             "model": model,
             "messages": messages,
             "stream": true,
+            "stream_options": { "include_usage": true },
         })
     }
 
@@ -247,6 +250,8 @@ struct SseReader {
     cancel: TurnCancel,
     style: ApiStyle,
     pending_event: Option<String>,
+    /// Multiple events from one SSE data line (e.g. Usage then Finished).
+    queued: std::collections::VecDeque<AgentEvent>,
 }
 
 impl SseReader {
@@ -261,6 +266,7 @@ impl SseReader {
             cancel,
             style,
             pending_event: None,
+            queued: std::collections::VecDeque::new(),
         }
     }
 
@@ -271,10 +277,16 @@ impl SseReader {
     }
 
     async fn next_event(&mut self) -> Option<Result<AgentEvent, String>> {
+        if let Some(ev) = self.queued.pop_front() {
+            return Some(Ok(ev));
+        }
         if self.done {
             return None;
         }
         loop {
+            if let Some(ev) = self.queued.pop_front() {
+                return Some(Ok(ev));
+            }
             if self.cancel.is_cancelled() {
                 self.done = true;
                 return Some(Ok(AgentEvent::Finished {
@@ -296,6 +308,9 @@ impl SseReader {
                     if let Some(event) = self.try_consume_line() {
                         return Some(event);
                     }
+                    if let Some(ev) = self.queued.pop_front() {
+                        return Some(Ok(ev));
+                    }
                     self.done = true;
                     return Some(Ok(AgentEvent::Finished {
                         reason: Some("stream_end".into()),
@@ -306,6 +321,9 @@ impl SseReader {
     }
 
     fn try_consume_line(&mut self) -> Option<Result<AgentEvent, String>> {
+        if let Some(ev) = self.queued.pop_front() {
+            return Some(Ok(ev));
+        }
         loop {
             let idx = self.buffer.find('\n')?;
             let mut line = self.buffer[..idx].to_owned();
@@ -336,22 +354,31 @@ impl SseReader {
                 }));
             }
             match self.parse_data(data, self.pending_event.as_deref()) {
-                Ok(Some(AgentEvent::Finished { reason })) => {
-                    self.done = true;
-                    return Some(Ok(AgentEvent::Finished { reason }));
+                Ok(events) if events.is_empty() => continue,
+                Ok(mut events) => {
+                    let first = events.remove(0);
+                    if matches!(first, AgentEvent::Finished { .. }) {
+                        self.done = true;
+                    }
+                    for ev in events {
+                        if matches!(ev, AgentEvent::Finished { .. }) {
+                            self.done = true;
+                        }
+                        self.queued.push_back(ev);
+                    }
+                    return Some(Ok(first));
                 }
-                Ok(Some(ev)) => return Some(Ok(ev)),
-                Ok(None) => continue,
                 Err(e) => return Some(Err(e)),
             }
         }
     }
 
+    /// Parse one SSE `data:` JSON object into zero or more kernel agent events.
     fn parse_data(
         &self,
         data: &str,
         event_name: Option<&str>,
-    ) -> Result<Option<AgentEvent>, String> {
+    ) -> Result<Vec<AgentEvent>, String> {
         let v: Value =
             serde_json::from_str(data).map_err(|e| format!("invalid SSE JSON: {e}: {data}"))?;
 
@@ -363,32 +390,38 @@ impl SseReader {
             return Err(msg.to_owned());
         }
 
+        let mut out = Vec::new();
+
         if let Some(ty) = v.get("type").and_then(|t| t.as_str()).or(event_name) {
             match ty {
                 "response.output_text.delta" | "response.text.delta" => {
                     if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
-                        if delta.is_empty() {
-                            return Ok(None);
+                        if !delta.is_empty() {
+                            out.push(AgentEvent::TextDelta {
+                                text: delta.to_owned(),
+                            });
                         }
-                        return Ok(Some(AgentEvent::TextDelta {
-                            text: delta.to_owned(),
-                        }));
                     }
+                    return Ok(out);
                 }
                 "response.reasoning_text.delta" => {
                     if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
-                        if delta.is_empty() {
-                            return Ok(None);
+                        if !delta.is_empty() {
+                            out.push(AgentEvent::ReasoningDelta {
+                                text: delta.to_owned(),
+                            });
                         }
-                        return Ok(Some(AgentEvent::ReasoningDelta {
-                            text: delta.to_owned(),
-                        }));
                     }
+                    return Ok(out);
                 }
                 "response.completed" | "response.done" | "response.incomplete" => {
-                    return Ok(Some(AgentEvent::Finished {
+                    if let Some(usage) = Self::usage_from_value(&v) {
+                        out.push(AgentEvent::Usage { usage });
+                    }
+                    out.push(AgentEvent::Finished {
                         reason: Some(ty.to_owned()),
-                    }));
+                    });
+                    return Ok(out);
                 }
                 "response.failed" => {
                     let msg = v
@@ -400,7 +433,11 @@ impl SseReader {
                 }
                 _ => {
                     if ty.starts_with("response.") {
-                        return Ok(None);
+                        // Ignore other lifecycle frames; still allow top-level usage.
+                        if let Some(usage) = Self::usage_from_value(&v) {
+                            out.push(AgentEvent::Usage { usage });
+                        }
+                        return Ok(out);
                     }
                 }
             }
@@ -411,26 +448,59 @@ impl SseReader {
                 .pointer("/choices/0/delta/content")
                 .and_then(|c| c.as_str())
             {
-                if content.is_empty() {
-                    return Ok(None);
+                if !content.is_empty() {
+                    out.push(AgentEvent::TextDelta {
+                        text: content.to_owned(),
+                    });
                 }
-                return Ok(Some(AgentEvent::TextDelta {
-                    text: content.to_owned(),
-                }));
             }
             if v.pointer("/choices/0/finish_reason")
                 .and_then(|f| f.as_str())
                 .is_some_and(|f| !f.is_empty() && f != "null")
             {
-                return Ok(Some(AgentEvent::Finished {
+                if let Some(usage) = Self::usage_from_value(&v) {
+                    out.push(AgentEvent::Usage { usage });
+                }
+                out.push(AgentEvent::Finished {
                     reason: v
                         .pointer("/choices/0/finish_reason")
                         .and_then(|f| f.as_str())
                         .map(str::to_owned),
-                }));
+                });
+                return Ok(out);
             }
+            // Final usage-only chunk (empty choices + usage).
+            if let Some(usage) = Self::usage_from_value(&v) {
+                out.push(AgentEvent::Usage { usage });
+            }
+            return Ok(out);
         }
 
-        Ok(None)
+        if let Some(usage) = Self::usage_from_value(&v) {
+            out.push(AgentEvent::Usage { usage });
+        }
+        Ok(out)
+    }
+
+    /// Map provider JSON `usage` object → kernel [`Usage`]. No local totals.
+    fn usage_from_value(v: &Value) -> Option<Usage> {
+        let u = v
+            .get("usage")
+            .or_else(|| v.pointer("/response/usage"))?;
+        let prompt = u
+            .get("prompt_tokens")
+            .or_else(|| u.get("input_tokens"))
+            .and_then(Value::as_u64);
+        let completion = u
+            .get("completion_tokens")
+            .or_else(|| u.get("output_tokens"))
+            .and_then(Value::as_u64);
+        let total = u.get("total_tokens").and_then(Value::as_u64);
+        let usage = Usage::new(prompt, completion, total);
+        if usage.is_empty() {
+            None
+        } else {
+            Some(usage)
+        }
     }
 }

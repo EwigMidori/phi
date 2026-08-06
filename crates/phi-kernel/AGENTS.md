@@ -7,7 +7,8 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 ## Public surface
 
 - Ids / `KernelError` / `KernelEvent`
-- `AgentRuntime` / `TurnRequest` / `AgentEvent`
+- `AgentRuntime` / `TurnRequest` / `AgentEvent` / `Usage` (provider metering observation)
+- `KernelEvent::GenerationUsage` — notice only; **not** transcript
 - `AgentPorts` = runtime + `TurnMaterials` (pump inject); `SourcesTurnMaterials` = default prepare from sources
 - `AgentPrefix` / `AgentPrefixSource` / `PreambleSection` / `SkillSlug` / `SkillDesc` / `ToolSpec`
 - `ToolCallSealPolicy` / `ToolCallSealSource` (seal; **opt-in** — default posture `LeaveOpen`; no enum default; usually behind materials)

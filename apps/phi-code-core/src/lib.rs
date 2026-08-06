@@ -12,6 +12,7 @@ mod session;
 // Crate root is the public surface; modules stay private.
 pub use phi_kernel::{
     AgentEvent, AgentRuntime, InMemoryTranscript, KernelEvent, SessionId, Transcript, TurnItem,
+    Usage,
 };
 pub use session::{PollBatch, SessionHost};
 

@@ -277,6 +277,46 @@ pub struct TurnRequest {
     pub cancel: TurnCancel,
 }
 
+// ── Usage (provider metering observation) ──────────────────────────────────
+
+/// Provider-reported token usage for one generation span.
+///
+/// **Observation only** — not a [`TurnItem`], never estimated by the kernel.
+/// Missing fields stay [`None`]; do not invent `total` from partial sums.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Usage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+impl Usage {
+    #[must_use]
+    pub fn new(
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        }
+    }
+
+    /// True when the provider reported no counters.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.prompt_tokens.is_none()
+            && self.completion_tokens.is_none()
+            && self.total_tokens.is_none()
+    }
+}
+
 // ── AgentEvent ─────────────────────────────────────────────────────────────
 
 /// Tool correlation uses [`ToolCallId`] / [`ToolName`] (not document PKs).
@@ -307,6 +347,9 @@ pub enum AgentEvent {
         tool_name: ToolName,
         input: Value,
     },
+    /// Provider token usage (notice path only; not transcript).
+    #[serde(rename_all = "camelCase")]
+    Usage { usage: Usage },
     #[serde(rename_all = "camelCase")]
     Error { message: String },
     #[serde(rename_all = "camelCase")]

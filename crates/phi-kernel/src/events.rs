@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::agent::{ToolCallId, ToolName, ToolResultStatus};
+use crate::agent::{ToolCallId, ToolName, ToolResultStatus, Usage};
 use crate::ids::{JobId, MessageId, SessionId};
 
 /// Multi-subscriber fan-out for kernel observers (SSE / tests).
@@ -71,6 +71,13 @@ pub enum KernelEvent {
         kind: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<Value>,
+    },
+    /// Provider-reported token usage for this job (notice only; not transcript).
+    #[serde(rename_all = "camelCase")]
+    GenerationUsage {
+        session_id: SessionId,
+        job_id: JobId,
+        usage: Usage,
     },
     #[serde(rename_all = "camelCase")]
     GenerationDone {

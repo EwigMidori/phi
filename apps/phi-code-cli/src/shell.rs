@@ -109,9 +109,15 @@ impl AgentShell {
         } else {
             format!("  {}", self.status_note)
         };
+        let usage = self.driver.usage_status();
+        let usage_bit = if usage.is_empty() {
+            String::new()
+        } else {
+            format!("  {usage}")
+        };
         frame.render_widget(
             Paragraph::new(format!(
-                " focus:{focus_label}  {mode}  {stream}  model:{}  turns:{}  h:{}{note} ",
+                " focus:{focus_label}  {mode}  {stream}  model:{}  turns:{}  h:{}{usage_bit}{note} ",
                 self.driver.model_label(),
                 self.scrollback.scrollback().items().len(),
                 self.scrollback.scrollback().total_height()
@@ -126,7 +132,7 @@ impl AgentShell {
 
         frame.render_widget(
             Paragraph::new(
-                " select · y copy · C-c clear prompt · C-c C-c quit (empty) · C-v paste ",
+                " select · C-c copy · y copy · C-c clear prompt · C-c C-c quit · C-v paste ",
             )
             .style(Style::default().fg(Color::DarkGray)),
             shortcuts,
@@ -186,7 +192,7 @@ impl AgentShell {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
-            // Prompt non-empty → copy+clear (no quit). Empty → double Ctrl+C quit.
+            // Selection → copy. Prompt non-empty → copy+clear. Empty → double C-c quit.
             KeyCode::Char('c' | 'C') if ctrl => {
                 self.handle_ctrl_c();
             }
@@ -265,7 +271,16 @@ impl AgentShell {
     }
 
     fn handle_ctrl_c(&mut self) {
-        // Non-empty prompt: copy + clear. Does not arm quit.
+        // 1) Active scrollback selection → copy (does not arm quit).
+        if self.scrollback.has_selection() {
+            self.ctrl_c_armed_at = None;
+            if let Some(n) = self.scrollback.copy_selection() {
+                self.notify(format!("copied selection ({n} chars)"));
+            }
+            return;
+        }
+
+        // 2) Non-empty prompt → copy + clear (does not arm quit).
         if !self.prompt.is_empty() {
             self.ctrl_c_armed_at = None;
             let text = self.prompt.text();
@@ -277,7 +292,7 @@ impl AgentShell {
             return;
         }
 
-        // Empty prompt: double Ctrl+C within 500ms quits.
+        // 3) Empty prompt, no selection → double Ctrl+C within 500ms quits.
         let now = Instant::now();
         if let Some(armed_at) = self.ctrl_c_armed_at {
             if now.duration_since(armed_at) <= QUIT_CTRL_C_WINDOW {

@@ -59,6 +59,19 @@ impl ScrollbackPane {
         self.selection.clear();
     }
 
+    /// Copy active character selection to the system clipboard.
+    ///
+    /// Returns char count on success.
+    pub fn copy_selection(&mut self) -> Option<usize> {
+        let text = self.selection.reconstruct_text(&self.scrollback)?;
+        if text.is_empty() {
+            return None;
+        }
+        let n = text.chars().count();
+        self.clipboard.copy_text(&text);
+        Some(n)
+    }
+
     pub fn clear_stream_renderer(&mut self) {
         self.painter.clear_stream();
     }
@@ -232,8 +245,8 @@ impl ScrollbackPane {
 
     /// Scrollback-focused keys. Returns true when handled.
     ///
-    /// Note: Ctrl+C is handled by the shell (double-tap quit), not here.
-    /// Use `y` to copy the character selection / entry.
+    /// `y` copies selection / entry. Ctrl+C copy is handled by the shell when
+    /// a selection is active.
     pub fn on_key(&mut self, key: KeyEvent, notify: &mut dyn FnMut(String)) -> bool {
         match key.code {
             KeyCode::Char('y') => {

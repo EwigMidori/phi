@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use phi_code_core::{KernelEvent, SessionHost, TurnItem};
+use phi_code_core::{KernelEvent, SessionHost, TurnItem, Usage};
 use phi_code_ui::Scrollback;
 use phi_ext_llm::{ApiStyle, HistoryProjector, LlmConfig, OpenAiCompatRuntime};
 
@@ -17,6 +17,67 @@ pub enum SubmitOutcome {
     Failed,
 }
 
+/// Product object: last job + session totals from provider [`Usage`] only.
+#[derive(Debug, Default, Clone)]
+struct UsageMeter {
+    last: Option<Usage>,
+    session_prompt: u64,
+    session_completion: u64,
+    session_total: u64,
+}
+
+impl UsageMeter {
+    fn observe(&mut self, usage: Usage) {
+        if let Some(p) = usage.prompt_tokens {
+            self.session_prompt = self.session_prompt.saturating_add(p);
+        }
+        if let Some(c) = usage.completion_tokens {
+            self.session_completion = self.session_completion.saturating_add(c);
+        }
+        if let Some(t) = usage.total_tokens {
+            self.session_total = self.session_total.saturating_add(t);
+        }
+        self.last = Some(usage);
+    }
+
+    /// Short status fragment; empty when no provider usage yet.
+    fn status_fragment(&self) -> String {
+        let Some(u) = &self.last else {
+            return String::new();
+        };
+        let mut parts = Vec::new();
+        if let Some(p) = u.prompt_tokens {
+            parts.push(format!("in:{p}"));
+        }
+        if let Some(c) = u.completion_tokens {
+            parts.push(format!("out:{c}"));
+        }
+        if let Some(t) = u.total_tokens {
+            parts.push(format!("tot:{t}"));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
+        let last = parts.join(" ");
+        // Session sums only for fields we actually received over time.
+        let mut sigma = Vec::new();
+        if self.session_prompt > 0 {
+            sigma.push(format!("in:{}", self.session_prompt));
+        }
+        if self.session_completion > 0 {
+            sigma.push(format!("out:{}", self.session_completion));
+        }
+        if self.session_total > 0 {
+            sigma.push(format!("tot:{}", self.session_total));
+        }
+        if sigma.is_empty() {
+            format!("tok {last}")
+        } else {
+            format!("tok {last} (Σ {})", sigma.join(" "))
+        }
+    }
+}
+
 /// Bridges kernel session host to the scrollback view.
 pub struct TurnDriver {
     host: Option<SessionHost>,
@@ -24,6 +85,7 @@ pub struct TurnDriver {
     model_label: String,
     /// Last status (errors, approval, pump) — not injected into transcript.
     last_note: Option<String>,
+    usage: UsageMeter,
 }
 
 impl TurnDriver {
@@ -44,6 +106,7 @@ impl TurnDriver {
                     config_error: None,
                     model_label,
                     last_note: None,
+                    usage: UsageMeter::default(),
                 }
             }
             Err(e) => Self {
@@ -51,8 +114,15 @@ impl TurnDriver {
                 config_error: Some(e),
                 model_label: "unconfigured".into(),
                 last_note: None,
+                usage: UsageMeter::default(),
             },
         }
+    }
+
+    /// Provider usage fragment for the status bar (empty if none yet).
+    #[must_use]
+    pub fn usage_status(&self) -> String {
+        self.usage.status_fragment()
     }
 
     #[must_use]
@@ -187,6 +257,9 @@ impl TurnDriver {
                 }
                 KernelEvent::GenerationAgentUnknown { kind, .. } => {
                     self.last_note = Some(format!("agent unknown event: {kind}"));
+                }
+                KernelEvent::GenerationUsage { usage, .. } => {
+                    self.usage.observe(usage);
                 }
                 KernelEvent::GenerationDone { .. } => {
                     if let Ok(items) = host.history() {
