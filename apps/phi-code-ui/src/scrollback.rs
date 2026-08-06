@@ -2,7 +2,8 @@
 //!
 //! - **Durable SoT:** [`TurnItem`] rows from [`phi_kernel::Transcript`] (via `set_durable`).
 //! - **Live overlay:** in-flight reasoning/assistant text from bus deltas (not a second history).
-//! - **Chrome:** expand/elapsed keyed by reasoning *content identity*, not entry index.
+//! - **Thinking chrome:** [`ThinkingPresenter`] — stable **open** span while streaming;
+//!   **sealed** by frozen content key only after flush (preserves expand across text).
 
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -61,13 +62,10 @@ pub struct VisibleSegment {
     pub visible_rows: usize,
 }
 
-/// In-flight generation (bus deltas not yet fully reflected in durable reload).
+/// In-flight generation (assistant body only; CoT lives in [`ThinkingPresenter::open`]).
 #[derive(Debug, Clone, Default)]
 struct LiveOverlay {
-    reasoning: String,
     assistant: String,
-    /// Live reasoning span is still receiving deltas.
-    reasoning_streaming: bool,
 }
 
 /// Conversation scrollback view.
@@ -87,8 +85,7 @@ pub struct Scrollback {
     virtual_y: Vec<usize>,
     total_height: usize,
     markdown: ProductMarkdown,
-    /// Expand / elapsed for reasoning, keyed by content hash (stable across reloads).
-    thinking: HashMap<u64, ThinkingChrome>,
+    thinking: ThinkingPresenter,
 }
 
 impl Default for Scrollback {
@@ -113,7 +110,7 @@ impl Scrollback {
             virtual_y: Vec::new(),
             total_height: 0,
             markdown: ProductMarkdown::new(),
-            thinking: HashMap::new(),
+            thinking: ThinkingPresenter::new(),
         }
     }
 
@@ -156,9 +153,7 @@ impl Scrollback {
 
     #[must_use]
     pub fn is_thinking(&self) -> bool {
-        self.live
-            .as_ref()
-            .is_some_and(|l| l.reasoning_streaming && !l.reasoning.is_empty())
+        self.thinking.is_open_streaming()
     }
 
     #[must_use]
@@ -192,35 +187,21 @@ impl Scrollback {
         if delta.is_empty() {
             return;
         }
-        let live = self.live.get_or_insert_with(LiveOverlay::default);
-        live.reasoning.push_str(delta);
-        live.reasoning_streaming = true;
-        let key = content_key(&live.reasoning);
-        self.thinking
-            .entry(key)
-            .or_insert_with(ThinkingChrome::new_streaming)
-            .streaming = true;
+        let _ = self.live.get_or_insert_with(LiveOverlay::default);
+        self.thinking.on_reasoning_delta(delta);
         self.rematerialize();
         self.scroll_to_bottom();
     }
 
-    /// Append answer text. Returns `true` when live CoT was cleared (kernel has
+    /// Append answer text. Returns `true` when live CoT was sealed (kernel has
     /// flushed reasoning to the transcript — caller should `set_durable`).
     pub fn live_text_delta(&mut self, delta: &str) -> bool {
         if delta.is_empty() {
             return false;
         }
         let live = self.live.get_or_insert_with(LiveOverlay::default);
-        // Kernel flushes reasoning to transcript before text; drop live CoT tail.
-        let mut reasoning_flushed = false;
-        if !live.reasoning.is_empty() {
-            if let Some(c) = self.thinking.get_mut(&content_key(&live.reasoning)) {
-                c.finish();
-            }
-            live.reasoning.clear();
-            live.reasoning_streaming = false;
-            reasoning_flushed = true;
-        }
+        // Seal open CoT into presenter (preserves expanded) before dropping live row.
+        let reasoning_flushed = self.thinking.seal_open();
         live.assistant.push_str(delta);
         self.rematerialize();
         self.scroll_to_bottom();
@@ -229,13 +210,8 @@ impl Scrollback {
 
     /// End live overlay (Done / Error / Stopped). Caller should `set_durable` after.
     pub fn end_live(&mut self) {
-        if let Some(live) = self.live.take() {
-            if !live.reasoning.is_empty() {
-                if let Some(c) = self.thinking.get_mut(&content_key(&live.reasoning)) {
-                    c.finish();
-                }
-            }
-        }
+        let _ = self.thinking.seal_open();
+        self.live = None;
         self.rematerialize();
         self.scroll_to_bottom();
     }
@@ -259,12 +235,9 @@ impl Scrollback {
         let Some(TurnItem::Reasoning { content }) = self.items.get(entry_idx) else {
             return false;
         };
-        let key = content_key(content);
-        let chrome = self
-            .thinking
-            .entry(key)
-            .or_insert_with(ThinkingChrome::default_collapsed);
-        chrome.expanded = !chrome.expanded;
+        if !self.thinking.toggle_for_content(content) {
+            return false;
+        }
         self.invalidate_layout();
         true
     }
@@ -286,13 +259,9 @@ impl Scrollback {
         if self.folded.contains(&entry_idx) {
             return None;
         }
-        let key = content_key(content);
-        let chrome = self.thinking.get(&key);
+        let chrome = self.thinking.chrome_for(content);
         let expanded = chrome.is_some_and(|c| c.expanded);
-        let streaming = chrome.is_some_and(|c| c.streaming)
-            || self.live.as_ref().is_some_and(|l| {
-                l.reasoning_streaming && content_key(&l.reasoning) == key
-            });
+        let streaming = chrome.is_some_and(|c| c.streaming);
         let body_rows = if expanded {
             EntryView::wrap_text(content, width.max(1)).len()
         } else {
@@ -477,18 +446,18 @@ impl Scrollback {
 
     fn rematerialize(&mut self) {
         let mut items = self.durable.clone();
-        if let Some(live) = &self.live {
-            // Live CoT only while not yet flushed into durable (first text clears it).
-            if !live.reasoning.is_empty() {
-                let already = items.iter().any(|it| {
-                    matches!(it, TurnItem::Reasoning { content } if content == &live.reasoning)
+        // Open CoT span (stable chrome) appears as a live reasoning row until sealed.
+        if let Some(buf) = self.thinking.open_buffer() {
+            let already = items
+                .iter()
+                .any(|it| matches!(it, TurnItem::Reasoning { content } if content == buf));
+            if !already {
+                items.push(TurnItem::Reasoning {
+                    content: buf.to_owned(),
                 });
-                if !already {
-                    items.push(TurnItem::Reasoning {
-                        content: live.reasoning.clone(),
-                    });
-                }
             }
+        }
+        if let Some(live) = &self.live {
             if !live.assistant.is_empty() {
                 items.push(TurnItem::Assistant {
                     content: live.assistant.clone(),
@@ -507,7 +476,7 @@ impl Scrollback {
 
     fn chrome_for_item(&self, item: &TurnItem) -> Option<&ThinkingChrome> {
         match item {
-            TurnItem::Reasoning { content } => self.thinking.get(&content_key(content)),
+            TurnItem::Reasoning { content } => self.thinking.chrome_for(content),
             _ => None,
         }
     }
@@ -590,6 +559,96 @@ fn content_key(s: &str) -> u64 {
     h.finish()
 }
 
+// ── ThinkingPresenter: open slot + sealed-by-frozen-content ────────────────
+
+/// UI presentation for reasoning rows.
+///
+/// - **open:** one stable span while CoT streams (expand survives more deltas).
+/// - **sealed:** frozen content key after flush (expand survives assistant text).
+#[derive(Debug, Clone, Default)]
+struct ThinkingPresenter {
+    open: Option<OpenThinkingSpan>,
+    sealed: HashMap<u64, ThinkingChrome>,
+}
+
+#[derive(Debug, Clone)]
+struct OpenThinkingSpan {
+    buffer: String,
+    chrome: ThinkingChrome,
+}
+
+impl ThinkingPresenter {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn is_open_streaming(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|o| o.chrome.streaming && !o.buffer.is_empty())
+    }
+
+    fn open_buffer(&self) -> Option<&str> {
+        self.open.as_ref().map(|o| o.buffer.as_str())
+    }
+
+    fn on_reasoning_delta(&mut self, delta: &str) {
+        let span = self.open.get_or_insert_with(|| OpenThinkingSpan {
+            buffer: String::new(),
+            chrome: ThinkingChrome::new_streaming(),
+        });
+        span.buffer.push_str(delta);
+        span.chrome.streaming = true;
+    }
+
+    /// Freeze open span into sealed map (preserves `expanded`). Returns true if sealed.
+    fn seal_open(&mut self) -> bool {
+        let Some(mut span) = self.open.take() else {
+            return false;
+        };
+        if span.buffer.is_empty() {
+            return false;
+        }
+        span.chrome.finish();
+        let key = content_key(&span.buffer);
+        self.sealed.insert(key, span.chrome);
+        true
+    }
+
+    fn chrome_for(&self, content: &str) -> Option<&ThinkingChrome> {
+        if let Some(open) = &self.open {
+            if open.buffer == content {
+                return Some(&open.chrome);
+            }
+        }
+        self.sealed.get(&content_key(content))
+    }
+
+    fn chrome_for_mut(&mut self, content: &str) -> Option<&mut ThinkingChrome> {
+        if let Some(open) = &mut self.open {
+            if open.buffer == content {
+                return Some(&mut open.chrome);
+            }
+        }
+        self.sealed.get_mut(&content_key(content))
+    }
+
+    fn toggle_for_content(&mut self, content: &str) -> bool {
+        if let Some(chrome) = self.chrome_for_mut(content) {
+            chrome.expanded = !chrome.expanded;
+            return true;
+        }
+        // Sealed row without chrome yet (e.g. loaded durable): create collapsed then expand.
+        let key = content_key(content);
+        let chrome = self
+            .sealed
+            .entry(key)
+            .or_insert_with(ThinkingChrome::default_collapsed);
+        chrome.expanded = !chrome.expanded;
+        true
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ThinkingChrome {
     expanded: bool,
@@ -653,7 +712,6 @@ struct EntryView<'a> {
     folded: bool,
     markdown: &'a ProductMarkdown,
     thinking_chrome: Option<&'a ThinkingChrome>,
-    is_streaming_target: bool,
 }
 
 impl<'a> EntryView<'a> {
@@ -662,14 +720,13 @@ impl<'a> EntryView<'a> {
         folded: bool,
         markdown: &'a ProductMarkdown,
         thinking_chrome: Option<&'a ThinkingChrome>,
-        is_streaming_target: bool,
+        _is_streaming_target: bool,
     ) -> Self {
         Self {
             item,
             folded,
             markdown,
             thinking_chrome,
-            is_streaming_target,
         }
     }
 
@@ -697,13 +754,10 @@ impl<'a> EntryView<'a> {
             TurnItem::Reasoning { content } => {
                 let chrome = self.thinking_chrome;
                 let expanded = chrome.is_some_and(|c| c.expanded);
-                let header = if self.is_streaming_target && chrome.is_none_or(|c| c.streaming) {
-                    "▸ Thinking…".to_string()
-                } else {
-                    chrome
-                        .map(ThinkingChrome::header_line)
-                        .unwrap_or_else(|| ThinkingChrome::default_collapsed().header_line())
-                };
+                // Always ask chrome for header (preserves ▾ when expanded while streaming).
+                let header = chrome
+                    .map(ThinkingChrome::header_line)
+                    .unwrap_or_else(|| ThinkingChrome::default_collapsed().header_line());
                 let mut lines = vec![header];
                 if expanded {
                     lines.extend(Self::wrap_text(content, width));
@@ -893,5 +947,61 @@ mod tests {
         assert!(sb.toggle_thinking(0));
         let lay = sb.thinking_layout(0, 40).unwrap();
         assert!(lay.expanded);
+    }
+
+    #[test]
+    fn thinking_expand_survives_more_reasoning_and_text() {
+        let mut sb = Scrollback::new();
+        sb.begin_live();
+        sb.live_reasoning_delta("step one");
+        sb.prepare(40, 40);
+        let idx = sb
+            .items()
+            .iter()
+            .position(|i| matches!(i, TurnItem::Reasoning { .. }))
+            .unwrap();
+        assert!(sb.toggle_thinking(idx));
+        assert!(sb.thinking_layout(idx, 40).unwrap().expanded);
+
+        // More CoT must not reset expand (stable open span).
+        sb.live_reasoning_delta("\nstep two");
+        sb.prepare(40, 40);
+        let idx = sb
+            .items()
+            .iter()
+            .position(|i| matches!(i, TurnItem::Reasoning { .. }))
+            .unwrap();
+        assert!(
+            sb.thinking_layout(idx, 40).unwrap().expanded,
+            "expand must survive further reasoning deltas"
+        );
+
+        // Seal + durable + assistant text must keep expand.
+        assert!(sb.live_text_delta("answer"));
+        sb.set_durable(vec![
+            TurnItem::Reasoning {
+                content: "step one\nstep two".into(),
+            },
+            TurnItem::Assistant {
+                content: "answer".into(),
+            },
+        ]);
+        sb.prepare(40, 40);
+        let idx = sb
+            .items()
+            .iter()
+            .position(|i| matches!(i, TurnItem::Reasoning { .. }))
+            .unwrap();
+        assert!(
+            sb.thinking_layout(idx, 40).unwrap().expanded,
+            "expand must survive seal into durable + assistant stream"
+        );
+        // Header should still show expanded chevron, not forced ▸ Thinking…
+        let lines = sb.entry_lines(idx);
+        assert!(
+            lines[0].starts_with('▾'),
+            "header should stay expanded: {}",
+            lines[0]
+        );
     }
 }
