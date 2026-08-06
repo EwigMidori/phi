@@ -5,6 +5,7 @@
 mod prompt_pane;
 mod scrollback_pane;
 mod shell;
+mod status_bar;
 mod turn_driver;
 
 use std::io::{self, stdout};

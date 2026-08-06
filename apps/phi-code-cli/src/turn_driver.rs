@@ -40,41 +40,86 @@ impl UsageMeter {
         self.last = Some(usage);
     }
 
-    /// Short status fragment; empty when no provider usage yet.
-    fn status_fragment(&self) -> String {
-        let Some(u) = &self.last else {
-            return String::new();
-        };
-        let mut parts = Vec::new();
-        if let Some(p) = u.prompt_tokens {
-            parts.push(format!("in:{p}"));
+    /// Context filled on the last request (provider `prompt_tokens`, else `total_tokens`).
+    fn context_used(&self) -> Option<u64> {
+        let u = self.last.as_ref()?;
+        u.prompt_tokens.or(u.total_tokens)
+    }
+
+    /// Compact bar: `used / window` humanized, e.g. `12K / 128K` or `— / 1M`.
+    fn bar_fragment(&self, context_window: u64) -> String {
+        let window = format_token_qty(context_window);
+        match self.context_used() {
+            Some(used) => format!("{} / {}", format_token_qty(used), window),
+            None => format!("— / {window}"),
         }
-        if let Some(c) = u.completion_tokens {
-            parts.push(format!("out:{c}"));
+    }
+
+    /// Extra lines for the expanded status panel.
+    fn detail_lines(&self, context_window: u64) -> Vec<String> {
+        let mut lines = Vec::new();
+        match self.context_used() {
+            Some(used) => lines.push(format!(
+                "  context: {} / {} ({} / {} tokens)",
+                format_token_qty(used),
+                format_token_qty(context_window),
+                used,
+                context_window
+            )),
+            None => lines.push(format!(
+                "  context: — / {} (window {}; waiting for provider usage)",
+                format_token_qty(context_window),
+                context_window
+            )),
         }
-        if let Some(t) = u.total_tokens {
-            parts.push(format!("tot:{t}"));
+        if let Some(u) = &self.last {
+            let mut last = Vec::new();
+            if let Some(p) = u.prompt_tokens {
+                last.push(format!("prompt {p}"));
+            }
+            if let Some(c) = u.completion_tokens {
+                last.push(format!("completion {c}"));
+            }
+            if let Some(t) = u.total_tokens {
+                last.push(format!("total {t}"));
+            }
+            if !last.is_empty() {
+                lines.push(format!("  last turn: {}", last.join(" · ")));
+            }
         }
-        if parts.is_empty() {
-            return String::new();
-        }
-        let last = parts.join(" ");
-        // Session sums only for fields we actually received over time.
         let mut sigma = Vec::new();
         if self.session_prompt > 0 {
-            sigma.push(format!("in:{}", self.session_prompt));
+            sigma.push(format!("prompt {}", self.session_prompt));
         }
         if self.session_completion > 0 {
-            sigma.push(format!("out:{}", self.session_completion));
+            sigma.push(format!("completion {}", self.session_completion));
         }
         if self.session_total > 0 {
-            sigma.push(format!("tot:{}", self.session_total));
+            sigma.push(format!("total {}", self.session_total));
         }
-        if sigma.is_empty() {
-            format!("tok {last}")
+        if !sigma.is_empty() {
+            lines.push(format!("  session Σ: {}", sigma.join(" · ")));
+        }
+        lines
+    }
+}
+
+/// Human quantity for the bar: `999`, `12K`, `1M`, `1.5M` (provider counts only).
+fn format_token_qty(n: u64) -> String {
+    if n >= 1_000_000 {
+        let whole = n / 1_000_000;
+        let tenths = (n % 1_000_000) / 100_000;
+        if tenths == 0 {
+            format!("{whole}M")
         } else {
-            format!("tok {last} (Σ {})", sigma.join(" "))
+            format!("{whole}.{tenths}M")
         }
+    } else if n >= 1000 {
+        // Round to nearest K for scannability.
+        let k = n.div_ceil(1000);
+        format!("{k}K")
+    } else {
+        n.to_string()
     }
 }
 
@@ -82,7 +127,12 @@ impl UsageMeter {
 pub struct TurnDriver {
     host: Option<SessionHost>,
     config_error: Option<String>,
-    model_label: String,
+    /// Short model id for the collapsed status bar.
+    model_id: String,
+    api_style: String,
+    api_base: String,
+    /// Model context window (product config); denominator of the usage bar.
+    context_window: u64,
     /// Last status (errors, approval, pump) — not injected into transcript.
     last_note: Option<String>,
     usage: UsageMeter,
@@ -92,10 +142,12 @@ impl TurnDriver {
     /// Build from process env (`PHI_*`). Config lives in the product binary.
     #[must_use]
     pub fn from_env() -> Self {
+        let context_window = load_context_window_from_env();
         match load_llm_config_from_env() {
             Ok(cfg) => {
-                let model_label =
-                    format!("{} ({}) @ {}", cfg.model, cfg.api_style.as_ref(), cfg.api_base);
+                let model_id = cfg.model.clone();
+                let api_style = cfg.api_style.as_ref().to_owned();
+                let api_base = cfg.api_base.clone();
                 // Product strategy: lean chat context (not owned by phi-ext-llm).
                 let agent = Arc::new(
                     OpenAiCompatRuntime::new(cfg)
@@ -104,7 +156,10 @@ impl TurnDriver {
                 Self {
                     host: Some(SessionHost::new(agent)),
                     config_error: None,
-                    model_label,
+                    model_id,
+                    api_style,
+                    api_base,
+                    context_window,
                     last_note: None,
                     usage: UsageMeter::default(),
                 }
@@ -112,22 +167,47 @@ impl TurnDriver {
             Err(e) => Self {
                 host: None,
                 config_error: Some(e),
-                model_label: "unconfigured".into(),
+                model_id: "unconfigured".into(),
+                api_style: "—".into(),
+                api_base: "—".into(),
+                context_window,
                 last_note: None,
                 usage: UsageMeter::default(),
             },
         }
     }
 
-    /// Provider usage fragment for the status bar (empty if none yet).
+    /// Context bar: `used / window` (e.g. `12K / 128K`). Always shows the window.
     #[must_use]
-    pub fn usage_status(&self) -> String {
-        self.usage.status_fragment()
+    pub fn usage_bar(&self) -> String {
+        self.usage.bar_fragment(self.context_window)
     }
 
+    /// Short model name for the collapsed bar.
     #[must_use]
-    pub fn model_label(&self) -> &str {
-        &self.model_label
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    /// Full channel summary for the expanded panel.
+    #[must_use]
+    pub fn channel_detail_lines(&self) -> Vec<String> {
+        vec![
+            format!("  model:  {}", self.model_id),
+            format!("  style:  {}", self.api_style),
+            format!("  base:   {}", self.api_base),
+            format!(
+                "  window: {} ({} tokens)",
+                format_token_qty(self.context_window),
+                self.context_window
+            ),
+        ]
+    }
+
+    /// Token detail lines for the expanded panel.
+    #[must_use]
+    pub fn usage_detail_lines(&self) -> Vec<String> {
+        self.usage.detail_lines(self.context_window)
     }
 
     #[must_use]
@@ -353,6 +433,15 @@ fn load_llm_config_from_env() -> Result<LlmConfig, String> {
         model,
         api_style,
     })
+}
+
+/// Context window for the usage bar denominator (`PHI_CONTEXT_WINDOW`, default 128000).
+fn load_context_window_from_env() -> u64 {
+    let raw = env_trim("PHI_CONTEXT_WINDOW");
+    if raw.is_empty() {
+        return 128_000;
+    }
+    raw.parse::<u64>().unwrap_or(128_000).max(1)
 }
 
 fn env_trim(key: &str) -> String {
