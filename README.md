@@ -33,7 +33,8 @@ phi/
     phi-ext-subagent/
   apps/
     phi-code-core/
-    phi-code-cli/    # bin: phi-code
+    phi-code-cli/           # bin: phi-code
+      vendor/               # Grok UI crates as-is (textarea, inline, markdown)
 ```
 
 ```bash

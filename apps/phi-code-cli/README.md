@@ -1,17 +1,17 @@
 # phi-code-cli
 
-CLI entry (`phi-code`). Grok-like stack + prompt basics.
+CLI entry (`phi-code`). Prompt uses vendored **`xai-ratatui-textarea`**
+(see [`vendor/`](./vendor/)).
 
-| Key | Action |
-|-----|--------|
-| ←→ Home End | move cursor |
-| Backspace Delete | delete |
-| Enter | send line to scrollback |
-| Shift/Alt+Enter, trailing `\`+Enter | newline |
-| paste | bracketed paste |
-| Ctrl+M | toggle multiline |
+| Input | Action |
+|-------|--------|
+| typing / arrows / undo | TextArea (`xai-ratatui-textarea`) |
+| Enter | send line → scrollback |
+| Shift/Alt+Enter | newline in prompt |
+| paste | bracketed paste → `insert_str` |
+| Ctrl+M | prefer taller prompt |
 | Tab | focus prompt ↔ scrollback |
-| click prompt / scrollback | focus that pane; click in prompt sets cursor |
+| click prompt | focus + TextArea mouse |
 | wheel on scrollback | scroll history |
 | Esc | quit |
 

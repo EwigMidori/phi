@@ -5,6 +5,11 @@ members = [
     "crates/phi-ext-subagent",
     "apps/phi-code-core",
     "apps/phi-code-cli",
+    # CLI-only vendored Grok UI (as-is; live under apps/phi-code-cli/vendor/).
+    "apps/phi-code-cli/vendor/xai-ratatui-textarea",
+    "apps/phi-code-cli/vendor/xai-ratatui-inline",
+    "apps/phi-code-cli/vendor/xai-grok-markdown-core",
+    "apps/phi-code-cli/vendor/xai-grok-markdown",
 ]
 resolver = "2"
 
@@ -16,30 +21,65 @@ repository = "https://github.com/ewigmidori/phi"
 authors = ["EwigMidori"]
 
 [workspace.dependencies]
+# --- phi ---
 async-trait = "0.1.89"
-crossterm = "0.28"
 futures = "0.3.31"
-ratatui = "0.29"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-unicode-segmentation = "1.12"
-unicode-width = "0.2"
 uuid = { version = "1.18.0", features = ["v4", "serde"] }
 
+# --- shared TUI / vendor host (versions aligned with Grok Build codegen crates) ---
+ansi-width = "0.1"
+anstyle = "1.0"
+anstyle-lossy = "1.1.4"
+anstyle-parse = "0.2"
+anstyle-syntect = "1.0.4"
+anyhow = { version = "1", features = ["backtrace"] }
+arboard = "3.6"
+chrono = "0.4"
+colored_json = "5"
+criterion = "0.6"
+crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+fuzzy-matcher = "0.3.7"
+html-escape = "0.2"
+ignore = "0.4"
+itertools = "0.14"
+linkify = "0.10"
+lipsum = "0.9"
+pretty_assertions = "1"
+pulldown-cmark = "0.13"
+rand = "0.9"
+ratatui = { version = "0.29", features = ["crossterm", "unstable-widget-ref"] }
+ratatui-core = "0.1"
+supports-color = "3.0"
+syntect = "5.3"
+termwiz = { version = "0.23", default-features = false }
+textwrap = "0.16"
+tracing = "0.1"
+tui-scrollbar = "0.2"
+two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+url = "2"
+
+# Vendored package path keys (workspace = true inside vendor crates).
+xai-grok-markdown = { path = "apps/phi-code-cli/vendor/xai-grok-markdown" }
+xai-grok-markdown-core = { path = "apps/phi-code-cli/vendor/xai-grok-markdown-core" }
+xai-ratatui-inline = { path = "apps/phi-code-cli/vendor/xai-ratatui-inline" }
+xai-ratatui-textarea = { path = "apps/phi-code-cli/vendor/xai-ratatui-textarea" }
+
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Vendor crates use `unsafe` in a few places; phi crates still #![forbid(unsafe_code)].
+unsafe_code = "allow"
 
 [workspace.lints.clippy]
-# Groups at lower priority so individual overrides win.
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-# Pedantic docs noise: thin kernel ports keep short API docs over # Errors on every Result.
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
-# Trait / helper methods return Result for fallible store adapters even when memory never fails.
 unnecessary_wraps = "allow"
 doc_markdown = "allow"
