@@ -1,4 +1,6 @@
-//! Prompt pane: TextArea + paste policy + multiline preference.
+//! Prompt pane (shell UI): TextArea + paste policy + multiline preference.
+//!
+//! No LLM / session / product policy — see `shell/mod.rs` package banner.
 
 use crossterm::event::{KeyEvent, MouseEvent};
 use phi_code_ui::PastePolicy;

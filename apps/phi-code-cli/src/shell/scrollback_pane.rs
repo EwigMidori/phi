@@ -1,8 +1,13 @@
-//! Scrollback pane: history layout, paint, char selection, scrollbar, nav keys.
+//! Scrollback pane (shell UI): history layout, paint, selection, scrollbar, nav keys,
+//! and model→view projection onto owned [`Scrollback`].
+//!
+//! Free functions here must stay pure (no read/write of process or object state).
+//! Mutation of scrollback goes through [`ScrollbackPane`] methods only.
 
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use phi_code_core::KernelEvent;
 use phi_code_ui::{
     AutoScrollDirection, HistoryScrollbar, HorizontalLayout, Scrollback, ScrollbackPainter,
     Selection, SystemClipboard,
@@ -11,6 +16,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+
+use crate::turn_driver::{TickResult, TurnDriver};
 
 /// Owns scrollback collaboration objects; Shell only routes messages here.
 pub struct ScrollbackPane {
@@ -46,13 +53,77 @@ impl ScrollbackPane {
         &self.scrollback
     }
 
-    pub fn scrollback_mut(&mut self) -> &mut Scrollback {
-        &mut self.scrollback
-    }
-
     #[must_use]
     pub fn has_selection(&self) -> bool {
         self.selection.has_active()
+    }
+
+    /// Project one application tick onto the owned scrollback.
+    ///
+    /// Returns `true` when a generation finished (painter stream should clear).
+    pub fn apply_tick(&mut self, driver: &TurnDriver, tick: &TickResult) -> bool {
+        if tick.pump_failed {
+            self.scrollback.end_live();
+            self.resync_durable(driver);
+        }
+        if tick.lagged {
+            self.resync_durable(driver);
+            if !driver.is_busy() {
+                self.scrollback.end_live();
+            }
+        }
+        if tick.events.is_empty() && !tick.pump_failed && !tick.lagged {
+            return false;
+        }
+        for ev in &tick.events {
+            self.apply_event(driver, ev);
+        }
+        tick.generation_finished
+    }
+
+    /// After an accepted submit: durable history + open live overlay.
+    pub fn apply_submit_accepted(&mut self, driver: &TurnDriver) {
+        self.resync_durable(driver);
+        self.scrollback.begin_live();
+    }
+
+    fn resync_durable(&mut self, driver: &TurnDriver) {
+        if let Ok(items) = driver.history() {
+            self.scrollback.set_durable(items);
+        }
+    }
+
+    fn apply_event(&mut self, driver: &TurnDriver, ev: &KernelEvent) {
+        match ev {
+            KernelEvent::GenerationStart { .. } => {
+                if !self.scrollback.is_streaming() {
+                    self.scrollback.begin_live();
+                }
+                self.resync_durable(driver);
+            }
+            KernelEvent::GenerationReasoningDelta { text, .. } => {
+                self.scrollback.live_reasoning_delta(text);
+            }
+            KernelEvent::GenerationTextDelta { text, .. } => {
+                if self.scrollback.live_text_delta(text) {
+                    self.resync_durable(driver);
+                }
+            }
+            KernelEvent::GenerationToolCall { .. }
+            | KernelEvent::GenerationToolResult { .. }
+            | KernelEvent::GenerationToolApprovalRequired { .. } => {
+                self.resync_durable(driver);
+            }
+            KernelEvent::GenerationDone { .. }
+            | KernelEvent::GenerationStopped { .. }
+            | KernelEvent::GenerationError { .. } => {
+                self.resync_durable(driver);
+                self.scrollback.end_live();
+            }
+            KernelEvent::GenerationUsage { .. } | KernelEvent::GenerationAgentUnknown { .. } => {
+                // Usage / unknown notes are application-side; nothing for the view.
+            }
+        }
     }
 
     pub fn clear_selection(&mut self) {

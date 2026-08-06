@@ -1,11 +1,9 @@
-//! phi-code CLI — terminal host over [`AgentShell`].
+//! phi-code CLI — terminal host.
 //!
-//! Tokio runtime hosts LLM stream tasks; the TUI loop stays tick-driven.
+//! Layers: [`turn_driver`] (application) · [`shell`] (UI chrome) · this file (I/O loop).
+//! Tokio hosts LLM stream tasks; the TUI loop stays tick-driven.
 
-mod prompt_pane;
-mod scrollback_pane;
 mod shell;
-mod status_bar;
 mod turn_driver;
 
 use std::io::{self, stdout};

@@ -1,20 +1,65 @@
-//! Agent shell: **route only** — tick / draw / handle among owned collaborators.
+//! # `shell` — terminal chrome only (View + input routing + model→view projection)
 //!
-//! # Forbidden (read before editing)
+//! Layering for this binary (MVVM-ish, not a framework):
 //!
-//! **Do not casually add methods or fields to [`AgentShell`].**
+//! | Layer | Where | Responsibility |
+//! |-------|--------|----------------|
+//! | **Model / application** | [`crate::turn_driver`] | LLM session, submit/tick, usage *counts*, product policy |
+//! | **View + chrome** | **this package** | layout, paint, focus, panes, status *formatting*, event→scrollback projection |
+//! | **Host** | [`crate`] `main` | terminal lifecycle, event poll loop |
 //!
-//! - Status chrome → [`crate::status_bar::StatusBar`]
-//! - History / selection → [`crate::scrollback_pane::ScrollbackPane`]
-//! - Prompt / paste → [`crate::prompt_pane::PromptPane`]
-//! - Turns / LLM → [`crate::turn_driver::TurnDriver`]
+//! [`AgentShell`] is the thin **ViewModel/coordinator**: it holds UI objects and a
+//! `TurnDriver` handle, routes terminal events, projects model outputs into the
+//! view, and builds paint-time snapshots. It must not own product policy.
 //!
-//! If you are about to write `fn paint_*` or `fn handle_*_detail` here, **stop**
-//! and put a message on the responsible object instead. Shell is a thin
-//! coordinator, not a dumping ground (Evans boundary / Kay objects / Ousterhout
-//! deep modules). Violating this will be rejected in review.
+//! # Allowed in `shell/`
+//!
+//! - Ratatui / crossterm layout and paint
+//! - Focus routing, mouse hit tests, keyboard→pane dispatch
+//! - Prompt / scrollback / status **presentation** objects
+//! - Host chrome protocols (e.g. double-Ctrl+C quit arming)
+//! - Mapping [`crate::turn_driver::TickResult`] / history onto scrollback via
+//!   [`scrollback_pane::ScrollbackPane`] methods (not free functions with side effects)
+//! - Formatting raw [`crate::turn_driver::ChannelInfo`] / [`UsageInfo`] into status
+//!   strings via **pure** helpers in [`status_format`]
+//!
+//! # Forbidden in `shell/` (reject in review)
+//!
+//! **Do not put application / domain logic in this directory.** Move it to
+//! [`crate::turn_driver`] (or further into `phi-code-core` / product crates).
+//!
+//! Specifically **do not**:
+//!
+//! - Call or configure LLM runtimes, `SessionHost`, `phi-ext-llm`, API keys/env product policy
+//! - Implement history projectors, transcript policies, or tool-approval product rules
+//! - Aggregate token meters (session Σ); only **display** counts the model already computed
+//! - Decide submit accept/reject product rules beyond pure view gates (e.g. already streaming)
+//! - Add files under `shell/` for “just a little” product composition
+//! - **Free functions with read/write side effects** (mutate panes, touch env, I/O).
+//!   Side-effecting behavior is a method on the object that owns the state.
+//!   Free functions may only be pure (args → value).
+//!
+//! # Forbidden in `turn_driver` (mirror rule)
+//!
+//! Application code must **not** import `phi_code_ui`, ratatui, or format status chrome.
+//! If it mutates scrollback or paints, it belongs here instead.
+//!
+//! **Do not casually add methods or fields to [`AgentShell`].** Prefer a message
+//! on the responsible object:
+//!
+//! - Status chrome → [`status_bar::StatusBar`] / [`status_format`]
+//! - History / selection / event→view → [`scrollback_pane::ScrollbackPane`]
+//! - Prompt / paste → [`prompt_pane::PromptPane`]
+//! - Double-Ctrl+C quit → [`quit_protocol::QuitProtocol`]
+//! - Turns / LLM / usage counts / config → [`crate::turn_driver::TurnDriver`] (**outside** this package)
+//!
+//! If you are about to write product policy or env loading here — **stop**.
 
-use std::time::{Duration, Instant};
+mod prompt_pane;
+mod quit_protocol;
+mod scrollback_pane;
+mod status_bar;
+mod status_format;
 
 use crossterm::event::{
     Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -26,13 +71,12 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use xai_ratatui_textarea::ClipboardProvider;
 
-use crate::prompt_pane::PromptPane;
-use crate::scrollback_pane::ScrollbackPane;
-use crate::status_bar::{classify_note, NoteKind, StatusBar, StatusSnapshot, StreamKind};
 use crate::turn_driver::{SubmitOutcome, TurnDriver};
 
-/// Second Ctrl+C must arrive within this window to quit.
-const QUIT_CTRL_C_WINDOW: Duration = Duration::from_millis(500);
+use prompt_pane::PromptPane;
+use quit_protocol::{IdleCtrlC, QuitProtocol, QUIT_REMINDER};
+use scrollback_pane::ScrollbackPane;
+use status_bar::{classify_note, NoteKind, StatusBar, StatusSnapshot, StreamKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -40,15 +84,15 @@ enum Focus {
     Scrollback,
 }
 
-/// Thin coordinator. See module docs — **do not grow this type**.
+/// Thin UI coordinator. See module docs — **do not grow this type with product logic**.
 pub struct AgentShell {
     focus: Focus,
+    quit: QuitProtocol,
     prompt: PromptPane,
     scrollback: ScrollbackPane,
+    /// Application model — lives in [`crate::turn_driver`], only composed here.
     driver: TurnDriver,
     status: StatusBar,
-    quit: bool,
-    ctrl_c_armed_at: Option<Instant>,
 }
 
 impl AgentShell {
@@ -62,18 +106,17 @@ impl AgentShell {
         }
         Self {
             focus: Focus::Prompt,
+            quit: QuitProtocol::new(),
             prompt,
             scrollback: ScrollbackPane::new(),
             driver,
             status,
-            quit: false,
-            ctrl_c_armed_at: None,
         }
     }
 
     #[must_use]
     pub fn should_quit(&self) -> bool {
-        self.quit
+        self.quit.should_quit()
     }
 
     /// Route a transient note to the status bar (typed by classifier).
@@ -84,8 +127,16 @@ impl AgentShell {
     }
 
     pub fn tick(&mut self) {
-        self.expire_ctrl_c_arm();
-        if self.driver.tick(self.scrollback.scrollback_mut()) {
+        if self.quit.expire()
+            && self
+                .status
+                .note()
+                .is_some_and(|n| n.text == QUIT_REMINDER)
+        {
+            self.status.clear_note();
+        }
+        let tick = self.driver.tick();
+        if self.scrollback.apply_tick(&self.driver, &tick) {
             self.scrollback.clear_stream_renderer();
         }
         if let Some(note) = self.driver.take_last_note() {
@@ -142,13 +193,15 @@ impl AgentShell {
             StreamKind::Idle
         };
         let sb = self.scrollback.scrollback();
+        let channel = self.driver.channel();
+        let usage = self.driver.usage();
         StatusSnapshot {
             stream,
-            model_id: self.driver.model_id().to_owned(),
-            usage_bar: self.driver.usage_bar(),
+            model_id: channel.model_id.clone(),
+            usage_bar: status_format::usage_bar(&usage),
             multiline: self.prompt.is_multiline(),
-            channel_lines: self.driver.channel_detail_lines(),
-            usage_lines: self.driver.usage_detail_lines(),
+            channel_lines: status_format::channel_detail_lines(&channel),
+            usage_lines: status_format::usage_detail_lines(&usage),
             layout_line: format!(
                 "  layout:  {} entries · {} rows",
                 sb.items().len(),
@@ -206,25 +259,25 @@ impl AgentShell {
                 self.handle_ctrl_c();
             }
             KeyCode::Esc => {
-                self.ctrl_c_armed_at = None;
+                self.quit.disarm();
                 if self.scrollback.has_selection() {
                     self.scrollback.clear_selection();
                     self.status.clear_note();
                 }
             }
             KeyCode::Tab => {
-                self.ctrl_c_armed_at = None;
+                self.quit.disarm();
                 self.focus = match self.focus {
                     Focus::Prompt => Focus::Scrollback,
                     Focus::Scrollback => Focus::Prompt,
                 };
             }
             KeyCode::Char('m') if ctrl => {
-                self.ctrl_c_armed_at = None;
+                self.quit.disarm();
                 self.prompt.toggle_multiline();
             }
             KeyCode::Char('v' | 'V') if ctrl && matches!(self.focus, Focus::Prompt) => {
-                self.ctrl_c_armed_at = None;
+                self.quit.disarm();
                 let mut clip = SystemClipboard::new();
                 if let Some(text) = ClipboardProvider::get(&mut clip) {
                     self.prompt.apply_paste(&text);
@@ -232,29 +285,15 @@ impl AgentShell {
                 }
             }
             KeyCode::Enter if matches!(self.focus, Focus::Prompt) => {
-                self.ctrl_c_armed_at = None;
+                self.quit.disarm();
                 if shift || alt {
                     self.prompt.insert_newline();
                 } else {
-                    let msg = self.prompt.submit_candidate();
-                    match self
-                        .driver
-                        .submit(self.scrollback.scrollback_mut(), &msg)
-                    {
-                        SubmitOutcome::Accepted => {
-                            self.prompt.clear();
-                            self.scrollback.clear_stream_renderer();
-                            self.scrollback.clear_selection();
-                        }
-                        SubmitOutcome::Rejected | SubmitOutcome::Failed => {}
-                    }
-                    if let Some(n) = self.driver.take_last_note() {
-                        self.notify(n);
-                    }
+                    self.submit_prompt();
                 }
             }
             _ if matches!(self.focus, Focus::Scrollback) => {
-                self.ctrl_c_armed_at = None;
+                self.quit.disarm();
                 let mut note = None;
                 let mut notify = |s: String| {
                     note = Some(s);
@@ -266,16 +305,37 @@ impl AgentShell {
                 }
             }
             _ if matches!(self.focus, Focus::Prompt) => {
-                self.ctrl_c_armed_at = None;
+                self.quit.disarm();
                 self.prompt.input_key(key);
             }
             _ => {}
         }
     }
 
+    /// View gate (streaming) + application submit + scrollback projection.
+    fn submit_prompt(&mut self) {
+        // View-only gate: do not start another turn while live overlay is open.
+        if self.scrollback.scrollback().is_streaming() {
+            return;
+        }
+        let msg = self.prompt.submit_candidate();
+        match self.driver.submit(&msg) {
+            SubmitOutcome::Accepted => {
+                self.scrollback.apply_submit_accepted(&self.driver);
+                self.prompt.clear();
+                self.scrollback.clear_stream_renderer();
+                self.scrollback.clear_selection();
+            }
+            SubmitOutcome::Rejected | SubmitOutcome::Failed => {}
+        }
+        if let Some(n) = self.driver.take_last_note() {
+            self.notify(n);
+        }
+    }
+
     fn handle_ctrl_c(&mut self) {
         if self.scrollback.has_selection() {
-            self.ctrl_c_armed_at = None;
+            self.quit.disarm();
             if let Some(n) = self.scrollback.copy_selection() {
                 self.notify(format!("copied selection ({n} chars)"));
             }
@@ -283,7 +343,7 @@ impl AgentShell {
         }
 
         if !self.prompt.is_empty() {
-            self.ctrl_c_armed_at = None;
+            self.quit.disarm();
             let text = self.prompt.text();
             let n = text.chars().count();
             let mut clip = SystemClipboard::new();
@@ -293,32 +353,9 @@ impl AgentShell {
             return;
         }
 
-        let now = Instant::now();
-        if let Some(armed_at) = self.ctrl_c_armed_at {
-            if now.duration_since(armed_at) <= QUIT_CTRL_C_WINDOW {
-                self.quit = true;
-                return;
-            }
-        }
-        self.ctrl_c_armed_at = Some(now);
-        self.notify("press Ctrl+C again to quit");
-    }
-
-    fn expire_ctrl_c_arm(&mut self) {
-        let Some(armed_at) = self.ctrl_c_armed_at else {
-            return;
-        };
-        if Instant::now().duration_since(armed_at) <= QUIT_CTRL_C_WINDOW {
-            return;
-        }
-        self.ctrl_c_armed_at = None;
-        // Clear only the quit reminder, not other notes.
-        if self
-            .status
-            .note()
-            .is_some_and(|n| n.text == "press Ctrl+C again to quit")
-        {
-            self.status.clear_note();
+        match self.quit.on_idle_ctrl_c() {
+            IdleCtrlC::ConfirmedQuit => {}
+            IdleCtrlC::Armed => self.notify(QUIT_REMINDER),
         }
     }
 }
