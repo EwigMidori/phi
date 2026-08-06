@@ -19,7 +19,8 @@
 //! Bus events for tool call/result are projected after successful record — not dual-built
 //! in the turn with duplicated fields.
 //!
-//! Non-tool frames (text/reasoning deltas, start, approval, unknown) stay notice-only.
+//! Text/start/approval/unknown stay notice-only. Reasoning is buffered then written
+//! as a durable sibling row when the turn leaves the reasoning span (or at end).
 
 use crate::agent::{ToolCallId, ToolName, ToolResultStatus};
 use crate::error::Result;
@@ -90,9 +91,11 @@ impl TurnOutcome {
     }
 }
 
-/// Authority intent: durable tool row on the transcript.
+/// Authority intent: durable transcript row from the stream path.
 #[derive(Debug)]
 pub(crate) enum TranscriptWrite {
+    /// Sibling CoT row ([`crate::agent::TurnItem::Reasoning`]).
+    Reasoning { content: String },
     ToolCall {
         tool_call_id: ToolCallId,
         tool_name: ToolName,
@@ -169,31 +172,35 @@ pub(crate) enum CommitUnit<'a> {
 }
 
 /// Project a durable tool write into the matching generation bus event.
-fn project_write(session_id: &SessionId, job_id: &JobId, write: &TranscriptWrite) -> KernelEvent {
+///
+/// Reasoning writes are durable-only (live path already emitted
+/// [`KernelEvent::GenerationReasoningDelta`] notices).
+fn project_write(session_id: &SessionId, job_id: &JobId, write: &TranscriptWrite) -> Option<KernelEvent> {
     match write {
+        TranscriptWrite::Reasoning { .. } => None,
         TranscriptWrite::ToolCall {
             tool_call_id,
             tool_name,
             input,
-        } => KernelEvent::GenerationToolCall {
+        } => Some(KernelEvent::GenerationToolCall {
             session_id: session_id.clone(),
             job_id: job_id.clone(),
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.clone(),
             input: input.clone(),
-        },
+        }),
         TranscriptWrite::ToolResult {
             tool_call_id,
             tool_name: _,
             output,
             status,
-        } => KernelEvent::GenerationToolResult {
+        } => Some(KernelEvent::GenerationToolResult {
             session_id: session_id.clone(),
             job_id: job_id.clone(),
             tool_call_id: tool_call_id.clone(),
             output: output.clone(),
             status: *status,
-        },
+        }),
     }
 }
 
@@ -241,6 +248,9 @@ impl<'a> EffectApplier<'a> {
     pub(crate) fn apply_stream(&self, job_id: &JobId, batch: EffectBatch) -> Result<()> {
         for write in &batch.writes {
             match write {
+                TranscriptWrite::Reasoning { content } => {
+                    let _ = self.transcript.record_reasoning(self.session_id, content)?;
+                }
                 TranscriptWrite::ToolCall {
                     tool_call_id,
                     tool_name,
@@ -268,7 +278,9 @@ impl<'a> EffectApplier<'a> {
                     )?;
                 }
             }
-            let _ = self.bus.send(project_write(self.session_id, job_id, write));
+            if let Some(ev) = project_write(self.session_id, job_id, write) {
+                let _ = self.bus.send(ev);
+            }
         }
         for notice in batch.notices {
             let _ = self.bus.send(notice);

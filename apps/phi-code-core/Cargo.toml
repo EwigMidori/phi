@@ -3,11 +3,10 @@ name = "phi-code-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "phi-code product runtime (turn orchestration)"
+description = "phi-code product runtime (session host over kernel SendQueue)"
 readme = "README.md"
 
 [dependencies]
-futures.workspace = true
 phi-kernel = { path = "../../crates/phi-kernel" }
 tokio.workspace = true
 

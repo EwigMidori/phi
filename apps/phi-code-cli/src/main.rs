@@ -25,8 +25,8 @@ async fn main() -> io::Result<()> {
 
 /// Own terminal lifecycle; all product behavior lives on [`AgentShell`].
 ///
-/// Must run inside a Tokio runtime so [`phi_code_core::SessionTurnRunner`] can
-/// `tokio::spawn` the LLM stream.
+/// Must run inside a Tokio runtime so [`phi_code_core::SessionHost`] can
+/// `tokio::spawn` the kernel SendQueue pump.
 fn run_terminal_host() -> io::Result<()> {
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableBracketedPaste, EnableMouseCapture)?;

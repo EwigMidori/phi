@@ -1,18 +1,19 @@
 //! # phi-code-core
 //!
-//! Product runtime for phi-code (turn orchestration).
+//! Product runtime for phi-code: session host over kernel generation.
 //!
 //! LLM **wire** adapters live in `phi-ext-llm`. Terminal UI lives in
 //! `phi-code-ui`.
 
 #![forbid(unsafe_code)]
 
-mod turn_runner;
+mod session;
 
 // Crate root is the public surface; modules stay private.
-// Re-export only kernel types that appear on this crate's public API.
-pub use phi_kernel::{AgentEvent, AgentRuntime, SessionId, TurnItem};
-pub use turn_runner::SessionTurnRunner;
+pub use phi_kernel::{
+    AgentEvent, AgentRuntime, InMemoryTranscript, KernelEvent, SessionId, Transcript, TurnItem,
+};
+pub use session::{PollBatch, SessionHost};
 
 pub const CORE_NAME: &str = "phi-code-core";
 

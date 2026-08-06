@@ -1874,7 +1874,6 @@ dependencies = [
 name = "phi-code-core"
 version = "0.0.0"
 dependencies = [
- "futures",
  "phi-kernel",
  "tokio",
 ]
@@ -1906,7 +1905,6 @@ dependencies = [
  "reqwest",
  "serde_json",
  "strum 0.28.0",
- "thiserror 2.0.19",
 ]
 
 [[package]]

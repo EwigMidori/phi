@@ -1,6 +1,6 @@
 //! OpenAI-compatible wire: Chat Completions **or** Responses API → kernel events.
 //!
-//! Products may build [`LlmConfig`] directly or via [`LlmConfig::from_env`] (`PHI_*`).
+//! Products construct [`LlmConfig`] (env keys are product-owned, not this crate).
 
 use std::pin::Pin;
 
@@ -12,11 +12,10 @@ use phi_kernel::{AgentEvent, AgentEventStream, AgentRuntime, TurnCancel, TurnIte
 use reqwest::Client;
 use serde_json::{Value, json};
 use strum::{Display, EnumString};
-use thiserror::Error;
 
 /// Wire protocol for the HTTP adapter.
 ///
-/// Env wire names (exact): `responses` | `completions`.
+/// String form (strum): `responses` | `completions`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Display, EnumString, strum::AsRefStr,
 )]
@@ -29,7 +28,9 @@ pub enum ApiStyle {
     Completions,
 }
 
-/// Env-driven LLM endpoint settings.
+/// Endpoint settings for [`OpenAiCompatRuntime`].
+///
+/// Construct explicitly; product binaries map env / config files → this struct.
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub api_base: String,
@@ -38,69 +39,52 @@ pub struct LlmConfig {
     pub api_style: ApiStyle,
 }
 
-#[derive(Debug, Error)]
-pub enum LlmConfigError {
-    #[error("API key missing: set PHI_API_KEY to call a real model")]
-    MissingApiKey,
-    #[error("invalid PHI_API_STYLE `{0}` (use `responses` or `completions`)")]
-    InvalidApiStyle(String),
-}
-
 impl LlmConfig {
-    /// Load from environment:
-    ///
-    /// | Variable | Default |
-    /// |----------|---------|
-    /// | `PHI_API_KEY` | required |
-    /// | `PHI_API_BASE` | `https://api.openai.com/v1` |
-    /// | `PHI_MODEL` | `gpt-4o-mini` |
-    /// | `PHI_API_STYLE` | `responses` |
-    pub fn from_env() -> Result<Self, LlmConfigError> {
-        let api_key = env_trim("PHI_API_KEY");
-        if api_key.is_empty() {
-            return Err(LlmConfigError::MissingApiKey);
-        }
-        let api_base = env_trim("PHI_API_BASE");
-        let api_base = if api_base.is_empty() {
-            "https://api.openai.com/v1".into()
-        } else {
-            api_base.trim_end_matches('/').to_owned()
-        };
-        let model = env_trim("PHI_MODEL");
-        let model = if model.is_empty() {
-            "gpt-4o-mini".into()
-        } else {
-            model
-        };
-        let style_raw = env_trim("PHI_API_STYLE");
-        let api_style = if style_raw.is_empty() {
-            ApiStyle::default()
-        } else {
-            style_raw
-                .parse::<ApiStyle>()
-                .map_err(|_| LlmConfigError::InvalidApiStyle(style_raw))?
-        };
-        Ok(Self {
-            api_base,
-            api_key,
-            model,
+    #[must_use]
+    pub fn new(
+        api_base: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        api_style: ApiStyle,
+    ) -> Self {
+        Self {
+            api_base: api_base.into(),
+            api_key: api_key.into(),
+            model: model.into(),
             api_style,
-        })
+        }
     }
 }
 
-fn env_trim(key: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_owned())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_default()
+/// How transcript history is projected onto the provider wire.
+///
+/// Explicit policy — not a silent drop. Extend when Responses re-sends CoT / tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistoryProjection {
+    /// User + Assistant text only (safe for Chat Completions and lean Responses).
+    #[default]
+    ChatTextOnly,
+}
+
+impl HistoryProjection {
+    fn include(self, item: &TurnItem) -> bool {
+        match self {
+            Self::ChatTextOnly => match item {
+                TurnItem::User { .. } => true,
+                TurnItem::Assistant { content } => !content.is_empty(),
+                TurnItem::Reasoning { .. }
+                | TurnItem::ToolCall { .. }
+                | TurnItem::ToolResult { .. } => false,
+            },
+        }
+    }
 }
 
 /// HTTP streaming runtime (Responses or Completions).
 pub struct OpenAiCompatRuntime {
     client: Client,
     config: LlmConfig,
+    history: HistoryProjection,
 }
 
 impl OpenAiCompatRuntime {
@@ -109,7 +93,14 @@ impl OpenAiCompatRuntime {
         Self {
             client: Client::new(),
             config,
+            history: HistoryProjection::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_history_projection(mut self, history: HistoryProjection) -> Self {
+        self.history = history;
+        self
     }
 
     fn endpoint_url(&self) -> String {
@@ -122,7 +113,7 @@ impl OpenAiCompatRuntime {
     fn request_body(&self, request: &TurnRequest) -> Value {
         match self.config.api_style {
             ApiStyle::Completions => {
-                let messages = history_to_chat_messages(request);
+                let messages = history_to_chat_messages(request, self.history);
                 json!({
                     "model": self.config.model,
                     "messages": messages,
@@ -130,7 +121,7 @@ impl OpenAiCompatRuntime {
                 })
             }
             ApiStyle::Responses => {
-                let (instructions, input) = history_to_responses_input(request);
+                let (instructions, input) = history_to_responses_input(request, self.history);
                 let mut body = json!({
                     "model": self.config.model,
                     "input": input,
@@ -177,24 +168,23 @@ impl AgentRuntime for OpenAiCompatRuntime {
 }
 
 /// Chat Completions message list.
-fn history_to_chat_messages(request: &TurnRequest) -> Vec<Value> {
+fn history_to_chat_messages(request: &TurnRequest, projection: HistoryProjection) -> Vec<Value> {
     let mut messages = Vec::new();
     let preamble = request.prefix.render_preamble();
     if !preamble.trim().is_empty() {
         messages.push(json!({"role": "system", "content": preamble}));
     }
     for item in &request.history {
+        if !projection.include(item) {
+            continue;
+        }
         match item {
             TurnItem::User { content } => {
                 messages.push(json!({"role": "user", "content": content}));
             }
             TurnItem::Assistant { content } => {
-                if !content.is_empty() {
-                    messages.push(json!({"role": "assistant", "content": content}));
-                }
+                messages.push(json!({"role": "assistant", "content": content}));
             }
-            // Sibling reasoning rows: chat-completions has no native slot; skip
-            // (Responses-style re-send is a later product policy).
             TurnItem::Reasoning { .. }
             | TurnItem::ToolCall { .. }
             | TurnItem::ToolResult { .. } => {}
@@ -204,20 +194,23 @@ fn history_to_chat_messages(request: &TurnRequest) -> Vec<Value> {
 }
 
 /// Responses API: optional `instructions` + `input` items.
-fn history_to_responses_input(request: &TurnRequest) -> (String, Vec<Value>) {
+fn history_to_responses_input(
+    request: &TurnRequest,
+    projection: HistoryProjection,
+) -> (String, Vec<Value>) {
     let instructions = request.prefix.render_preamble();
     let mut input = Vec::new();
     for item in &request.history {
+        if !projection.include(item) {
+            continue;
+        }
         match item {
             TurnItem::User { content } => {
                 input.push(json!({"role": "user", "content": content}));
             }
             TurnItem::Assistant { content } => {
-                if !content.is_empty() {
-                    input.push(json!({"role": "assistant", "content": content}));
-                }
+                input.push(json!({"role": "assistant", "content": content}));
             }
-            // Keep history lean for now; encrypted/full reasoning round-trip later.
             TurnItem::Reasoning { .. }
             | TurnItem::ToolCall { .. }
             | TurnItem::ToolResult { .. } => {}

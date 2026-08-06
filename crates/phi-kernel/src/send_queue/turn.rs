@@ -33,7 +33,10 @@ pub(crate) struct GenerationTurn {
     assistant_message_id: MessageId,
     claimed_epoch: Epoch,
     history: Vec<TurnItem>,
+    /// Answer body; recorded as assistant at terminal success.
     buffer: String,
+    /// Open CoT span; flushed as [`TurnItem::Reasoning`] before text/tools/end.
+    reasoning_buffer: String,
     tool_ledger: ToolLedger,
 }
 
@@ -50,6 +53,7 @@ impl GenerationTurn {
             claimed_epoch,
             history,
             buffer: String::new(),
+            reasoning_buffer: String::new(),
             tool_ledger: ToolLedger::new(),
         }
     }
@@ -139,26 +143,49 @@ impl GenerationTurn {
         }
     }
 
+    /// Flush open CoT into a durable reasoning write (if any).
+    fn take_reasoning_write(&mut self) -> Option<TranscriptWrite> {
+        if self.reasoning_buffer.is_empty() {
+            return None;
+        }
+        Some(TranscriptWrite::Reasoning {
+            content: std::mem::take(&mut self.reasoning_buffer),
+        })
+    }
+
+    fn prepend_reasoning_flush(&mut self, mut batch: EffectBatch) -> EffectBatch {
+        if let Some(write) = self.take_reasoning_write() {
+            let mut out = EffectBatch::from_write(write);
+            out.writes.append(&mut batch.writes);
+            out.notices.append(&mut batch.notices);
+            out
+        } else {
+            batch
+        }
+    }
+
     fn on_text_delta(&mut self, text: String) -> (Disposition, EffectBatch) {
         if text.is_empty() {
             return (Disposition::Continue, EffectBatch::empty());
         }
         self.buffer.push_str(&text);
+        let batch = EffectBatch::from_notice(KernelEvent::GenerationTextDelta {
+            session_id: self.session_id().clone(),
+            job_id: self.job.job_id.clone(),
+            assistant_message_id: self.assistant_message_id.clone(),
+            text,
+        });
         (
             Disposition::Continue,
-            EffectBatch::from_notice(KernelEvent::GenerationTextDelta {
-                session_id: self.session_id().clone(),
-                job_id: self.job.job_id.clone(),
-                assistant_message_id: self.assistant_message_id.clone(),
-                text,
-            }),
+            self.prepend_reasoning_flush(batch),
         )
     }
 
-    fn on_reasoning_delta(&self, text: String) -> (Disposition, EffectBatch) {
+    fn on_reasoning_delta(&mut self, text: String) -> (Disposition, EffectBatch) {
         if text.is_empty() {
             return (Disposition::Continue, EffectBatch::empty());
         }
+        self.reasoning_buffer.push_str(&text);
         (
             Disposition::Continue,
             EffectBatch::from_notice(KernelEvent::GenerationReasoningDelta {
@@ -179,13 +206,14 @@ impl GenerationTurn {
     ) -> (Disposition, EffectBatch) {
         self.tool_ledger
             .open(tool_call_id.clone(), tool_name.clone());
+        let batch = EffectBatch::from_write(TranscriptWrite::ToolCall {
+            tool_call_id,
+            tool_name,
+            input,
+        });
         (
             Disposition::Continue,
-            EffectBatch::from_write(TranscriptWrite::ToolCall {
-                tool_call_id,
-                tool_name,
-                input,
-            }),
+            self.prepend_reasoning_flush(batch),
         )
     }
 
@@ -198,25 +226,27 @@ impl GenerationTurn {
         status: ToolResultStatus,
     ) -> (Disposition, EffectBatch) {
         if let Some(tool_name) = self.tool_ledger.close(&tool_call_id) {
+            let batch = EffectBatch::from_write(TranscriptWrite::ToolResult {
+                tool_call_id,
+                tool_name,
+                output,
+                status,
+            });
             (
                 Disposition::Continue,
-                EffectBatch::from_write(TranscriptWrite::ToolResult {
-                    tool_call_id,
-                    tool_name,
-                    output,
-                    status,
-                }),
+                self.prepend_reasoning_flush(batch),
             )
         } else {
+            let batch = EffectBatch::from_notice(KernelEvent::GenerationToolResult {
+                session_id: self.session_id().clone(),
+                job_id: self.job.job_id.clone(),
+                tool_call_id,
+                output,
+                status,
+            });
             (
                 Disposition::Continue,
-                EffectBatch::from_notice(KernelEvent::GenerationToolResult {
-                    session_id: self.session_id().clone(),
-                    job_id: self.job.job_id.clone(),
-                    tool_call_id,
-                    output,
-                    status,
-                }),
+                self.prepend_reasoning_flush(batch),
             )
         }
     }
@@ -225,11 +255,14 @@ impl GenerationTurn {
     /// Opt-in via [`ToolCallSealPolicy`] — the default posture is `LeaveOpen`.
     fn seal_incomplete_effects(&mut self) -> EffectBatch {
         let open = self.tool_ledger.seal_incomplete();
+        let mut batch = EffectBatch::empty();
+        if let Some(write) = self.take_reasoning_write() {
+            batch.push_write(write);
+        }
         if open.is_empty() {
-            return EffectBatch::empty();
+            return batch;
         }
         let output = serde_json::json!({});
-        let mut batch = EffectBatch::empty();
         for (tool_call_id, tool_name) in open {
             batch.push_write(TranscriptWrite::ToolResult {
                 tool_call_id,
@@ -283,13 +316,29 @@ impl GenerationTurn {
         // aborting = cooperative stop mid-stream or cancel-epoch stale after stream.
         // Abort outranks agent terminal / stream error (interrupt, not fault classification).
         let aborting = stopped || is_cancelled();
+        // Flush any open CoT span before seal / terminal (durable sibling row).
+        if !self.reasoning_buffer.is_empty() {
+            let job_id = self.job_id().clone();
+            let batch = self
+                .take_reasoning_write()
+                .map(EffectBatch::from_write)
+                .unwrap_or_else(EffectBatch::empty);
+            if !batch.is_empty() {
+                applier.commit(CommitUnit::Stream {
+                    job_id: &job_id,
+                    batch,
+                })?;
+            }
+        }
         if tool_call_seal.should_seal(aborting) {
             let job_id = self.job_id().clone();
             let batch = self.seal_incomplete_effects();
-            applier.commit(CommitUnit::Stream {
-                job_id: &job_id,
-                batch,
-            })?;
+            if !batch.is_empty() {
+                applier.commit(CommitUnit::Stream {
+                    job_id: &job_id,
+                    batch,
+                })?;
+            }
         }
 
         Ok(if aborting {

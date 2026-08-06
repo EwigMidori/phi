@@ -12,7 +12,8 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 - `AgentPrefix` / `AgentPrefixSource` / `PreambleSection` / `SkillSlug` / `SkillDesc` / `ToolSpec`
 - `ToolCallSealPolicy` / `ToolCallSealSource` (seal; **opt-in** — default posture `LeaveOpen`; no enum default; usually behind materials)
 - **`SendQueue`** / `GenerationJob` / `SessionDirectory` (never call this "mailbox")
-- `Transcript` / `truncate_from` (trait in `transcript/`); reference impl `transcript::memory::InMemoryTranscript` (re-exported)
+- `Transcript` / `truncate_from` / `record_reasoning` (trait in `transcript/`); reference impl `InMemoryTranscript` (re-exported)
+- Reasoning is a durable sibling row (flushed from the generation turn before text/tools/end); live path is still `GenerationReasoningDelta` notices
 
 ## Prefix vs turn (ownership)
 

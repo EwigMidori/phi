@@ -1,43 +1,52 @@
-//! Turn driver: submit user text → [`SessionTurnRunner`] → [`AgentEvent`] → Scrollback.
+//! Turn driver: CLI composition — env → `phi-ext-llm` runtime → [`SessionHost`] → view.
 
 use std::sync::Arc;
 
-use phi_code_core::{AgentEvent, SessionTurnRunner};
+use phi_code_core::{KernelEvent, SessionHost};
 use phi_code_ui::Scrollback;
-use phi_ext_llm::{LlmConfig, OpenAiCompatRuntime};
+use phi_ext_llm::{ApiStyle, LlmConfig, OpenAiCompatRuntime};
 
-/// Bridges product turn runner to the scrollback view.
+/// Result of [`TurnDriver::submit`] — shell clears the prompt only on [`Accepted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// User recorded + job enqueued; prompt may be cleared.
+    Accepted,
+    /// Busy / still streaming / empty input — keep prompt text.
+    Rejected,
+    /// Config or host failure — keep prompt; note via [`TurnDriver::take_last_note`].
+    Failed,
+}
+
+/// Bridges kernel session host to the scrollback view.
 pub struct TurnDriver {
-    runner: Option<SessionTurnRunner>,
-    /// Startup config error (e.g. missing PHI_API_KEY); shown once / on submit.
+    host: Option<SessionHost>,
     config_error: Option<String>,
-    /// Model label for status chrome.
     model_label: String,
-    /// True while the latest turn is still receiving reasoning (CoT) deltas.
-    thinking: bool,
+    /// Last status (errors, approval, pump) — not injected into transcript.
+    last_note: Option<String>,
 }
 
 impl TurnDriver {
-    /// Build from env (`PHI_API_KEY` / `PHI_API_BASE` / `PHI_MODEL`).
+    /// Build from process env (`PHI_*`). Config lives in the product binary.
     #[must_use]
     pub fn from_env() -> Self {
-        match LlmConfig::from_env() {
+        match load_llm_config_from_env() {
             Ok(cfg) => {
                 let model_label =
                     format!("{} ({}) @ {}", cfg.model, cfg.api_style.as_ref(), cfg.api_base);
                 let agent = Arc::new(OpenAiCompatRuntime::new(cfg));
                 Self {
-                    runner: Some(SessionTurnRunner::new(agent)),
+                    host: Some(SessionHost::new(agent)),
                     config_error: None,
                     model_label,
-                    thinking: false,
+                    last_note: None,
                 }
             }
             Err(e) => Self {
-                runner: None,
-                config_error: Some(e.to_string()),
+                host: None,
+                config_error: Some(e),
                 model_label: "unconfigured".into(),
-                thinking: false,
+                last_note: None,
             },
         }
     }
@@ -52,109 +61,203 @@ impl TurnDriver {
         self.config_error.as_deref()
     }
 
+    /// Take the latest status note; clears the slot.
+    pub fn take_last_note(&mut self) -> Option<String> {
+        self.last_note.take()
+    }
+
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        self.runner.as_ref().is_some_and(SessionTurnRunner::is_busy)
+        self.host.as_ref().is_some_and(SessionHost::is_busy)
     }
 
-    /// True while CoT/reasoning is arriving (answer body may still be empty).
-    #[must_use]
-    pub fn is_thinking(&self) -> bool {
-        self.thinking
-    }
-
-    /// Start a turn: push user + begin assistant stream + spawn LLM job.
-    ///
-    /// Returns `false` when busy or empty. Config/API start failures still return
-    /// `true` after writing an error into the assistant stream and finishing it.
-    pub fn submit(&mut self, scrollback: &mut Scrollback, user: &str) -> bool {
+    /// Submit user text via kernel transcript + SendQueue.
+    pub fn submit(&mut self, scrollback: &mut Scrollback, user: &str) -> SubmitOutcome {
         if self.is_busy() || scrollback.is_streaming() {
-            return false;
+            return SubmitOutcome::Rejected;
         }
         let msg = user.trim();
         if msg.is_empty() {
-            return false;
+            return SubmitOutcome::Rejected;
         }
-
-        scrollback.push_user(msg);
-        scrollback.begin_assistant_stream();
-        scrollback.scroll_to_bottom();
-        self.thinking = false;
 
         if let Some(err) = &self.config_error {
-            let err = err.clone();
-            scrollback.append_assistant_delta(&format!(
-                "**Configuration error**\n\n{err}\n\nSet `PHI_API_KEY` / `PHI_API_BASE` / `PHI_MODEL` / `PHI_API_STYLE`.\n"
-            ));
-            scrollback.finish_assistant_stream();
-            return true;
+            self.last_note = Some(format!("config: {err}"));
+            return SubmitOutcome::Failed;
         }
 
-        let Some(runner) = self.runner.as_mut() else {
-            scrollback.append_assistant_delta("**No LLM runtime configured.**\n");
-            scrollback.finish_assistant_stream();
-            return true;
+        let Some(host) = self.host.as_mut() else {
+            self.last_note = Some("no LLM runtime configured".into());
+            return SubmitOutcome::Failed;
         };
 
-        let history = scrollback.items().to_vec();
-        if let Err(e) = runner.start_turn(history) {
-            scrollback.append_assistant_delta(&format!("\n\n**Failed to start turn:** {e}\n"));
-            scrollback.finish_assistant_stream();
-            self.thinking = false;
+        match host.submit_user(msg) {
+            Ok(()) => match host.history() {
+                Ok(items) => {
+                    scrollback.set_durable(items);
+                    scrollback.begin_live();
+                    self.last_note = None;
+                    SubmitOutcome::Accepted
+                }
+                Err(e) => {
+                    self.last_note = Some(format!("history: {e}"));
+                    // User is already recorded; still start live for events.
+                    scrollback.begin_live();
+                    SubmitOutcome::Accepted
+                }
+            },
+            Err(e) => {
+                self.last_note = Some(e);
+                SubmitOutcome::Failed
+            }
         }
-        true
     }
 
-    /// Drain kernel [`AgentEvent`]s into scrollback.
+    /// Drain kernel bus (+ host pump errors) into the scrollback projection.
     ///
-    /// Returns `true` when a stream finished on this tick (clear painter).
-    /// Tool / approval events are ignored until product hosts them (channel already carries them).
+    /// Returns `true` when a generation finished this tick (clear painter stream).
     pub fn tick(&mut self, scrollback: &mut Scrollback) -> bool {
-        let Some(runner) = self.runner.as_mut() else {
+        let Some(host) = self.host.as_mut() else {
             return false;
         };
-        let events = runner.poll();
-        if events.is_empty() {
+        let batch = host.poll_events();
+        let mut finished = false;
+        let had_pump_error = batch.pump_error.is_some();
+        if let Some(err) = batch.pump_error {
+            self.last_note = Some(err);
+            scrollback.end_live();
+            if let Ok(items) = host.history() {
+                scrollback.set_durable(items);
+            }
+            finished = true;
+        }
+        if batch.lagged {
+            // Dropped events — resync durable truth; clear live to avoid ghosts.
+            if let Ok(items) = host.history() {
+                scrollback.set_durable(items);
+            }
+            if !host.is_busy() {
+                scrollback.end_live();
+            }
+            self.last_note = Some("event bus lagged — resynced from transcript".into());
+        }
+        if batch.events.is_empty() && !had_pump_error && !batch.lagged {
             return false;
         }
-        let mut finished = false;
-        for ev in events {
+        for ev in batch.events {
             match ev {
-                AgentEvent::TextDelta { text } => {
-                    if text.is_empty() {
-                        continue;
+                KernelEvent::GenerationStart { .. } => {
+                    if !scrollback.is_streaming() {
+                        scrollback.begin_live();
                     }
-                    self.thinking = false;
-                    scrollback.append_assistant_delta(&text);
-                    scrollback.scroll_to_bottom();
-                }
-                AgentEvent::ReasoningDelta { text } => {
-                    if text.is_empty() {
-                        continue;
+                    // Durable already has the user row from submit.
+                    if let Ok(items) = host.history() {
+                        scrollback.set_durable(items);
                     }
-                    self.thinking = true;
-                    scrollback.append_reasoning_delta(&text);
-                    scrollback.scroll_to_bottom();
                 }
-                AgentEvent::Error { message } => {
-                    self.thinking = false;
-                    scrollback.append_assistant_delta(&format!("\n\n**Error:** {message}\n"));
-                    scrollback.scroll_to_bottom();
+                KernelEvent::GenerationReasoningDelta { text, .. } => {
+                    // Live only — no full history reload per token.
+                    scrollback.live_reasoning_delta(&text);
                 }
-                AgentEvent::Finished { .. } => {
-                    self.thinking = false;
-                    scrollback.finish_assistant_stream();
-                    scrollback.scroll_to_bottom();
+                KernelEvent::GenerationTextDelta { text, .. } => {
+                    // Live only; reload durable once when CoT span ends.
+                    if scrollback.live_text_delta(&text) {
+                        if let Ok(items) = host.history() {
+                            scrollback.set_durable(items);
+                        }
+                    }
+                }
+                KernelEvent::GenerationToolCall { .. }
+                | KernelEvent::GenerationToolResult { .. } => {
+                    if let Ok(items) = host.history() {
+                        scrollback.set_durable(items);
+                    }
+                }
+                KernelEvent::GenerationToolApprovalRequired {
+                    tool_name, input, ..
+                } => {
+                    self.last_note = Some(format!("approval required: {tool_name} {input}"));
+                    if let Ok(items) = host.history() {
+                        scrollback.set_durable(items);
+                    }
+                }
+                KernelEvent::GenerationAgentUnknown { kind, .. } => {
+                    self.last_note = Some(format!("agent unknown event: {kind}"));
+                }
+                KernelEvent::GenerationDone { .. } => {
+                    if let Ok(items) = host.history() {
+                        scrollback.set_durable(items);
+                    }
+                    scrollback.end_live();
                     finished = true;
                 }
-                AgentEvent::ToolCall { .. }
-                | AgentEvent::ToolResult { .. }
-                | AgentEvent::ToolApprovalRequired { .. }
-                | AgentEvent::Unknown { .. } => {
-                    // Forwarded by runner; UI host for tools/approvals lands later.
+                KernelEvent::GenerationStopped { partial, .. } => {
+                    if let Ok(items) = host.history() {
+                        scrollback.set_durable(items);
+                    }
+                    scrollback.end_live();
+                    if !partial.is_empty() {
+                        self.last_note =
+                            Some("stopped (partial discarded from durable write)".into());
+                    }
+                    finished = true;
+                }
+                KernelEvent::GenerationError { message, .. } => {
+                    if let Ok(items) = host.history() {
+                        scrollback.set_durable(items);
+                    }
+                    scrollback.end_live();
+                    self.last_note = Some(format!("error: {message}"));
+                    finished = true;
                 }
             }
         }
         finished
     }
+}
+
+/// Product-owned env mapping (not in `phi-ext-llm`).
+fn load_llm_config_from_env() -> Result<LlmConfig, String> {
+    let api_key = env_trim("PHI_API_KEY");
+    if api_key.is_empty() {
+        return Err("set PHI_API_KEY to call a real model".into());
+    }
+    let api_base = env_trim("PHI_API_BASE");
+    let api_base = if api_base.is_empty() {
+        "https://api.openai.com/v1".into()
+    } else {
+        api_base.trim_end_matches('/').to_owned()
+    };
+    let model = env_trim("PHI_MODEL");
+    let model = if model.is_empty() {
+        "gpt-4o-mini".into()
+    } else {
+        model
+    };
+    let style_raw = env_trim("PHI_API_STYLE");
+    let api_style = if style_raw.is_empty() {
+        ApiStyle::default()
+    } else {
+        style_raw
+            .parse::<ApiStyle>()
+            .map_err(|_| {
+                format!(
+                    "invalid PHI_API_STYLE `{style_raw}` (use `responses` or `completions`)"
+                )
+            })?
+    };
+    Ok(LlmConfig {
+        api_base,
+        api_key,
+        model,
+        api_style,
+    })
+}
+
+fn env_trim(key: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_default()
 }

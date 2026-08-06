@@ -14,7 +14,7 @@ use xai_ratatui_textarea::ClipboardProvider;
 
 use crate::prompt_pane::PromptPane;
 use crate::scrollback_pane::ScrollbackPane;
-use crate::turn_driver::TurnDriver;
+use crate::turn_driver::{SubmitOutcome, TurnDriver};
 
 /// Second Ctrl+C must arrive within this window to quit.
 const QUIT_CTRL_C_WINDOW: Duration = Duration::from_millis(500);
@@ -72,6 +72,9 @@ impl AgentShell {
         if self.driver.tick(self.scrollback.scrollback_mut()) {
             self.scrollback.clear_stream_renderer();
         }
+        if let Some(note) = self.driver.take_last_note() {
+            self.status_note = note;
+        }
         self.scrollback.tick();
     }
 
@@ -90,7 +93,7 @@ impl AgentShell {
         } else {
             "single"
         };
-        let stream = if self.driver.is_thinking() {
+        let stream = if self.scrollback.scrollback().is_thinking() {
             "thinking"
         } else if self.driver.is_busy() || self.scrollback.scrollback().is_streaming() {
             "streaming"
@@ -220,13 +223,24 @@ impl AgentShell {
                     self.prompt.insert_newline();
                 } else {
                     let msg = self.prompt.submit_candidate();
-                    if self
+                    match self
                         .driver
                         .submit(self.scrollback.scrollback_mut(), &msg)
                     {
-                        self.prompt.clear();
-                        self.scrollback.clear_stream_renderer();
-                        self.scrollback.clear_selection();
+                        SubmitOutcome::Accepted => {
+                            self.prompt.clear();
+                            self.scrollback.clear_stream_renderer();
+                            self.scrollback.clear_selection();
+                        }
+                        SubmitOutcome::Rejected => {
+                            // Keep prompt text (busy / empty).
+                        }
+                        SubmitOutcome::Failed => {
+                            // Keep prompt text; surface note only.
+                        }
+                    }
+                    if let Some(n) = self.driver.take_last_note() {
+                        self.notify(n);
                     }
                 }
             }

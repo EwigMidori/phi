@@ -5,17 +5,17 @@
 //!
 //! | Area | Surface |
 //! |------|---------|
-//! | Config | [`LlmConfig`], [`ApiStyle`], [`LlmConfigError`] |
+//! | Config | [`LlmConfig`], [`ApiStyle`], [`HistoryProjection`] |
 //! | Runtime | [`OpenAiCompatRuntime`] (`responses` / `completions`) |
 //!
-//! **Not in this crate:** product turn orchestration (`SessionTurnRunner`),
+//! **Not in this crate:** product turn orchestration (`SessionHost` / SendQueue),
 //! TUI, tool hosts, permission engines. Kernel stays free of provider loops.
 
 #![forbid(unsafe_code)]
 
 mod openai_compat;
 
-pub use openai_compat::{ApiStyle, LlmConfig, LlmConfigError, OpenAiCompatRuntime};
+pub use openai_compat::{ApiStyle, HistoryProjection, LlmConfig, OpenAiCompatRuntime};
 
 pub const EXT_LLM_NAME: &str = "phi-ext-llm";
 

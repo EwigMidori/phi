@@ -14,9 +14,10 @@ Does **not** own agent runtime / product orchestration (`phi-code-core`).
 
 ## Public surface
 
-Crate root only (`pub use`). Implementation modules are private — do not depend on
-`phi_code_ui::scrollback::…` paths. Kernel types (`TurnItem`, …) come from
-`phi-kernel`, not re-exported here.
+Crate root only (`pub use`). Implementation modules are private.
+
+`Scrollback` is a **view**: durable rows from transcript (`set_durable`) + live
+overlay from bus deltas. It is not conversation write authority.
 
 ## Forbidden
 

@@ -2,31 +2,32 @@
 
 ## Role
 
-phi-code product runtime: **turn orchestration** only. Depends on `phi-kernel`.
-LLM wire adapters are **`phi-ext-llm`** (framework ext), not this crate.
+phi-code product runtime: **session host** over kernel generation.
+Depends on `phi-kernel` only. LLM wire adapters are **`phi-ext-llm`**.
 
 ## Boundaries
 
-- **SoT for conversation content:** kernel `TurnItem`
-- **Agent contract:** `AgentRuntime` / `AgentEvent` only (no ad-hoc text stream API)
+- **Durable SoT:** kernel `Transcript` (via `SessionHost`)
+- **Generation:** kernel `SendQueue` + `AgentPorts` (no custom mpsc/event enums)
+- **Observe:** `KernelEvent` bus → product view
 - **Provider HTTP/SSE:** `phi-ext-llm` only
 - **UI:** `phi-code-ui` only
 
-## Step-1 product pieces
-
-- `SessionTurnRunner` — non-blocking poll of kernel `AgentEvent` for CLI tick
-- Composition root (CLI) injects `Arc<dyn AgentRuntime>` from `phi-ext-llm`
-
 ## Public surface
 
-Crate root only. Implementation modules (`turn_runner`) are private.
-Kernel re-exports only types on this crate’s API (`AgentEvent`, `AgentRuntime`,
-`SessionId`, `TurnItem`).
+- `SessionHost` — `submit_user` / `poll_events` → `PollBatch` / `history` → `Result` / `is_busy`
+- `PollBatch` — `events`, `lagged` (must resync history), `pump_error` (host-private, not a bus forge)
+- Re-exports: `KernelEvent`, `TurnItem`, `SessionId`, …
+
+## Pump rules
+
+- Single worker via `pump_running` CAS + exit re-check (no stuck pending jobs)
+- Never forge `KernelEvent` / synthetic `JobId` on pump failure
 
 ## Forbidden
 
-- Parallel “chat message” types that duplicate `TurnItem`
-- Parallel progress/event enums that duplicate `AgentEvent` (e.g. `TurnProgress`)
-- Owning provider wire parsers / OpenAI-compat SSE
-- Owning ratatui / scrollback modules
+- Parallel progress enums (`TurnProgress`)
+- Custom `agent.run` spawn loops that bypass `SendQueue`
+- Owning provider wire parsers
+- Writing errors into fake assistant transcript rows
 - `da-*` imports

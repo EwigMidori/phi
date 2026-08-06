@@ -17,6 +17,7 @@ use super::{RecordResult, Transcript, TruncateResult};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StoredRole {
     User,
+    Reasoning,
     Assistant,
     ToolCall,
     ToolResult,
@@ -41,7 +42,7 @@ struct MemoryInner {
 
 /// In-memory transcript authority (reference implementation of [`Transcript`]).
 ///
-/// Baseline store: user / assistant / tool rows only.
+/// Baseline store: user / reasoning / assistant / tool rows.
 ///
 /// [`Clone`] shares the in-memory store (`Arc`); it does **not** snapshot-fork
 /// sessions or message history.
@@ -175,6 +176,9 @@ impl Transcript for InMemoryTranscript {
                 StoredRole::User => TurnItem::User {
                     content: m.content.clone(),
                 },
+                StoredRole::Reasoning => TurnItem::Reasoning {
+                    content: m.content.clone(),
+                },
                 StoredRole::Assistant => TurnItem::Assistant {
                     content: m.content.clone(),
                 },
@@ -262,6 +266,17 @@ impl Transcript for InMemoryTranscript {
         content: &str,
     ) -> Result<RecordResult> {
         self.try_append_assistant(session_id, assistant_message_id, content)
+    }
+
+    fn record_reasoning(&self, session_id: &SessionId, content: &str) -> Result<RecordResult> {
+        self.append_live(
+            session_id,
+            StoredMessage {
+                id: MessageId::generate(),
+                role: StoredRole::Reasoning,
+                content: content.to_owned(),
+            },
+        )
     }
 
     fn record_tool_call(

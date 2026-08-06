@@ -52,8 +52,8 @@ pub trait Transcript: Send + Sync {
     /// assistant writes (`wrote: false`).
     fn version(&self) -> Result<u64>;
 
-    /// Load the full turn history in transcript order — user / assistant / tool
-    /// call / tool result interleaved. One ordered sequence; no reassembly.
+    /// Load the full turn history in transcript order — user / reasoning /
+    /// assistant / tool call / tool result interleaved. One ordered sequence.
     fn load_turn_history(&self, session_id: &SessionId) -> Result<Vec<TurnItem>>;
 
     /// Append a user message. Requires a live session.
@@ -80,6 +80,12 @@ pub trait Transcript: Send + Sync {
         assistant_message_id: &MessageId,
         content: &str,
     ) -> Result<RecordResult>;
+
+    /// Append a reasoning / CoT sibling row ([`TurnItem::Reasoning`]).
+    ///
+    /// Requires a live session. Order is transcript order: typically before the
+    /// answering assistant row, possibly interleaved with tool rows.
+    fn record_reasoning(&self, session_id: &SessionId, content: &str) -> Result<RecordResult>;
 
     /// Append a tool-call row. Requires a live session.
     fn record_tool_call(
