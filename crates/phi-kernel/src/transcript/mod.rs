@@ -5,8 +5,8 @@
 //!
 //! | Module | Role |
 //! |--------|------|
-//! | (this) | [`Transcript`] trait + shared result types |
-//! | [`memory`] | [`InMemoryTranscript`] — tests / scaffold only |
+//! | (this) | [`Transcript`] trait + [`TranscriptRow`] + result types |
+//! | [`memory`] | [`InMemoryTranscript`] — stores [`TranscriptRow`] directly |
 
 mod memory;
 
@@ -34,6 +34,17 @@ pub struct TruncateResult {
     pub removed_count: usize,
 }
 
+/// One durable transcript row: stable [`MessageId`] + model material [`TurnItem`].
+///
+/// **Authority read shape** for products (document snapshot, fork copy).
+/// [`TurnRequest::history`] stays [`Vec<TurnItem>`] — strip with
+/// [`TranscriptRow::item`] / [`Transcript::load_turn_history`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct TranscriptRow {
+    pub id: MessageId,
+    pub item: TurnItem,
+}
+
 /// Write-authority port for session dialogue history.
 ///
 /// The kernel reads and writes session dialogue through this trait and does not
@@ -52,9 +63,21 @@ pub trait Transcript: Send + Sync {
     /// assistant writes (`wrote: false`).
     fn version(&self) -> Result<u64>;
 
-    /// Load the full turn history in transcript order — user / reasoning /
-    /// assistant / tool call / tool result interleaved. One ordered sequence.
-    fn load_turn_history(&self, session_id: &SessionId) -> Result<Vec<TurnItem>>;
+    /// Load durable rows in transcript order (id + [`TurnItem`]).
+    ///
+    /// Primary read API for products that need stable message identities.
+    fn load_rows(&self, session_id: &SessionId) -> Result<Vec<TranscriptRow>>;
+
+    /// Model-facing history: same order as [`Self::load_rows`], items only.
+    ///
+    /// Default: map [`TranscriptRow::item`]. Implementors may override.
+    fn load_turn_history(&self, session_id: &SessionId) -> Result<Vec<TurnItem>> {
+        Ok(self
+            .load_rows(session_id)?
+            .into_iter()
+            .map(|r| r.item)
+            .collect())
+    }
 
     /// Append a user message. Requires a live session.
     fn record_user(&self, session_id: &SessionId, text: &str) -> Result<RecordResult>;

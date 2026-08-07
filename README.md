@@ -1,6 +1,6 @@
 # phi
 
-Open-source **agent kernel** (+ future extensions). Daan (`crates/da-*`, `web/`) is a **policy + projection** consumer, not this project’s OSS identity.
+Open-source **agent kernel** (+ future extensions). Daan (`web/`, future product composition) is a **policy + projection** consumer, not this project’s OSS identity. The former parallel stack lives in monorepo [`archive/da-stack/`](../archive/da-stack/) (not a dependency of phi).
 
 | | |
 |--|--|
@@ -46,5 +46,6 @@ cargo run -p phi-code-cli
 
 ## Relationship to Daan monorepo
 
-- Standalone Cargo workspace (not a member of the root `Cargo.toml`).
-- No dependency on `da-*`. Daan may later adapt to these ports.
+- Standalone Cargo workspace under `open-source/` (monorepo root has **no** active da Cargo workspace).
+- No dependency on archived `da-*` (`../archive/da-stack/`).
+- **Direction:** Daan product backend will compose on these ports; extend via `phi-ext-*` when needed.

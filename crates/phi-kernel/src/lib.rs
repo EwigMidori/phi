@@ -49,7 +49,9 @@ pub use error::{KernelError, Result};
 pub use events::{EventBus, KernelEvent};
 pub use ids::{JobId, MessageId, SessionId};
 pub use send_queue::{GenerationJob, SendQueue, SessionDirectory};
-pub use transcript::{InMemoryTranscript, RecordResult, Transcript, TruncateResult};
+pub use transcript::{
+    InMemoryTranscript, RecordResult, Transcript, TranscriptRow, TruncateResult,
+};
 
 pub const KERNEL_NAME: &str = "phi-kernel";
 
@@ -157,6 +159,27 @@ mod integration {
             .collect();
         assert_eq!(assistants, ["reply", "reply"]);
         assert!(store.version().unwrap() >= 4);
+    }
+
+    #[test]
+    fn load_rows_preserves_message_ids() {
+        let store = InMemoryTranscript::new();
+        let sid = SessionId::generate();
+        store.ensure_live(&sid).unwrap();
+        let u = store.record_user(&sid, "hello").unwrap();
+        let aid = MessageId::generate();
+        store.record_assistant(&sid, &aid, "world").unwrap();
+
+        let rows = store.load_rows(&sid).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, u.message_id);
+        assert!(matches!(&rows[0].item, TurnItem::User { content } if content == "hello"));
+        assert_eq!(rows[1].id, aid);
+        assert!(matches!(&rows[1].item, TurnItem::Assistant { content } if content == "world"));
+
+        let history = store.load_turn_history(&sid).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(matches!(&history[0], TurnItem::User { .. }));
     }
 
     #[tokio::test]

@@ -17,6 +17,8 @@ First package of **[phi](../../README.md)**: minimal agent **mechanisms**.
 
 **Turn history:** `TurnRequest.history` is the full interleaved sequence (user / assistant / tool rows in transcript order) — one ordered `Vec<TurnItem>`, no separate dialogue / tool projections to reassemble. Tool `input` / `output` stay opaque to the kernel.
 
+**Transcript rows:** durable read is [`Transcript::load_rows`] → `TranscriptRow { id, item }` (stable [`MessageId`] + [`TurnItem`]). [`Transcript::load_turn_history`] is the model-facing strip (items only).
+
 ## Boundary: tools / approval / prefix (kernel vs adapter)
 
 | Concern | Owner |

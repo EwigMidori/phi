@@ -1,7 +1,7 @@
 //! Process-local [`Transcript`](super::Transcript) for tests and scaffold consumers.
 //!
-//! **Not** a product store schema. Tool rows are stored as ad-hoc JSON in `content`
-//! (private to this module) — production document authority uses typed metadata.
+//! Internal rows are the public authority shape [`TranscriptRow`] — no parallel
+//! `StoredMessage` / role enum. Not a product SQLite schema.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,27 +12,12 @@ use crate::agent::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
 use crate::error::{KernelError, Result};
 use crate::ids::{MessageId, SessionId};
 
-use super::{RecordResult, Transcript, TruncateResult};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StoredRole {
-    User,
-    Reasoning,
-    Assistant,
-    ToolCall,
-    ToolResult,
-}
-
-#[derive(Clone, Debug)]
-struct StoredMessage {
-    id: MessageId,
-    role: StoredRole,
-    content: String,
-}
+use super::{RecordResult, Transcript, TranscriptRow, TruncateResult};
 
 struct SessionState {
     live: bool,
-    messages: Vec<StoredMessage>,
+    /// Durable rows — same type products load via [`Transcript::load_rows`].
+    messages: Vec<TranscriptRow>,
 }
 
 struct MemoryInner {
@@ -42,7 +27,7 @@ struct MemoryInner {
 
 /// In-memory transcript authority (reference implementation of [`Transcript`]).
 ///
-/// Baseline store: user / reasoning / assistant / tool rows.
+/// Baseline store: [`TranscriptRow`] sequence per session.
 ///
 /// [`Clone`] shares the in-memory store (`Arc`); it does **not** snapshot-fork
 /// sessions or message history.
@@ -79,8 +64,8 @@ impl InMemoryTranscript {
         Ok(())
     }
 
-    /// Require a live session; on success append `message` and bump version.
-    fn append_live(&self, session_id: &SessionId, message: StoredMessage) -> Result<RecordResult> {
+    /// Require a live session; on success append `row` and bump version.
+    fn append_live(&self, session_id: &SessionId, row: TranscriptRow) -> Result<RecordResult> {
         let mut g = self.lock();
         let Some(s) = g.sessions.get_mut(session_id.as_str()) else {
             return Err(KernelError::SessionNotFound(session_id.to_string()));
@@ -88,8 +73,8 @@ impl InMemoryTranscript {
         if !s.live {
             return Err(KernelError::SessionNotLive(session_id.to_string()));
         }
-        let message_id = message.id.clone();
-        s.messages.push(message);
+        let message_id = row.id.clone();
+        s.messages.push(row);
         g.version = g.version.saturating_add(1);
         Ok(RecordResult {
             message_id,
@@ -120,10 +105,11 @@ impl InMemoryTranscript {
                 wrote: false,
             });
         }
-        s.messages.push(StoredMessage {
+        s.messages.push(TranscriptRow {
             id: assistant_message_id.clone(),
-            role: StoredRole::Assistant,
-            content: content.to_owned(),
+            item: TurnItem::Assistant {
+                content: content.to_owned(),
+            },
         });
         g.version = g.version.saturating_add(1);
         Ok(RecordResult {
@@ -165,66 +151,22 @@ impl Transcript for InMemoryTranscript {
         Ok(self.lock().version)
     }
 
-    fn load_turn_history(&self, session_id: &SessionId) -> Result<Vec<TurnItem>> {
+    fn load_rows(&self, session_id: &SessionId) -> Result<Vec<TranscriptRow>> {
         let g = self.lock();
         let Some(s) = g.sessions.get(session_id.as_str()) else {
             return Err(KernelError::SessionNotFound(session_id.to_string()));
         };
-        let mut history = Vec::with_capacity(s.messages.len());
-        for m in &s.messages {
-            let item = match m.role {
-                StoredRole::User => TurnItem::User {
-                    content: m.content.clone(),
-                },
-                StoredRole::Reasoning => TurnItem::Reasoning {
-                    content: m.content.clone(),
-                },
-                StoredRole::Assistant => TurnItem::Assistant {
-                    content: m.content.clone(),
-                },
-                StoredRole::ToolCall => {
-                    // Ad-hoc blob written by `record_tool_call` — same-module invariant.
-                    let row: Value =
-                        serde_json::from_str(&m.content).expect("tool-call row is stored JSON");
-                    TurnItem::ToolCall {
-                        tool_call_id: ToolCallId::new(
-                            row["toolCallId"].as_str().expect("stored call carries toolCallId"),
-                        ),
-                        tool_name: ToolName::new(
-                            row["toolName"].as_str().expect("stored call carries toolName"),
-                        ),
-                        input: row["input"].clone(),
-                    }
-                }
-                StoredRole::ToolResult => {
-                    // Ad-hoc blob written by `record_tool_result` — same-module invariant.
-                    let row: Value =
-                        serde_json::from_str(&m.content).expect("tool-result row is stored JSON");
-                    TurnItem::ToolResult {
-                        tool_call_id: ToolCallId::new(
-                            row["toolCallId"].as_str().expect("stored result carries toolCallId"),
-                        ),
-                        tool_name: ToolName::new(
-                            row["toolName"].as_str().expect("stored result carries toolName"),
-                        ),
-                        output: row["output"].clone(),
-                        status: serde_json::from_value(row["status"].clone())
-                            .expect("stored result carries a parseable status"),
-                    }
-                }
-            };
-            history.push(item);
-        }
-        Ok(history)
+        Ok(s.messages.clone())
     }
 
     fn record_user(&self, session_id: &SessionId, text: &str) -> Result<RecordResult> {
         self.append_live(
             session_id,
-            StoredMessage {
+            TranscriptRow {
                 id: MessageId::generate(),
-                role: StoredRole::User,
-                content: text.to_owned(),
+                item: TurnItem::User {
+                    content: text.to_owned(),
+                },
             },
         )
     }
@@ -271,10 +213,11 @@ impl Transcript for InMemoryTranscript {
     fn record_reasoning(&self, session_id: &SessionId, content: &str) -> Result<RecordResult> {
         self.append_live(
             session_id,
-            StoredMessage {
+            TranscriptRow {
                 id: MessageId::generate(),
-                role: StoredRole::Reasoning,
-                content: content.to_owned(),
+                item: TurnItem::Reasoning {
+                    content: content.to_owned(),
+                },
             },
         )
     }
@@ -286,19 +229,15 @@ impl Transcript for InMemoryTranscript {
         tool_name: &ToolName,
         input: &Value,
     ) -> Result<RecordResult> {
-        // Ad-hoc JSON blob for this reference store only — not a cross-system schema.
-        let content = serde_json::json!({
-            "toolCallId": tool_call_id.as_str(),
-            "toolName": tool_name.as_str(),
-            "input": input,
-        })
-        .to_string();
         self.append_live(
             session_id,
-            StoredMessage {
+            TranscriptRow {
                 id: MessageId::generate(),
-                role: StoredRole::ToolCall,
-                content,
+                item: TurnItem::ToolCall {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    input: input.clone(),
+                },
             },
         )
     }
@@ -311,19 +250,16 @@ impl Transcript for InMemoryTranscript {
         output: &Value,
         status: ToolResultStatus,
     ) -> Result<RecordResult> {
-        let content = serde_json::json!({
-            "toolCallId": tool_call_id.as_str(),
-            "toolName": tool_name.as_str(),
-            "output": output,
-            "status": status.as_ref(),
-        })
-        .to_string();
         self.append_live(
             session_id,
-            StoredMessage {
+            TranscriptRow {
                 id: MessageId::generate(),
-                role: StoredRole::ToolResult,
-                content,
+                item: TurnItem::ToolResult {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    output: output.clone(),
+                    status,
+                },
             },
         )
     }

@@ -22,6 +22,7 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 |-------|--------|--------|
 | **Prefix** | `preamble` (`Vec<PreambleSection>`), `tools`, `skill_index` (`BTreeMap<SkillSlug, SkillDesc>`) | Session/agent **binding** via `AgentPrefixSource`; `TurnRequest.prefix` is a **read-only snapshot** |
 | **Turn** | `history` (`Vec<TurnItem>`), `cancel`, `job_id`, `tool_call_seal` (snapshot) | This generation; assembled by `TurnMaterials::prepare` |
+| **Transcript read** | `load_rows` → `TranscriptRow { id, item }`; `load_turn_history` = items only | Durable authority vs model material |
 | **Pump inject** | `AgentPorts` { agent, materials } | Directory/queue plumbing — not a domain aggregate |
 
 - `AgentPrefix::render_preamble()` → `<section-name>content</section-name>` per section, joined by `\n`
