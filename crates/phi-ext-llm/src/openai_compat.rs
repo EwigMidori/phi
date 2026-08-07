@@ -12,8 +12,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use phi_kernel::{
-    AgentEvent, AgentEventStream, AgentPrefix, AgentRuntime, TurnCancel, TurnItem, TurnRequest,
-    Usage,
+    AgentEvent, AgentEventStream, AgentPrefix, AgentRuntime, JobId, OneshotText, SessionId,
+    ToolCallSealPolicy, TurnCancel, TurnItem, TurnRequest, Usage,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -346,6 +346,40 @@ impl AgentRuntime for OpenAiCompatRuntime {
             self.config.api_style,
         );
         Ok(reader.into_event_stream())
+    }
+}
+
+/// Same client as [`AgentRuntime`]: bare complete with **empty** product prefix / tools.
+#[async_trait]
+impl OneshotText for OpenAiCompatRuntime {
+    async fn complete(&self, input: &str) -> Result<String, String> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err("oneshot input empty".into());
+        }
+        // Explicit bare turn: empty AgentPrefix — never product binding materials.
+        let request = TurnRequest {
+            session_id: SessionId::generate(),
+            job_id: JobId::generate(),
+            history: vec![TurnItem::User {
+                content: input.to_owned(),
+            }],
+            prefix: AgentPrefix::baseline_chat(Vec::new()),
+            tool_call_seal: ToolCallSealPolicy::LeaveOpen,
+            cancel: TurnCancel::new(),
+        };
+        let mut stream = AgentRuntime::run(self, request).await?;
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(AgentEvent::TextDelta { text: t }) => text.push_str(&t),
+                Ok(AgentEvent::Finished { .. }) => break,
+                Ok(AgentEvent::Error { message }) => return Err(message),
+                Err(message) => return Err(message),
+                Ok(_) => {}
+            }
+        }
+        Ok(text)
     }
 }
 

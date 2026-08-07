@@ -41,8 +41,8 @@ mod transcript;
 
 pub use agent::{
     AgentEvent, AgentEventStream, AgentPorts, AgentPrefix, AgentPrefixSource, AgentRuntime,
-    EmptyAgentPrefix, FixedAgentPrefix, FixedToolCallSeal, PreambleSection, SkillDesc, SkillSlug,
-    SourcesTurnMaterials, ToolCallId, ToolCallSealPolicy, ToolCallSealSource, ToolName,
+    EmptyAgentPrefix, FixedAgentPrefix, FixedToolCallSeal, OneshotText, PreambleSection, SkillDesc,
+    SkillSlug, SourcesTurnMaterials, ToolCallId, ToolCallSealPolicy, ToolCallSealSource, ToolName,
     ToolResultStatus, ToolSpec, TurnCancel, TurnItem, TurnMaterials, TurnRequest, Usage,
 };
 pub use error::{KernelError, Result};

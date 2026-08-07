@@ -373,6 +373,22 @@ pub trait AgentRuntime: Send + Sync {
     async fn run(&self, request: TurnRequest) -> Result<AgentEventStream, String>;
 }
 
+// ── Oneshot text complete (mechanism, not product labeling policy) ─────────
+
+/// Bare text completion: **string in → string out**.
+///
+/// - **No** product binding prefix, tools, or session transcript side effects.
+/// - **Not** a substitute for [`AgentRuntime`] dialogue turns.
+/// - Callers own any prompt policy (e.g. product session-name materials).
+///
+/// Implementations typically share one LLM client object with [`AgentRuntime`]
+/// (same wire stack, different message — not a second HTTP client).
+#[async_trait]
+pub trait OneshotText: Send + Sync {
+    /// Complete `input` and return the model text (concatenated deltas).
+    async fn complete(&self, input: &str) -> Result<String, String>;
+}
+
 // ── Agent prefix source (binding / composition, not Turn) ──────────────────
 
 /// Resolves model-prefix material for a session.

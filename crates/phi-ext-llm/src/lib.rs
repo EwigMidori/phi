@@ -7,10 +7,10 @@
 //! |------|---------|
 //! | Config | [`LlmConfig`], [`ApiStyle`], [`ModelId`], [`ApiBase`], [`ApiKey`] |
 //! | Strategy port | [`HistoryProjector`], default [`PassThrough`] |
-//! | Runtime | [`OpenAiCompatRuntime`] |
+//! | Runtime | [`OpenAiCompatRuntime`] — [`phi_kernel::AgentRuntime`] + [`phi_kernel::OneshotText`] |
 //!
 //! Context policy is **product-owned** (inject a projector). This crate is wire
-//! mechanism only.
+//! mechanism only. Oneshot uses the **same** client with an empty product prefix.
 //!
 //! **Not in this crate:** product turn orchestration (`SessionHost` / SendQueue),
 //! TUI, tool hosts, permission engines. Kernel stays free of provider loops.
