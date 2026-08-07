@@ -83,6 +83,26 @@ impl InMemoryTranscript {
         })
     }
 
+    /// Store-adapter rehydrate: replace one session's durable rows, preserving
+    /// message ids. Does **not** advance [`Transcript::version`] (product
+    /// document clock is separate). Overwrites any prior state for `session_id`.
+    pub fn rehydrate_session(
+        &self,
+        session_id: &SessionId,
+        rows: Vec<TranscriptRow>,
+        live: bool,
+    ) -> Result<()> {
+        let mut g = self.lock();
+        g.sessions.insert(
+            session_id.as_str().to_owned(),
+            SessionState {
+                live,
+                messages: rows,
+            },
+        );
+        Ok(())
+    }
+
     /// Soft write path for assistant: skip when missing / not live (`wrote: false`).
     fn try_append_assistant(
         &self,
