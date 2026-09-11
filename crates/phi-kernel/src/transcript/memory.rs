@@ -12,14 +12,21 @@ use crate::agent::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
 use crate::error::{KernelError, Result};
 use crate::ids::{MessageId, SessionId};
 
-use super::{RecordResult, Transcript, TranscriptRow, TruncateResult};
+use super::{
+    GenerationCommit, GenerationRecord, RecordResult, Transcript, TranscriptRow, TranscriptSession,
+    TruncateResult,
+};
+use crate::ToolArguments;
 
+#[derive(Clone)]
 struct SessionState {
     live: bool,
     /// Durable rows — same type products load via [`Transcript::load_rows`].
     messages: Vec<TranscriptRow>,
+    generations: Vec<GenerationRecord>,
 }
 
+#[derive(Clone)]
 struct MemoryInner {
     version: u64,
     sessions: HashMap<String, SessionState>,
@@ -37,6 +44,40 @@ pub struct InMemoryTranscript {
 }
 
 impl InMemoryTranscript {
+    #[must_use]
+    pub fn detached(&self) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(self.lock().clone())),
+        }
+    }
+    pub fn session_snapshot(&self, session_id: &SessionId) -> Result<TranscriptSession> {
+        let inner = self.lock();
+        let session = inner
+            .sessions
+            .get(session_id.as_str())
+            .ok_or_else(|| KernelError::SessionNotFound(session_id.to_string()))?;
+        Ok(TranscriptSession {
+            rows: session.messages.clone(),
+            live: session.live,
+            generations: session.generations.clone(),
+        })
+    }
+    pub fn replace_session(
+        &self,
+        session_id: &SessionId,
+        snapshot: TranscriptSession,
+    ) -> Result<()> {
+        snapshot.validate()?;
+        self.lock().sessions.insert(
+            session_id.to_string(),
+            SessionState {
+                live: snapshot.live,
+                messages: snapshot.rows,
+                generations: snapshot.generations,
+            },
+        );
+        Ok(())
+    }
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -98,6 +139,7 @@ impl InMemoryTranscript {
             SessionState {
                 live,
                 messages: rows,
+                generations: Vec::new(),
             },
         );
         Ok(())
@@ -126,6 +168,7 @@ impl InMemoryTranscript {
             });
         }
         s.messages.push(TranscriptRow {
+            generation: None,
             id: assistant_message_id.clone(),
             item: TurnItem::Assistant {
                 content: content.to_owned(),
@@ -147,6 +190,26 @@ impl Default for InMemoryTranscript {
 }
 
 impl Transcript for InMemoryTranscript {
+    fn session_snapshot(&self, session_id: &SessionId) -> Result<TranscriptSession> {
+        InMemoryTranscript::session_snapshot(self, session_id)
+    }
+    fn commit_generation(&self, commit: &GenerationCommit) -> Result<u64> {
+        let mut inner = self.lock();
+        let session = inner
+            .sessions
+            .get_mut(commit.job().session_id.as_str())
+            .ok_or_else(|| KernelError::SessionNotFound(commit.job().session_id.to_string()))?;
+        let mut snapshot = TranscriptSession {
+            rows: session.messages.clone(),
+            live: session.live,
+            generations: session.generations.clone(),
+        };
+        snapshot.apply(commit)?;
+        session.messages = snapshot.rows;
+        session.generations = snapshot.generations;
+        inner.version = inner.version.saturating_add(1);
+        Ok(inner.version)
+    }
     fn ensure_live(&self, session_id: &SessionId) -> Result<()> {
         let mut g = self.lock();
         g.sessions
@@ -154,6 +217,7 @@ impl Transcript for InMemoryTranscript {
             .or_insert_with(|| SessionState {
                 live: true,
                 messages: Vec::new(),
+                generations: Vec::new(),
             })
             .live = true;
         Ok(())
@@ -172,11 +236,10 @@ impl Transcript for InMemoryTranscript {
     }
 
     fn load_rows(&self, session_id: &SessionId) -> Result<Vec<TranscriptRow>> {
-        let g = self.lock();
-        let Some(s) = g.sessions.get(session_id.as_str()) else {
-            return Err(KernelError::SessionNotFound(session_id.to_string()));
-        };
-        Ok(s.messages.clone())
+        Ok(self.session_snapshot(session_id)?.ordered_rows())
+    }
+    fn load_turn_history(&self, session_id: &SessionId) -> Result<Vec<TurnItem>> {
+        self.session_snapshot(session_id)?.history()
     }
 
     fn record_user(
@@ -187,6 +250,7 @@ impl Transcript for InMemoryTranscript {
         self.append_live(
             session_id,
             TranscriptRow {
+                generation: None,
                 id: MessageId::generate(),
                 item: TurnItem::User {
                     content: content.clone(),
@@ -207,8 +271,13 @@ impl Transcript for InMemoryTranscript {
         if !s.live {
             return Err(KernelError::SessionNotLive(session_id.to_string()));
         }
-        let idx = s
-            .messages
+        let mut ordered = TranscriptSession {
+            rows: s.messages.clone(),
+            live: s.live,
+            generations: s.generations.clone(),
+        }
+        .ordered_rows();
+        let idx = ordered
             .iter()
             .position(|m| &m.id == from_message_id)
             .ok_or_else(|| {
@@ -216,8 +285,14 @@ impl Transcript for InMemoryTranscript {
                     "message not found in session: {from_message_id}"
                 ))
             })?;
-        let removed_count = s.messages.len() - idx;
-        s.messages.truncate(idx);
+        let removed_count = ordered.len() - idx;
+        ordered.truncate(idx);
+        s.messages = ordered;
+        s.generations.retain(|record| {
+            s.messages
+                .iter()
+                .any(|row| row.id == record.job.user_message_id)
+        });
         g.version = g.version.saturating_add(1);
         Ok(TruncateResult {
             version: g.version,
@@ -238,6 +313,7 @@ impl Transcript for InMemoryTranscript {
         self.append_live(
             session_id,
             TranscriptRow {
+                generation: None,
                 id: MessageId::generate(),
                 item: TurnItem::Reasoning {
                     content: content.to_owned(),
@@ -251,11 +327,12 @@ impl Transcript for InMemoryTranscript {
         session_id: &SessionId,
         tool_call_id: &ToolCallId,
         tool_name: &ToolName,
-        input: &Value,
+        input: &ToolArguments,
     ) -> Result<RecordResult> {
         self.append_live(
             session_id,
             TranscriptRow {
+                generation: None,
                 id: MessageId::generate(),
                 item: TurnItem::ToolCall {
                     tool_call_id: tool_call_id.clone(),
@@ -277,6 +354,7 @@ impl Transcript for InMemoryTranscript {
         self.append_live(
             session_id,
             TranscriptRow {
+                generation: None,
                 id: MessageId::generate(),
                 item: TurnItem::ToolResult {
                     tool_call_id: tool_call_id.clone(),

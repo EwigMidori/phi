@@ -41,6 +41,9 @@ struct RunningClaim {
 }
 
 struct QueueInner {
+    paused: bool,
+    fault: Option<String>,
+    fault_job: Option<JobId>,
     id: SessionId,
     pending: VecDeque<GenerationJob>,
     /// Current claim seat (job + claim-time epoch together).
@@ -59,13 +62,18 @@ struct QueueInner {
 #[derive(Clone)]
 pub struct SendQueue {
     inner: Arc<Mutex<QueueInner>>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl SendQueue {
     #[must_use]
     pub fn new(id: SessionId) -> Self {
         Self {
+            changed: Arc::new(tokio::sync::Notify::new()),
             inner: Arc::new(Mutex::new(QueueInner {
+                paused: false,
+                fault: None,
+                fault_job: None,
                 id,
                 pending: VecDeque::new(),
                 running: None,
@@ -84,6 +92,50 @@ impl SendQueue {
     #[must_use]
     pub fn id(&self) -> SessionId {
         self.lock().id.clone()
+    }
+
+    pub fn pause_claims(&self) {
+        self.lock().paused = true;
+    }
+    pub fn resume_claims(&self) -> Result<()> {
+        let mut inner = self.lock();
+        if let Some(error) = &inner.fault {
+            return Err(KernelError::CommitFailed(error.clone()));
+        }
+        inner.paused = false;
+        Ok(())
+    }
+    pub async fn stop_and_wait(&self) -> Result<()> {
+        let job = {
+            let mut inner = self.lock();
+            inner.cancel_epoch = inner.cancel_epoch.bump();
+            inner.running.as_ref().map(|claim| {
+                claim.cancel.cancel();
+                claim.job.job_id.clone()
+            })
+        };
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let inner = self.lock();
+                if let Some(error) = &inner.fault {
+                    return Err(KernelError::CommitFailed(error.clone()));
+                }
+                if inner.running.as_ref().map(|claim| &claim.job.job_id) != job.as_ref() {
+                    return Ok(());
+                }
+                if job.is_none() {
+                    return Ok(());
+                }
+            }
+            changed.await;
+        }
+    }
+    pub fn fault(&self) -> Option<(JobId, String)> {
+        let inner = self.lock();
+        Some((inner.fault_job.clone()?, inner.fault.clone()?))
     }
 
     #[must_use]
@@ -120,7 +172,18 @@ impl SendQueue {
     }
 
     fn end_pump(&self) {
-        self.lock().pump_active = false;
+        let mut inner = self.lock();
+        inner.pump_active = false;
+        if let Some(claim) = inner.running.take() {
+            claim.cancel.cancel();
+            inner.paused = true;
+            inner.fault_job = Some(claim.job.job_id);
+            if inner.fault.is_none() {
+                inner.fault =
+                    Some("generation pump exited before committing its terminal state".into());
+            }
+        }
+        self.changed.notify_waiters();
     }
 
     /// Push job only — claim only inside [`run_until_idle`](Self::run_until_idle).
@@ -140,6 +203,9 @@ impl SendQueue {
 
     fn claim_for_pump(&self) -> Option<(GenerationJob, Epoch, TurnCancel)> {
         let mut g = self.lock();
+        if g.paused {
+            return None;
+        }
         debug_assert!(g.pump_active, "claim_for_pump without pump seat");
         if let Some(claim) = g.running.clone() {
             return Some((claim.job, claim.epoch, claim.cancel));
@@ -160,6 +226,7 @@ impl SendQueue {
         if g.running.as_ref().is_some_and(|c| &c.job.job_id == job_id) {
             g.running = None;
         }
+        self.changed.notify_waiters();
     }
 
     pub fn cancel_pending_job(&self, job_id: &JobId) -> bool {
@@ -218,19 +285,18 @@ impl SendQueue {
                 break;
             };
 
-            // Cancel fence stale before work → Aborted (interrupt), not Failed.
-            if self.is_cancelled(claimed_epoch) {
-                let turn = GenerationTurn::begin(job, claimed_epoch, Vec::new());
-                self.finish_outcome(turn.into_aborted(), &applier)?;
-                continue;
-            }
-
-            let history = transcript.load_turn_history(&session_id)?;
+            let history = match transcript.load_job_history(&job) {
+                Ok(history) => history,
+                Err(error) => {
+                    self.record_fault(&job.job_id, &error, &applier);
+                    return Err(error);
+                }
+            };
             let turn = GenerationTurn::begin(job, claimed_epoch, history);
-            applier.commit(CommitUnit::Stream {
-                job_id: turn.job_id(),
-                batch: turn.start_effects(),
-            })?;
+            if let Err(error) = turn.start(&applier) {
+                self.record_fault(turn.job_id(), &error, &applier);
+                return Err(error);
+            }
 
             // Precondition fault → Failed (error message), not Aborted.
             if turn.history().is_empty() {
@@ -275,6 +341,7 @@ impl SendQueue {
             };
 
             let claimed = turn.claimed_epoch();
+            let running_job = turn.job_id().clone();
             let outcome = turn
                 .drive(
                     stream,
@@ -283,7 +350,14 @@ impl SendQueue {
                     tool_call_seal,
                     &applier,
                 )
-                .await?;
+                .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.record_fault(&running_job, &error, &applier);
+                    return Err(error);
+                }
+            };
             self.finish_outcome(outcome, &applier)?;
         }
         Ok(())
@@ -291,8 +365,23 @@ impl SendQueue {
 
     /// Queue job seat + sole observation/transcript commit for terminal outcome.
     fn finish_outcome(&self, outcome: TurnOutcome, applier: &EffectApplier<'_>) -> Result<()> {
-        self.mark_finished(outcome.job_id());
-        applier.commit(CommitUnit::Terminal(outcome))
+        let job_id = outcome.job_id().clone();
+        let result = applier.commit(CommitUnit::Terminal(outcome));
+        if let Err(error) = &result {
+            self.record_fault(&job_id, error, applier);
+        }
+        self.mark_finished(&job_id);
+        result
+    }
+    fn record_fault(&self, job_id: &JobId, error: &KernelError, applier: &EffectApplier<'_>) {
+        {
+            let mut inner = self.lock();
+            inner.paused = true;
+            inner.fault = Some(error.to_string());
+            inner.fault_job = Some(job_id.clone());
+        }
+        let _ = applier.fault(job_id, error.to_string());
+        self.mark_finished(job_id);
     }
 }
 
@@ -311,8 +400,8 @@ mod tests {
     use super::*;
     use crate::ids::MessageId;
     use crate::{
-        AgentEvent, AgentEventStream, AgentRuntime, EmptyAgentPrefix, InMemoryTranscript,
-        KernelEvent, MessageContent, TurnRequest,
+        AgentRuntime, EmptyAgentPrefix, InMemoryTranscript, KernelEvent, MessageContent,
+        TurnRequest,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -378,23 +467,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AgentRuntime for WaitingFirstRun {
-        async fn run(
-            &self,
-            _request: TurnRequest,
-        ) -> std::result::Result<AgentEventStream, String> {
+        async fn run(&self, _request: TurnRequest) -> std::result::Result<crate::AgentRun, String> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.started.notify_one();
                 if self.preparing {
                     return futures::future::pending().await;
                 }
-                return Ok(Box::pin(futures::stream::pending()));
+                return Ok(crate::AgentRun::new(Box::pin(futures::stream::pending())));
             }
-            Ok(Box::pin(futures::stream::iter([
-                Ok(AgentEvent::TextDelta {
-                    text: "second completed".into(),
-                }),
-                Ok(AgentEvent::Finished { reason: None }),
-            ])))
+            Ok(crate::AgentRun::text("second completed"))
         }
     }
 
@@ -435,7 +516,12 @@ mod tests {
         .expect("stop must wake a pending adapter future or idle stream");
         result.unwrap();
         assert!(queue.is_idle());
-        let history = transcript.load_turn_history(&sid).unwrap();
+        let history: Vec<_> = transcript
+            .load_rows(&sid)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item)
+            .collect();
         assert_eq!(history.len(), 2);
         assert!(
             matches!(&history[1], crate::TurnItem::Assistant { content } if content == "second completed")

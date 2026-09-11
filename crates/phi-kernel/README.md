@@ -16,7 +16,7 @@ First package of **[phi](../../README.md)**: minimal agent **mechanisms**.
 | Transient tail | `TurnRequest.tail_state`, `TailState`, `TurnRequest::materialize_history` |
 | Events | `KernelEvent` (generation-class only), `EventBus` |
 
-**Stream commit:** `EffectBatch` writes are recorded then **projected** to tool bus events; pure `notices` follow. Terminal jobs use `TurnOutcome` (`apply_terminal`), not `EffectBatch`. Tool success path is write-only in the turn (no dual-built Record+Emit).
+**Generation commit:** `EffectApplier` submits complete `ModelResponse` batches and individual tool results through `Transcript::commit_generation` before publishing observations. The next adapter poll acknowledges that commit and permits the next execution. `AgentRun::close_and_join` is awaited before terminal commit; no merged assistant is written at terminal. `TranscriptSession` stores generation ownership, response grouping and completeness, and provides causal history independently of append order.
 
 **Turn history:** `TurnRequest.history` is the full interleaved sequence (user / assistant / tool rows in transcript order) — one ordered `Vec<TurnItem>`, no separate dialogue / tool projections to reassemble. Tool `input` / `output` stay opaque to the kernel.
 

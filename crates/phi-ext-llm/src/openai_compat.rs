@@ -4,22 +4,20 @@
 //! inject a [`HistoryProjector`]. Default is [`PassThrough`] (D3: no baked-in policy).
 
 use std::fmt;
-use std::pin::Pin;
 use std::sync::Arc;
 
+use self::conversation::SseReader;
 use crate::images::{PreparedImage, PreparedImages};
 use crate::{ImagePolicy, ProviderImages};
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::StreamExt;
-use futures::stream::{self, Stream};
 use phi_kernel::{
-    AgentEvent, AgentEventStream, AgentPrefix, AgentRuntime, ContentPart, JobId, MessageContent,
-    OneshotText, SessionId, ToolCallSealPolicy, TurnCancel, TurnItem, TurnRequest, Usage,
+    AgentEvent, AgentPrefix, AgentRuntime, ContentPart, JobId, MessageContent, OneshotText,
+    SessionId, ToolCallSealPolicy, TurnCancel, TurnItem, TurnRequest,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
 use strum::{Display, EnumString};
+mod conversation;
 
 // ── Config ─────────────────────────────────────────────────────────────────
 
@@ -193,9 +191,9 @@ impl HistoryProjector for PassThrough {
 
 /// Knows how one [`ApiStyle`] turns projected history into an HTTP JSON body.
 ///
-/// Wire surface today: user/assistant role messages. Reasoning / tool rows that
-/// remain after projection are not expressed on this dialect yet (product should
-/// project them out or a future codec path will encode them).
+/// Encodes complete response groups and their tool results without losing
+/// provider continuation or completion-message tool-call grouping.
+#[derive(Clone)]
 struct WireCodec {
     style: ApiStyle,
 }
@@ -219,62 +217,92 @@ impl WireCodec {
         prefix: &AgentPrefix,
         history: &[TurnItem],
         images: &PreparedImages,
+        scope: &str,
     ) -> Result<Value, String> {
-        match self.style {
-            ApiStyle::Completions => self.completions_body(model, prefix, history, images),
-            ApiStyle::Responses => self.responses_body(model, prefix, history, images),
+        let mut body = match self.style {
+            ApiStyle::Completions => {
+                json!({"model":model,"stream":true,"stream_options":{"include_usage":true}})
+            }
+            ApiStyle::Responses => json!({"model":model,"stream":true}),
+        };
+        if self.style == ApiStyle::Responses && !prefix.render_preamble().is_empty() {
+            body["instructions"] = json!(prefix.render_preamble());
         }
-    }
-
-    fn completions_body(
-        &self,
-        model: &str,
-        prefix: &AgentPrefix,
-        history: &[TurnItem],
-        images: &PreparedImages,
-    ) -> Result<Value, String> {
         let mut messages = Vec::new();
-        let preamble = prefix.render_preamble();
-        if !preamble.trim().is_empty() {
-            messages.push(json!({"role": "system", "content": preamble}));
+        if self.style == ApiStyle::Completions && !prefix.render_preamble().trim().is_empty() {
+            messages.push(json!({"role":"system","content":prefix.render_preamble()}));
         }
         for item in history {
-            if let Some(msg) = self.encode_role_message(item, images)? {
-                messages.push(msg);
-            }
+            self.encode_history(item, images, scope, &mut messages)?;
         }
-        // `include_usage` so the final stream chunk carries provider usage.
-        Ok(json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-            "stream_options": { "include_usage": true },
-        }))
-    }
-
-    fn responses_body(
-        &self,
-        model: &str,
-        prefix: &AgentPrefix,
-        history: &[TurnItem],
-        images: &PreparedImages,
-    ) -> Result<Value, String> {
-        let instructions = prefix.render_preamble();
-        let mut input = Vec::new();
-        for item in history {
-            if let Some(msg) = self.encode_role_message(item, images)? {
-                input.push(msg);
+        body[if self.style == ApiStyle::Responses {
+            "input"
+        } else {
+            "messages"
+        }] = json!(messages);
+        if !prefix.tools.is_empty() {
+            let mut tools = Vec::new();
+            for spec in &prefix.tools {
+                let function = json!({"name":spec.name.as_str(),"description":spec.description,"parameters":spec.parameters.clone().unwrap_or_else(||json!({"type":"object","properties":{}})),"strict":false});
+                tools.push(match self.style {
+                    ApiStyle::Completions => json!({"type":"function","function":function}),
+                    ApiStyle::Responses => {
+                        let mut value = function;
+                        value["type"] = json!("function");
+                        value
+                    }
+                });
             }
+            body["tools"] = json!(tools);
+            body["tool_choice"] = json!("auto");
         }
-        let mut body = json!({
-            "model": model,
-            "input": input,
-            "stream": true,
-        });
-        if !instructions.is_empty() {
-            body["instructions"] = json!(instructions);
+        if self.style == ApiStyle::Responses {
+            body["store"] = json!(false);
+            body["include"] = json!(["reasoning.encrypted_content"]);
         }
         Ok(body)
+    }
+
+    fn encode_history(
+        &self,
+        item: &TurnItem,
+        images: &PreparedImages,
+        scope: &str,
+        out: &mut Vec<Value>,
+    ) -> Result<(), String> {
+        match item {
+            TurnItem::ModelResponse{response}=>{
+                if let Some(continuation)=&response.continuation {
+                    if continuation.scope!=scope{return Err("provider/model/protocol differs from persisted reasoning continuation".into());}
+                    if self.style!=ApiStyle::Responses{return Err("unsupported continuation protocol".into());}
+                    let items=continuation.payload.as_array().ok_or("invalid persisted continuation")?;
+                    out.extend(items.iter().cloned());return Ok(());
+                }
+                if self.style==ApiStyle::Completions {
+                    let mut text=String::new();let mut calls=Vec::new();
+                    for row in &response.rows {match &row.item{
+                        TurnItem::Assistant{content}=>text.push_str(content),
+                        TurnItem::ToolCall{tool_call_id,tool_name,input}=>calls.push(json!({"id":tool_call_id.as_str(),"type":"function","function":{"name":tool_name.as_str(),"arguments":input.as_str()}})),
+                        TurnItem::Reasoning{..}=>{},
+                        _=>return Err("invalid response group member".into()),
+                    }}
+                    let mut message=json!({"role":"assistant","content":text});
+                    if !calls.is_empty(){message["tool_calls"]=json!(calls);}
+                    out.push(message);
+                }else{for row in &response.rows{self.encode_history(&row.item,images,scope,out)?;}}
+            }
+            TurnItem::ToolCall{tool_call_id,tool_name,input}=>out.push(match self.style{
+                ApiStyle::Responses=>json!({"type":"function_call","call_id":tool_call_id.as_str(),"name":tool_name.as_str(),"arguments":input.as_str()}),
+                ApiStyle::Completions=>json!({"role":"assistant","tool_calls":[{"id":tool_call_id.as_str(),"type":"function","function":{"name":tool_name.as_str(),"arguments":input.as_str()}}]}),
+            }),
+            TurnItem::ToolResult{tool_call_id,output,status,..}=>{
+                let text=json!({"status":status,"output":output}).to_string();
+                out.push(match self.style{ApiStyle::Responses=>json!({"type":"function_call_output","call_id":tool_call_id.as_str(),"output":text}),ApiStyle::Completions=>json!({"role":"tool","tool_call_id":tool_call_id.as_str(),"content":text})});
+            }
+            TurnItem::Continuation{..}=>return Err("continuation must belong to a response group".into()),
+            _=>{if let Some(message)=self.encode_role_message(item,images)?{out.push(message);}}
+        }
+        Ok(())
     }
 
     /// Map one transcript row to a role message when this dialect can express it.
@@ -323,7 +351,9 @@ impl WireCodec {
             TurnItem::Assistant { .. }
             | TurnItem::Reasoning { .. }
             | TurnItem::ToolCall { .. }
-            | TurnItem::ToolResult { .. } => None,
+            | TurnItem::ToolResult { .. }
+            | TurnItem::ModelResponse { .. }
+            | TurnItem::Continuation { .. } => None,
         })
     }
 }
@@ -331,7 +361,9 @@ impl WireCodec {
 // ── Runtime (orchestrates HTTP + collaborators) ────────────────────────────
 
 /// HTTP streaming runtime: projector → wire codec → SSE reader → [`AgentEvent`].
+#[derive(Clone)]
 pub struct OpenAiCompatRuntime {
+    tools: Arc<phi_ext_tools::ToolRegistry>,
     client: Client,
     config: LlmConfig,
     projector: Arc<dyn HistoryProjector>,
@@ -340,11 +372,25 @@ pub struct OpenAiCompatRuntime {
 }
 
 impl OpenAiCompatRuntime {
+    #[must_use]
+    pub fn with_tools(mut self, tools: Arc<phi_ext_tools::ToolRegistry>) -> Self {
+        self.tools = tools;
+        self
+    }
+    fn continuation_scope(&self) -> String {
+        format!(
+            "openai-compatible/v1|{}|{}|{}",
+            self.config.api_base.as_str(),
+            self.config.api_style,
+            self.config.model.as_str()
+        )
+    }
     /// Default history policy is [`PassThrough`] — no product strategy baked in.
     #[must_use]
     pub fn new(config: LlmConfig) -> Self {
         let codec = WireCodec::for_style(config.api_style);
         Self {
+            tools: Arc::new(phi_ext_tools::ToolRegistry::new()),
             client: Client::new(),
             config,
             projector: Arc::new(PassThrough),
@@ -393,11 +439,14 @@ impl OpenAiCompatRuntime {
     }
 }
 
-#[async_trait]
-impl AgentRuntime for OpenAiCompatRuntime {
-    async fn run(&self, request: TurnRequest) -> Result<AgentEventStream, String> {
+impl OpenAiCompatRuntime {
+    async fn open_response(
+        &self,
+        request: &TurnRequest,
+        history: &[TurnItem],
+    ) -> Result<SseReader, String> {
         let history = request
-            .materialize_history(self.projector.project(&request.history))
+            .materialize_history(history.to_vec())
             .map_err(|e| e.to_string())?;
         let mut images = match &self.images {
             Some((service, policy)) => {
@@ -421,6 +470,7 @@ impl AgentRuntime for OpenAiCompatRuntime {
                 &request.prefix,
                 &history,
                 &images,
+                &self.continuation_scope(),
             )?;
             let body = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
             if self
@@ -467,8 +517,9 @@ impl AgentRuntime for OpenAiCompatRuntime {
             response.bytes_stream(),
             request.cancel.clone(),
             self.config.api_style,
+            self.continuation_scope(),
         );
-        Ok(reader.into_event_stream())
+        Ok(reader)
     }
 }
 
@@ -503,332 +554,26 @@ impl OneshotText for OpenAiCompatRuntime {
                 Ok(_) => {}
             }
         }
+        stream.close_and_join().await?;
         Ok(text)
     }
 }
 
-// ── SSE reader (mechanism object) ──────────────────────────────────────────
-
-/// Owns parse state for one provider SSE body → [`AgentEvent`] stream.
-struct SseReader {
-    stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    buffer: String,
-    done: bool,
-    cancel: TurnCancel,
-    style: ApiStyle,
-    pending_event: Option<String>,
-    /// Multiple events from one SSE data line (e.g. Usage then Finished).
-    queued: std::collections::VecDeque<AgentEvent>,
-}
-
-impl SseReader {
-    fn from_byte_stream<S>(byte_stream: S, cancel: TurnCancel, style: ApiStyle) -> Self
-    where
-        S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-    {
-        Self {
-            stream: Box::pin(byte_stream),
-            buffer: String::new(),
-            done: false,
-            cancel,
-            style,
-            pending_event: None,
-            queued: std::collections::VecDeque::new(),
-        }
-    }
-
-    fn into_event_stream(self) -> AgentEventStream {
-        Box::pin(stream::unfold(self, |mut reader| async move {
-            reader.next_event().await.map(|ev| (ev, reader))
-        }))
-    }
-
-    async fn next_event(&mut self) -> Option<Result<AgentEvent, String>> {
-        if let Some(ev) = self.queued.pop_front() {
-            return Some(Ok(ev));
-        }
-        if self.done {
-            return None;
-        }
-        loop {
-            if let Some(ev) = self.queued.pop_front() {
-                return Some(Ok(ev));
-            }
-            if self.cancel.is_cancelled() {
-                self.done = true;
-                return Some(Ok(AgentEvent::Finished {
-                    reason: Some("cancelled".into()),
-                }));
-            }
-            if let Some(event) = self.try_consume_line() {
-                return Some(event);
-            }
-            let next = tokio::select! {
-                () = self.cancel.cancelled() => {
-                    self.done = true;
-                    return Some(Ok(AgentEvent::Finished { reason: Some("cancelled".into()) }));
-                },
-                next = self.stream.next() => next,
-            };
-            match next {
-                Some(Ok(bytes)) => {
-                    self.buffer.push_str(&String::from_utf8_lossy(&bytes));
-                }
-                Some(Err(e)) => {
-                    self.done = true;
-                    return Some(Err(format!("stream read error: {e}")));
-                }
-                None => {
-                    if let Some(event) = self.try_consume_line() {
-                        return Some(event);
-                    }
-                    if let Some(ev) = self.queued.pop_front() {
-                        return Some(Ok(ev));
-                    }
-                    self.done = true;
-                    return Some(Ok(AgentEvent::Finished {
-                        reason: Some("stream_end".into()),
-                    }));
-                }
-            }
-        }
-    }
-
-    fn try_consume_line(&mut self) -> Option<Result<AgentEvent, String>> {
-        if let Some(ev) = self.queued.pop_front() {
-            return Some(Ok(ev));
-        }
-        loop {
-            let idx = self.buffer.find('\n')?;
-            let mut line = self.buffer[..idx].to_owned();
-            self.buffer = self.buffer[idx + 1..].to_owned();
-            if line.ends_with('\r') {
-                line.pop();
-            }
-            let line = line.trim();
-            if line.is_empty() {
-                self.pending_event = None;
-                continue;
-            }
-            if line.starts_with(':') {
-                continue;
-            }
-            if let Some(ev) = line.strip_prefix("event:") {
-                self.pending_event = Some(ev.trim().to_owned());
-                continue;
-            }
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let data = data.trim();
-            if data == "[DONE]" {
-                self.done = true;
-                return Some(Ok(AgentEvent::Finished {
-                    reason: Some("stop".into()),
-                }));
-            }
-            match self.parse_data(data, self.pending_event.as_deref()) {
-                Ok(events) if events.is_empty() => continue,
-                Ok(mut events) => {
-                    let first = events.remove(0);
-                    if matches!(first, AgentEvent::Finished { .. }) {
-                        self.done = true;
-                    }
-                    for ev in events {
-                        if matches!(ev, AgentEvent::Finished { .. }) {
-                            self.done = true;
-                        }
-                        self.queued.push_back(ev);
-                    }
-                    return Some(Ok(first));
-                }
-                Err(e) => return Some(Err(e)),
-            }
-        }
-    }
-
-    /// Parse one SSE `data:` JSON object into zero or more kernel agent events.
-    fn parse_data(&self, data: &str, event_name: Option<&str>) -> Result<Vec<AgentEvent>, String> {
-        let v: Value =
-            serde_json::from_str(data).map_err(|e| format!("invalid SSE JSON: {e}: {data}"))?;
-
-        if let Some(err) = v.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("provider error");
-            return Err(msg.to_owned());
-        }
-
-        let mut out = Vec::new();
-
-        if let Some(ty) = v.get("type").and_then(|t| t.as_str()).or(event_name) {
-            match ty {
-                "response.output_text.delta" | "response.text.delta" => {
-                    if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
-                        if !delta.is_empty() {
-                            out.push(AgentEvent::TextDelta {
-                                text: delta.to_owned(),
-                            });
-                        }
-                    }
-                    return Ok(out);
-                }
-                "response.reasoning_text.delta" => {
-                    if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
-                        if !delta.is_empty() {
-                            out.push(AgentEvent::ReasoningDelta {
-                                text: delta.to_owned(),
-                            });
-                        }
-                    }
-                    return Ok(out);
-                }
-                "response.completed" | "response.done" | "response.incomplete" => {
-                    if let Some(usage) = Self::usage_from_value(&v) {
-                        out.push(AgentEvent::Usage { usage });
-                    }
-                    out.push(AgentEvent::Finished {
-                        reason: Some(ty.to_owned()),
-                    });
-                    return Ok(out);
-                }
-                "response.failed" => {
-                    let msg = v
-                        .pointer("/response/error/message")
-                        .or_else(|| v.pointer("/error/message"))
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("response.failed");
-                    return Err(msg.to_owned());
-                }
-                _ => {
-                    if ty.starts_with("response.") {
-                        // Ignore other lifecycle frames; still allow top-level usage.
-                        if let Some(usage) = Self::usage_from_value(&v) {
-                            out.push(AgentEvent::Usage { usage });
-                        }
-                        return Ok(out);
-                    }
-                }
-            }
-        }
-
-        if matches!(self.style, ApiStyle::Completions) || v.pointer("/choices/0/delta").is_some() {
-            if let Some(content) = v
-                .pointer("/choices/0/delta/content")
-                .and_then(|c| c.as_str())
-            {
-                if !content.is_empty() {
-                    out.push(AgentEvent::TextDelta {
-                        text: content.to_owned(),
-                    });
-                }
-            }
-            if v.pointer("/choices/0/finish_reason")
-                .and_then(|f| f.as_str())
-                .is_some_and(|f| !f.is_empty() && f != "null")
-            {
-                if let Some(usage) = Self::usage_from_value(&v) {
-                    out.push(AgentEvent::Usage { usage });
-                }
-                out.push(AgentEvent::Finished {
-                    reason: v
-                        .pointer("/choices/0/finish_reason")
-                        .and_then(|f| f.as_str())
-                        .map(str::to_owned),
-                });
-                return Ok(out);
-            }
-            // Final usage-only chunk (empty choices + usage).
-            if let Some(usage) = Self::usage_from_value(&v) {
-                out.push(AgentEvent::Usage { usage });
-            }
-            return Ok(out);
-        }
-
-        if let Some(usage) = Self::usage_from_value(&v) {
-            out.push(AgentEvent::Usage { usage });
-        }
-        Ok(out)
-    }
-
-    /// Map provider JSON `usage` object → kernel [`Usage`]. No local totals.
-    fn usage_from_value(v: &Value) -> Option<Usage> {
-        let u = v.get("usage").or_else(|| v.pointer("/response/usage"))?;
-        let prompt = u
-            .get("prompt_tokens")
-            .or_else(|| u.get("input_tokens"))
-            .and_then(Value::as_u64);
-        let completion = u
-            .get("completion_tokens")
-            .or_else(|| u.get("output_tokens"))
-            .and_then(Value::as_u64);
-        let total = u.get("total_tokens").and_then(Value::as_u64);
-        let cached = u
-            .get("prompt_cache_hit_tokens")
-            .or_else(|| u.pointer("/input_tokens_details/cached_tokens"))
-            .or_else(|| u.pointer("/prompt_tokens_details/cached_tokens"))
-            .and_then(Value::as_u64);
-        let missed = u.get("prompt_cache_miss_tokens").and_then(Value::as_u64);
-        let usage = Usage::new(prompt, completion, total).with_cache(cached, missed);
-        if usage.is_empty() { None } else { Some(usage) }
-    }
-}
-
 #[cfg(test)]
-mod config_newtype_tests {
-    use super::{ApiBase, ApiKey, ModelId};
-
+mod config_tests {
+    use super::*;
     #[test]
-    fn model_id_rejects_empty() {
-        assert!(ModelId::try_new("").is_err());
-        assert!(ModelId::try_new("   ").is_err());
-        assert_eq!(ModelId::try_new(" gpt ").unwrap().as_str(), "gpt");
-    }
-
-    #[test]
-    fn api_base_strips_trailing_slash_and_rejects_empty() {
-        assert!(ApiBase::try_new("").is_err());
+    fn configuration_rejects_empty_values_and_redacts_keys() {
+        assert!(ModelId::try_new(" ").is_err());
         assert!(ApiBase::try_new("///").is_err());
+        assert!(ApiKey::try_new("").is_err());
         assert_eq!(
-            ApiBase::try_new("https://api.openai.com/v1/")
+            ApiBase::try_new("https://example.test/v1/")
                 .unwrap()
                 .as_str(),
-            "https://api.openai.com/v1"
+            "https://example.test/v1"
         );
-    }
-
-    #[test]
-    fn api_key_rejects_empty_and_redacts_debug() {
-        assert!(ApiKey::try_new("").is_err());
-        let key = ApiKey::try_new("sk-secret").unwrap();
-        assert_eq!(key.as_str(), "sk-secret");
-        assert_eq!(format!("{key:?}"), "ApiKey(***)");
-    }
-}
-
-#[cfg(test)]
-mod cancellation_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn direct_runtime_stream_consumer_can_cancel_a_silent_connection() {
-        let cancel = TurnCancel::new();
-        let reader = SseReader::from_byte_stream(
-            stream::pending::<Result<Bytes, reqwest::Error>>(),
-            cancel.clone(),
-            ApiStyle::Completions,
-        );
-        let mut events = reader.into_event_stream();
-        let waiting = tokio::spawn(async move { events.next().await });
-        tokio::task::yield_now().await;
-        cancel.cancel();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(result, Some(Ok(AgentEvent::Finished { reason: Some(reason) })) if reason == "cancelled")
-        );
+        let key = ApiKey::try_new("private-key").unwrap();
+        assert!(!format!("{key:?}").contains("private-key"));
     }
 }

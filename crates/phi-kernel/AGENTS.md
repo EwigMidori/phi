@@ -36,16 +36,21 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 
 ## Generation turn (send_queue)
 
-- `GenerationTurn::handle` / `start_effects` / `seal_incomplete_effects` → pure state + `EffectBatch` (`writes` = `TranscriptWrite`, `notices` = pure bus intents; `Disposition`; no transcript/bus in handle)
-- **Tool dual-write banned:** durable tool rows are stream SoT; success-path tool call/result are **write only** in handle; bus tool events are **projected after successful record** in the applier. Unknown tool_result (no open ledger id) stays **notice only**.
-- **Sole commit path:** `EffectApplier` (`apply_stream(job_id, batch)` for stream/start/seal; `apply_terminal` for Done/Stopped/Error; optional `commit(CommitUnit)`)
-- **`apply_stream` hard order:** for each write: `record_*` then immediately projected tool notice; then all `batch.notices`
-- `GenerationTurn::drive` owns the agent stream loop; `SendQueue::run_until_idle` is claim → begin → applier → `agent.run` → drive → mark_finished + apply_terminal
-- Open tools: `ToolLedger` (open/close; seal opt-in via `ToolCallSealPolicy`, default posture `LeaveOpen`); seal policy comes from `TurnRequest` after `materials.prepare` (typically `SourcesTurnMaterials` → `ToolCallSealSource`)
+- `AgentRuntime::run` returns owned `AgentRun`; the consumer uses `next` and always awaits `close_and_join`, including commit failures.
+- `GenerationTurn` buffers only the current visible response. `ModelResponseCompleted` commits the complete ordered response batch; terminal never writes a merged assistant body again.
+- `EffectApplier` is the sole commit/publish path. `Transcript::commit_generation` success means durable host commit. A response is committed before the adapter is polled again to execute tools; a result is committed before the next tool/provider request.
+- `GenerationCommit`: `Enqueue`, `Start`, `Response`, `ToolResult`, `Finish`; `TranscriptSession` persists rows plus generation records.
+- `TranscriptRow.generation` preserves `JobId`, user `MessageId` anchor, `ModelResponseId`, and response completeness. `ordered_rows` and `history_for` use causal input order, not physical append order.
+- `ToolArguments` retains exact provider JSON text, including malformed arguments; parsing belongs at the execution boundary.
+- `ProviderContinuation` is opaque scoped replay material. A materialized `TurnItem::ModelResponse` groups durable flat rows for provider encoding; nested materialized groups cannot be persisted.
+- `GenerationModelResponseCommitted` and tool notices are projected only after commit. `GenerationStart` carries the committed version.
+- Tool ledger keys are `(ModelResponseId, ToolCallId)`; duplicate/open-orphan results are errors. Sealing remains opt-in (`LeaveOpen` by default); products may select `SealAlways`.
+- Stop captures and cancels the same queue claim atomically, awaits run cleanup, commits partial text and incomplete results, then commits terminal and releases the seat. `pause_claim`/`resume_claim` support host mutations; `stop_and_wait` waits only for the captured job.
+- Failed commits stop later claims, preserve the actual fault JobId, and emit an error observation at the last committed version. No provider/tool replay on a failed commit.
 
 ## Allowed (tools / policy shapes)
 
-- `AgentEvent` tool shapes (`ToolCall`, `ToolResult`, `ToolApprovalRequired` as stream observation only)
+- `AgentEvent` response batches and tool results (`ToolApprovalRequired` remains an observation shape, never an approval engine)
 - `ToolCallId` (provider correlation key, not document PK) / `ToolName` (catalog name); ledger is `HashMap<ToolCallId, ToolName>`
 - `ToolCallSealPolicy` incomplete-tool ledger seal (**opt-in**; not ACL)
 - Adapter pass-through of `AgentPrefix` (may be empty tools/skills)

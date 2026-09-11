@@ -1,595 +1,287 @@
-//! One in-flight generation for a claimed [`GenerationJob`](super::GenerationJob).
-//!
-//! **SRP:** owns stream-event interpretation, text buffer, [`ToolLedger`], and
-//! terminal classification. [`handle`](GenerationTurn::handle) is pure state +
-//! effects; [`drive`](GenerationTurn::drive) owns the stream loop and commits via
-//! [`EffectApplier`](super::effect::EffectApplier). [`SendQueue`](super::SendQueue)
-//! only claims / pumps / finishes jobs.
-//!
-//! **Effects:** `handle` / `start_effects` / `seal_incomplete_effects` return
-//! [`EffectBatch`](super::effect::EffectBatch) **intents**. Tool authority is
-//! [`TranscriptWrite`](super::effect::TranscriptWrite) only; tool bus events are
-//! projected by the applier after successful record. Non-tool frames are notices only.
-
-use futures::StreamExt;
-
-use crate::agent::{
-    AgentEvent, AgentEventStream, ToolCallId, ToolCallSealPolicy, ToolName, ToolResultStatus,
+//! A generation owns its active response projection and commits every completed
+//! response before the adapter may execute tools on its next poll.
+use super::{
+    GenerationJob,
+    effect::{CommitUnit, EffectApplier, TurnOutcome},
+    epoch::Epoch,
+    tool_ledger::ToolLedger,
+};
+use crate::{
+    AgentEvent, AgentRun, GenerationCommit, JobId, KernelEvent, MessageId, ModelResponse,
+    ModelResponseId, Result, SessionId, ToolCallSealPolicy, ToolResultStatus, TranscriptRow,
     TurnCancel, TurnItem,
 };
-use crate::error::Result;
-use crate::events::KernelEvent;
-use crate::ids::{JobId, MessageId, SessionId};
-
-use super::effect::{
-    CommitUnit, Disposition, EffectApplier, EffectBatch, TranscriptWrite, TurnOutcome, TurnTerminal,
-};
-use super::epoch::Epoch;
-use super::job::GenerationJob;
-use super::tool_ledger::ToolLedger;
 
 pub(crate) struct GenerationTurn {
     job: GenerationJob,
-    assistant_message_id: MessageId,
     claimed_epoch: Epoch,
     history: Vec<TurnItem>,
-    /// Answer body; recorded as assistant at terminal success.
+    assistant_message_id: MessageId,
+    response_id: ModelResponseId,
     buffer: String,
-    /// Open CoT span; flushed as [`TurnItem::Reasoning`] before text/tools/end.
-    reasoning_buffer: String,
+    reasoning: String,
+    final_text: String,
     tool_ledger: ToolLedger,
 }
-
 impl GenerationTurn {
-    #[must_use]
-    pub(crate) fn begin(job: GenerationJob, claimed_epoch: Epoch, history: Vec<TurnItem>) -> Self {
+    pub fn begin(job: GenerationJob, claimed_epoch: Epoch, history: Vec<TurnItem>) -> Self {
         Self {
             job,
-            assistant_message_id: MessageId::generate(),
             claimed_epoch,
             history,
+            assistant_message_id: MessageId::generate(),
+            response_id: ModelResponseId::generate(),
             buffer: String::new(),
-            reasoning_buffer: String::new(),
+            reasoning: String::new(),
+            final_text: String::new(),
             tool_ledger: ToolLedger::new(),
         }
     }
-
-    #[must_use]
-    pub(crate) fn session_id(&self) -> &SessionId {
+    pub fn session_id(&self) -> &SessionId {
         &self.job.session_id
     }
-
-    #[must_use]
-    pub(crate) fn claimed_epoch(&self) -> Epoch {
-        self.claimed_epoch
-    }
-
-    #[must_use]
-    pub(crate) fn history(&self) -> &[TurnItem] {
-        &self.history
-    }
-
-    #[must_use]
-    pub(crate) fn job_id(&self) -> &JobId {
+    pub fn job_id(&self) -> &JobId {
         &self.job.job_id
     }
-
-    /// Mechanism effects for turn start — committed only via [`EffectApplier`].
-    /// Notice-only (no transcript write).
-    #[must_use]
-    pub(crate) fn start_effects(&self) -> EffectBatch {
-        EffectBatch::from_notice(KernelEvent::GenerationStart {
-            session_id: self.session_id().clone(),
-            job_id: self.job.job_id.clone(),
-            user_message_id: self.job.user_message_id.clone(),
-            assistant_message_id: self.assistant_message_id.clone(),
-        })
+    pub fn claimed_epoch(&self) -> Epoch {
+        self.claimed_epoch
     }
-
-    /// Interpret one agent event: update buffers / ledger; return disposition + effects.
-    ///
-    /// Does **not** touch transcript or bus — [`EffectApplier`] commits.
-    /// Tool success path: write only (projection in applier). Unknown tool result:
-    /// notice only. Non-tool frames: notices only.
-    pub(crate) fn handle(&mut self, event: AgentEvent) -> (Disposition, EffectBatch) {
-        match event {
-            AgentEvent::TextDelta { text } => self.on_text_delta(text),
-            AgentEvent::ReasoningDelta { text } => self.on_reasoning_delta(text),
-            AgentEvent::ToolCall {
-                tool_call_id,
-                tool_name,
-                input,
-            } => self.on_tool_call(tool_call_id, tool_name, input),
-            AgentEvent::ToolResult {
-                tool_call_id,
-                output,
-                status,
-            } => self.on_tool_result(tool_call_id, output, status),
-            AgentEvent::ToolApprovalRequired {
-                tool_call_id,
-                tool_name,
-                input,
-            } => (
-                Disposition::Continue,
-                EffectBatch::from_notice(KernelEvent::GenerationToolApprovalRequired {
-                    session_id: self.session_id().clone(),
-                    job_id: self.job.job_id.clone(),
-                    tool_call_id,
-                    tool_name,
-                    input,
-                }),
-            ),
-            AgentEvent::Unknown { kind, payload } => (
-                Disposition::Continue,
-                EffectBatch::from_notice(KernelEvent::GenerationAgentUnknown {
-                    session_id: self.session_id().clone(),
-                    job_id: self.job.job_id.clone(),
-                    kind,
-                    payload,
-                }),
-            ),
-            AgentEvent::Usage { usage } => (
-                Disposition::Continue,
-                EffectBatch::from_notice(KernelEvent::GenerationUsage {
-                    session_id: self.session_id().clone(),
-                    job_id: self.job.job_id.clone(),
-                    usage,
-                }),
-            ),
-            AgentEvent::Error { message } => (
-                Disposition::Terminal(TurnTerminal::Failed(message)),
-                EffectBatch::empty(),
-            ),
-            AgentEvent::Finished { reason: _ } => (
-                Disposition::Terminal(TurnTerminal::Finished),
-                EffectBatch::empty(),
-            ),
-        }
+    pub fn history(&self) -> &[TurnItem] {
+        &self.history
     }
-
-    /// Flush open CoT into a durable reasoning write (if any).
-    fn take_reasoning_write(&mut self) -> Option<TranscriptWrite> {
-        if self.reasoning_buffer.is_empty() {
-            return None;
-        }
-        Some(TranscriptWrite::Reasoning {
-            content: std::mem::take(&mut self.reasoning_buffer),
-        })
+    pub fn start(&self, applier: &EffectApplier<'_>) -> Result<()> {
+        applier.start(&self.job, &self.assistant_message_id)
     }
-
-    fn prepend_reasoning_flush(&mut self, mut batch: EffectBatch) -> EffectBatch {
-        if let Some(write) = self.take_reasoning_write() {
-            let mut out = EffectBatch::from_write(write);
-            out.writes.append(&mut batch.writes);
-            out.notices.append(&mut batch.notices);
-            out
-        } else {
-            batch
+    fn partial(&mut self, applier: &EffectApplier<'_>) -> Result<()> {
+        let mut rows = Vec::new();
+        if !self.reasoning.is_empty() {
+            rows.push(TranscriptRow::new(
+                MessageId::generate(),
+                TurnItem::Reasoning {
+                    content: std::mem::take(&mut self.reasoning),
+                },
+            ));
         }
+        if !self.buffer.is_empty() {
+            rows.push(TranscriptRow::new(
+                self.assistant_message_id.clone(),
+                TurnItem::Assistant {
+                    content: std::mem::take(&mut self.buffer),
+                },
+            ));
+        }
+        if !rows.is_empty() {
+            applier.commit(CommitUnit::Generation(GenerationCommit::Response {
+                job: self.job.clone(),
+                response: ModelResponse {
+                    id: self.response_id.clone(),
+                    rows,
+                    continuation: None,
+                    complete: false,
+                },
+            }))?;
+        }
+        Ok(())
     }
-
-    fn on_text_delta(&mut self, text: String) -> (Disposition, EffectBatch) {
-        if text.is_empty() {
-            return (Disposition::Continue, EffectBatch::empty());
-        }
-        self.buffer.push_str(&text);
-        let batch = EffectBatch::from_notice(KernelEvent::GenerationTextDelta {
-            session_id: self.session_id().clone(),
-            job_id: self.job.job_id.clone(),
-            assistant_message_id: self.assistant_message_id.clone(),
-            text,
-        });
-        (Disposition::Continue, self.prepend_reasoning_flush(batch))
-    }
-
-    fn on_reasoning_delta(&mut self, text: String) -> (Disposition, EffectBatch) {
-        if text.is_empty() {
-            return (Disposition::Continue, EffectBatch::empty());
-        }
-        self.reasoning_buffer.push_str(&text);
-        (
-            Disposition::Continue,
-            EffectBatch::from_notice(KernelEvent::GenerationReasoningDelta {
-                session_id: self.session_id().clone(),
-                job_id: self.job.job_id.clone(),
-                assistant_message_id: self.assistant_message_id.clone(),
-                text,
-            }),
-        )
-    }
-
-    /// Ledger open + durable write only; bus projection after successful record.
-    fn on_tool_call(
-        &mut self,
-        tool_call_id: ToolCallId,
-        tool_name: ToolName,
-        input: serde_json::Value,
-    ) -> (Disposition, EffectBatch) {
-        self.tool_ledger
-            .open(tool_call_id.clone(), tool_name.clone());
-        let batch = EffectBatch::from_write(TranscriptWrite::ToolCall {
-            tool_call_id,
-            tool_name,
-            input,
-        });
-        (Disposition::Continue, self.prepend_reasoning_flush(batch))
-    }
-
-    /// Known open call → write only (projection in applier).
-    /// Unknown id → notice only (emit without record), same as historical behavior.
-    fn on_tool_result(
-        &mut self,
-        tool_call_id: ToolCallId,
-        output: serde_json::Value,
-        status: ToolResultStatus,
-    ) -> (Disposition, EffectBatch) {
-        if let Some(tool_name) = self.tool_ledger.close(&tool_call_id) {
-            let batch = EffectBatch::from_write(TranscriptWrite::ToolResult {
-                tool_call_id,
-                tool_name,
-                output,
-                status,
-            });
-            (Disposition::Continue, self.prepend_reasoning_flush(batch))
-        } else {
-            let batch = EffectBatch::from_notice(KernelEvent::GenerationToolResult {
-                session_id: self.session_id().clone(),
-                job_id: self.job.job_id.clone(),
-                tool_call_id,
-                output,
-                status,
-            });
-            (Disposition::Continue, self.prepend_reasoning_flush(batch))
-        }
-    }
-
-    /// Seal still-open tools: durable Incomplete results only (projection in applier).
-    /// Opt-in via [`ToolCallSealPolicy`] — the default posture is `LeaveOpen`.
-    fn seal_incomplete_effects(&mut self) -> EffectBatch {
-        let open = self.tool_ledger.seal_incomplete();
-        let mut batch = EffectBatch::empty();
-        if let Some(write) = self.take_reasoning_write() {
-            batch.push_write(write);
-        }
-        if open.is_empty() {
-            return batch;
-        }
-        let output = serde_json::json!({});
-        for (tool_call_id, tool_name) in open {
-            batch.push_write(TranscriptWrite::ToolResult {
-                tool_call_id,
-                tool_name,
-                output: output.clone(),
-                status: ToolResultStatus::Incomplete,
-            });
-        }
-        batch
-    }
-
-    /// Own the agent stream loop: handle → [`EffectApplier::apply_stream`] → optional seal → outcome.
-    pub(crate) async fn drive(
+    pub async fn drive(
         mut self,
-        stream: AgentEventStream,
+        mut run: AgentRun,
         mut is_cancelled: impl FnMut() -> bool,
-        agent_cancel: &TurnCancel,
-        tool_call_seal: ToolCallSealPolicy,
+        cancel: &TurnCancel,
+        seal: ToolCallSealPolicy,
         applier: &EffectApplier<'_>,
     ) -> Result<TurnOutcome> {
-        let mut stream = stream;
+        let mut error = None;
         let mut stopped = false;
-        let mut terminal: Option<TurnTerminal> = None;
-        let mut stream_err: Option<String> = None;
-
+        let mut finished = false;
+        let mut commit_error = None;
         loop {
-            let item = tokio::select! {
-                biased;
-                () = agent_cancel.cancelled() => {
-                    stopped = true;
-                    break;
-                }
-                item = stream.next() => item,
-            };
-            let Some(item) = item else { break };
-            if is_cancelled() || agent_cancel.is_cancelled() {
-                agent_cancel.cancel();
+            let item = tokio::select! {biased;()=cancel.cancelled()=>{stopped=true;break;} item=run.next()=>item};
+            if is_cancelled() || cancel.is_cancelled() {
+                cancel.cancel();
                 stopped = true;
                 break;
             }
-            match item {
-                Ok(event) => {
-                    let (disposition, batch) = self.handle(event);
-                    applier.commit(CommitUnit::Stream {
-                        job_id: self.job_id(),
-                        batch,
-                    })?;
-                    if let Disposition::Terminal(t) = disposition {
-                        terminal = Some(t);
-                        break;
-                    }
-                }
-                Err(msg) => {
-                    stream_err = Some(msg);
+            let Some(item) = item else {
+                error = Some("agent stream ended without a terminal event".into());
+                break;
+            };
+            let event = match item {
+                Ok(event) => event,
+                Err(message) => {
+                    error = Some(message);
                     break;
                 }
+            };
+            let result: Result<()> = match event {
+                AgentEvent::ResponseStarted {
+                    response_id,
+                    assistant_message_id,
+                } => {
+                    self.response_id = response_id;
+                    self.assistant_message_id = assistant_message_id;
+                    Ok(())
+                }
+                AgentEvent::TextDelta { text } => {
+                    self.buffer.push_str(&text);
+                    applier.commit(CommitUnit::Notice(KernelEvent::GenerationTextDelta {
+                        session_id: self.session_id().clone(),
+                        job_id: self.job_id().clone(),
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        text,
+                    }))
+                }
+                AgentEvent::ReasoningDelta { text } => {
+                    self.reasoning.push_str(&text);
+                    applier.commit(CommitUnit::Notice(KernelEvent::GenerationReasoningDelta {
+                        session_id: self.session_id().clone(),
+                        job_id: self.job_id().clone(),
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        text,
+                    }))
+                }
+                AgentEvent::ModelResponseCompleted { response } => {
+                    let mut result =
+                        applier.commit(CommitUnit::Generation(GenerationCommit::Response {
+                            job: self.job.clone(),
+                            response: response.clone(),
+                        }));
+                    if result.is_ok() {
+                        self.final_text.clear();
+                        for row in &response.rows {
+                            match &row.item {
+                                TurnItem::ToolCall {
+                                    tool_call_id,
+                                    tool_name,
+                                    ..
+                                } => {
+                                    if let Err(error) = self.tool_ledger.open(
+                                        response.id.clone(),
+                                        tool_call_id.clone(),
+                                        tool_name.clone(),
+                                    ) {
+                                        result = Err(error);
+                                        break;
+                                    }
+                                }
+                                TurnItem::Assistant { content } => {
+                                    self.final_text.push_str(content);
+                                    self.assistant_message_id = row.id.clone();
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.buffer.clear();
+                        self.reasoning.clear();
+                    }
+                    result
+                }
+                AgentEvent::ToolResult {
+                    response_id,
+                    tool_call_id,
+                    output,
+                    status,
+                } => match self.tool_ledger.close(&response_id, &tool_call_id) {
+                    Ok(tool_name) => {
+                        applier.commit(CommitUnit::Generation(GenerationCommit::ToolResult {
+                            job: self.job.clone(),
+                            response_id,
+                            tool_call_id,
+                            tool_name,
+                            output,
+                            status,
+                        }))
+                    }
+                    Err(error) => Err(error),
+                },
+                AgentEvent::Usage { usage } => {
+                    applier.commit(CommitUnit::Notice(KernelEvent::GenerationUsage {
+                        session_id: self.session_id().clone(),
+                        job_id: self.job_id().clone(),
+                        usage,
+                    }))
+                }
+                AgentEvent::Error { message } => {
+                    error = Some(message);
+                    break;
+                }
+                AgentEvent::Finished { .. } => {
+                    finished = true;
+                    break;
+                }
+                AgentEvent::ToolApprovalRequired { .. } => {
+                    error = Some("runtime requested unsupported approval".into());
+                    break;
+                }
+                AgentEvent::Unknown { kind, payload } => {
+                    applier.commit(CommitUnit::Notice(KernelEvent::GenerationAgentUnknown {
+                        session_id: self.session_id().clone(),
+                        job_id: self.job_id().clone(),
+                        kind,
+                        payload,
+                    }))
+                }
+            };
+            if let Err(error) = result {
+                commit_error = Some(error);
+                break;
             }
         }
-
-        // aborting = cooperative stop mid-stream or cancel-epoch stale after stream.
-        // Abort outranks agent terminal / stream error (interrupt, not fault classification).
-        let aborting = stopped || is_cancelled() || agent_cancel.is_cancelled();
-        // Flush any open CoT span before seal / terminal (durable sibling row).
-        if !self.reasoning_buffer.is_empty() {
-            let job_id = self.job_id().clone();
-            let batch = self
-                .take_reasoning_write()
-                .map(EffectBatch::from_write)
-                .unwrap_or_else(EffectBatch::empty);
-            if !batch.is_empty() {
-                applier.commit(CommitUnit::Stream {
-                    job_id: &job_id,
-                    batch,
-                })?;
+        // Closing owns cancellation and joins subprocesses even after commit failure.
+        let close = run.close_and_join().await;
+        if let Some(error) = commit_error {
+            return Err(error);
+        }
+        if let Err(message) = close {
+            error = Some(message);
+        }
+        let aborting = stopped || is_cancelled();
+        let partial = self.buffer.clone();
+        self.partial(applier)?;
+        if seal.should_seal(aborting) {
+            for (response_id, tool_call_id, tool_name) in self.tool_ledger.seal_incomplete() {
+                applier.commit(CommitUnit::Generation(GenerationCommit::ToolResult {
+                    job: self.job.clone(),
+                    response_id,
+                    tool_call_id,
+                    tool_name,
+                    output: serde_json::json!({}),
+                    status: ToolResultStatus::Incomplete,
+                }))?;
             }
         }
-        if tool_call_seal.should_seal(aborting) {
-            let job_id = self.job_id().clone();
-            let batch = self.seal_incomplete_effects();
-            if !batch.is_empty() {
-                applier.commit(CommitUnit::Stream {
-                    job_id: &job_id,
-                    batch,
-                })?;
-            }
-        }
-
         Ok(if aborting {
-            // External stop/cancel → Aborted (partial buffer), not Failed.
-            self.into_aborted()
-        } else if let Some(TurnTerminal::Failed(msg)) = terminal {
-            // AgentEvent::Error → Failed (error message).
-            self.into_failed(msg)
-        } else if let Some(msg) = stream_err {
-            // Stream transport / adapter Err → Failed.
-            self.into_failed(msg)
-        } else {
-            // TurnTerminal::Finished or clean end without terminal → Completed.
+            TurnOutcome::Aborted {
+                job: self.job,
+                assistant_message_id: self.assistant_message_id,
+                partial,
+            }
+        } else if let Some(message) = error {
+            self.into_failed(message)
+        } else if finished {
             self.into_completed()
+        } else {
+            self.into_failed("generation ended unexpectedly")
         })
     }
-
-    /// Normal success: buffer becomes assistant `content`.
-    #[must_use]
-    pub(crate) fn into_completed(self) -> TurnOutcome {
-        TurnOutcome::Completed {
-            job: self.job,
-            assistant_message_id: self.assistant_message_id,
-            content: self.buffer,
-        }
-    }
-
-    /// Stop/cancel interrupt: buffer is `partial` (may be empty). See [`TurnOutcome`].
-    #[must_use]
-    pub(crate) fn into_aborted(self) -> TurnOutcome {
+    pub fn into_aborted(self) -> TurnOutcome {
         TurnOutcome::Aborted {
             job: self.job,
             assistant_message_id: self.assistant_message_id,
             partial: self.buffer,
         }
     }
-
-    /// Fault: no partial field — `message` only. See [`TurnOutcome`].
-    #[must_use]
-    pub(crate) fn into_failed(self, message: impl Into<String>) -> TurnOutcome {
+    pub fn into_failed(self, message: impl Into<String>) -> TurnOutcome {
         TurnOutcome::Failed {
             job: self.job,
             message: message.into(),
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::epoch::Epoch;
-    use super::*;
-    use crate::ids::MessageId;
-
-    #[test]
-    fn handle_text_delta_buffers_and_emits_without_side_channels() {
-        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
-        let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
-        let (disposition, batch) = turn.handle(AgentEvent::TextDelta { text: "hi".into() });
-        assert!(matches!(disposition, Disposition::Continue));
-        assert_eq!(turn.buffer, "hi");
-        assert!(batch.writes.is_empty());
-        assert_eq!(batch.notices.len(), 1);
-        assert!(matches!(
-            batch.notices[0],
-            KernelEvent::GenerationTextDelta { .. }
-        ));
-    }
-
-    #[test]
-    fn handle_finished_is_terminal() {
-        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
-        let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
-        let (disposition, batch) = turn.handle(AgentEvent::Finished {
-            reason: Some("stop".into()),
-        });
-        assert!(matches!(
-            disposition,
-            Disposition::Terminal(TurnTerminal::Finished)
-        ));
-        assert!(batch.is_empty());
-    }
-
-    #[test]
-    fn handle_usage_is_notice_only() {
-        use crate::agent::Usage;
-        use crate::events::KernelEvent;
-        use crate::ids::MessageId;
-
-        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
-        let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
-        let usage = Usage::new(Some(10), Some(20), Some(30));
-        let (disposition, batch) = turn.handle(AgentEvent::Usage {
-            usage: usage.clone(),
-        });
-        assert!(matches!(disposition, Disposition::Continue));
-        assert!(batch.writes.is_empty());
-        assert!(matches!(
-            batch.notices.as_slice(),
-            [KernelEvent::GenerationUsage { usage: u, .. }] if u == &usage
-        ));
-    }
-
-    #[test]
-    fn handle_tool_call_opens_ledger_and_write_only() {
-        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
-        let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
-        let (disposition, batch) = turn.handle(AgentEvent::ToolCall {
-            tool_call_id: "tc1".into(),
-            tool_name: "echo".into(),
-            input: serde_json::json!({"x": 1}),
-        });
-        assert!(matches!(disposition, Disposition::Continue));
-        // No dual-write: write only; projection happens in applier.
-        assert!(batch.notices.is_empty());
-        assert_eq!(batch.writes.len(), 1);
-        assert!(matches!(
-            &batch.writes[0],
-            TranscriptWrite::ToolCall {
-                tool_call_id,
-                tool_name,
-                ..
-            } if tool_call_id.as_str() == "tc1" && tool_name.as_str() == "echo"
-        ));
-        // close known → name; unknown → None
-        assert_eq!(
-            turn.tool_ledger
-                .close(&ToolCallId::new("tc1"))
-                .as_ref()
-                .map(ToolName::as_str),
-            Some("echo")
-        );
-    }
-
-    #[test]
-    fn seal_incomplete_after_tool_call_without_result() {
-        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
-        let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
-        let (_disposition, _batch) = turn.handle(AgentEvent::ToolCall {
-            tool_call_id: "tc-open".into(),
-            tool_name: "search".into(),
-            input: serde_json::json!({}),
-        });
-        let seal = turn.seal_incomplete_effects();
-        assert!(seal.notices.is_empty(), "projection only after apply");
-        assert_eq!(seal.writes.len(), 1);
-        assert!(matches!(
-            &seal.writes[0],
-            TranscriptWrite::ToolResult {
-                tool_call_id,
-                tool_name,
-                status: ToolResultStatus::Incomplete,
-                output,
-                ..
-            } if tool_call_id.as_str() == "tc-open"
-                && tool_name.as_str() == "search"
-                && output == &serde_json::json!({})
-        ));
-        assert!(turn.tool_ledger.is_empty());
-    }
-
-    /// Status field is sole outcome authority — kernel must not sniff `output` JSON keys.
-    #[test]
-    fn status_field_is_sole_authority_anti_sniff() {
-        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
-        let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
-        let _ = turn.handle(AgentEvent::ToolCall {
-            tool_call_id: "tc1".into(),
-            tool_name: "echo".into(),
-            input: serde_json::json!({"x": 1}),
-        });
-        let (disposition, batch) = turn.handle(AgentEvent::ToolResult {
-            tool_call_id: "tc1".into(),
-            // Misleading keys must NOT change outcome when status is Ok.
-            output: serde_json::json!({"denied": true}),
-            status: ToolResultStatus::Ok,
-        });
-        assert!(matches!(disposition, Disposition::Continue));
-        assert!(batch.notices.is_empty());
-        assert_eq!(batch.writes.len(), 1);
-        assert!(matches!(
-            &batch.writes[0],
-            TranscriptWrite::ToolResult {
-                status: ToolResultStatus::Ok,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn tool_result_explicit_denied_status() {
-        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
-        let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
-        let _ = turn.handle(AgentEvent::ToolCall {
-            tool_call_id: "tc1".into(),
-            tool_name: "echo".into(),
-            input: serde_json::json!({}),
-        });
-        let (disposition, batch) = turn.handle(AgentEvent::ToolResult {
-            tool_call_id: "tc1".into(),
-            output: serde_json::json!({}),
-            status: ToolResultStatus::Denied,
-        });
-        assert!(matches!(disposition, Disposition::Continue));
-        assert!(batch.notices.is_empty());
-        assert!(matches!(
-            &batch.writes[0],
-            TranscriptWrite::ToolResult {
-                status: ToolResultStatus::Denied,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn unknown_tool_result_is_notice_only() {
-        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
-        let mut turn = GenerationTurn::begin(job, Epoch::ZERO, Vec::new());
-        // No prior ToolCall — ledger has no open id.
-        let (disposition, batch) = turn.handle(AgentEvent::ToolResult {
-            tool_call_id: "orphan".into(),
-            output: serde_json::json!({"ok": true}),
-            status: ToolResultStatus::Ok,
-        });
-        assert!(matches!(disposition, Disposition::Continue));
-        assert!(batch.writes.is_empty());
-        assert_eq!(batch.notices.len(), 1);
-        assert!(matches!(
-            &batch.notices[0],
-            KernelEvent::GenerationToolResult {
-                tool_call_id,
-                status: ToolResultStatus::Ok,
-                ..
-            } if tool_call_id.as_str() == "orphan"
-        ));
-    }
-
-    #[test]
-    fn start_effects_emits_generation_start() {
-        let job = GenerationJob::new(SessionId::generate(), MessageId::generate());
-        let turn = GenerationTurn::begin(job.clone(), Epoch::ZERO, Vec::new());
-        let batch = turn.start_effects();
-        assert!(batch.writes.is_empty());
-        assert_eq!(batch.notices.len(), 1);
-        assert!(matches!(
-            &batch.notices[0],
-            KernelEvent::GenerationStart {
-                job_id,
-                user_message_id,
-                ..
-            } if job_id == &job.job_id && user_message_id == &job.user_message_id
-        ));
+    fn into_completed(self) -> TurnOutcome {
+        TurnOutcome::Completed {
+            job: self.job,
+            assistant_message_id: self.assistant_message_id,
+            content: self.final_text,
+        }
     }
 }

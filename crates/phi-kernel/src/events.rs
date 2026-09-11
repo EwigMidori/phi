@@ -20,11 +20,20 @@ pub type EventBus = broadcast::Sender<KernelEvent>;
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum KernelEvent {
     #[serde(rename_all = "camelCase")]
+    GenerationModelResponseCommitted {
+        session_id: SessionId,
+        job_id: JobId,
+        response_id: crate::ModelResponseId,
+        assistant_message_ids: Vec<MessageId>,
+        version: u64,
+    },
+    #[serde(rename_all = "camelCase")]
     GenerationStart {
         session_id: SessionId,
         job_id: JobId,
         user_message_id: MessageId,
         assistant_message_id: MessageId,
+        version: u64,
     },
     #[serde(rename_all = "camelCase")]
     GenerationTextDelta {

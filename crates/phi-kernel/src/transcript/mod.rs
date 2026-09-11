@@ -8,16 +8,21 @@
 //! | (this) | [`Transcript`] trait + [`TranscriptRow`] + result types |
 //! | [`memory`] | [`InMemoryTranscript`] — stores [`TranscriptRow`] directly |
 
+mod generation;
 mod memory;
 
 pub use memory::InMemoryTranscript;
 
 use serde_json::Value;
 
-use crate::agent::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
+use crate::GenerationJob;
+use crate::agent::{
+    ModelResponse, ToolArguments, ToolCallId, ToolName, ToolResultStatus, TurnItem,
+};
 use crate::content::MessageContent;
 use crate::error::Result;
-use crate::ids::{MessageId, SessionId};
+use crate::ids::{JobId, MessageId, ModelResponseId, SessionId};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
 pub struct RecordResult {
@@ -40,10 +45,89 @@ pub struct TruncateResult {
 /// **Authority read shape** for products (document snapshot, fork copy).
 /// [`TurnRequest::history`] stays [`Vec<TurnItem>`] — strip with
 /// [`TranscriptRow::item`] / [`Transcript::load_turn_history`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptRow {
     pub id: MessageId,
     pub item: TurnItem,
+    pub generation: Option<GenerationStamp>,
+}
+
+impl TranscriptRow {
+    pub fn new(id: MessageId, item: TurnItem) -> Self {
+        Self {
+            id,
+            item,
+            generation: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GenerationStamp {
+    pub job_id: JobId,
+    pub user_message_id: MessageId,
+    pub response_id: ModelResponseId,
+    pub response_complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GenerationStatus {
+    Pending,
+    Running,
+    Completed,
+    Stopped,
+    Failed { message: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenerationRecord {
+    pub job: GenerationJob,
+    pub status: GenerationStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TranscriptSession {
+    pub rows: Vec<TranscriptRow>,
+    pub live: bool,
+    pub generations: Vec<GenerationRecord>,
+}
+
+#[derive(Clone, Debug)]
+pub enum GenerationCommit {
+    Enqueue {
+        job: GenerationJob,
+    },
+    Start {
+        job: GenerationJob,
+    },
+    Response {
+        job: GenerationJob,
+        response: ModelResponse,
+    },
+    ToolResult {
+        job: GenerationJob,
+        response_id: ModelResponseId,
+        tool_call_id: ToolCallId,
+        tool_name: ToolName,
+        output: Value,
+        status: ToolResultStatus,
+    },
+    Finish {
+        job: GenerationJob,
+        status: GenerationStatus,
+    },
+}
+
+impl GenerationCommit {
+    pub fn job(&self) -> &GenerationJob {
+        match self {
+            Self::Enqueue { job }
+            | Self::Start { job }
+            | Self::Response { job, .. }
+            | Self::ToolResult { job, .. }
+            | Self::Finish { job, .. } => job,
+        }
+    }
 }
 
 /// Write-authority port for session dialogue history.
@@ -51,6 +135,15 @@ pub struct TranscriptRow {
 /// The kernel reads and writes session dialogue through this trait and does not
 /// care whether the backend is memory, SQLite, or a product store.
 pub trait Transcript: Send + Sync {
+    /// Must return only after the complete mutation has committed durably.
+    fn commit_generation(&self, commit: &GenerationCommit) -> Result<u64>;
+    fn session_snapshot(&self, session_id: &SessionId) -> Result<TranscriptSession>;
+
+    /// Causal model history up to this input, independent of physical append order.
+    fn load_job_history(&self, job: &GenerationJob) -> Result<Vec<TurnItem>> {
+        let snapshot = self.session_snapshot(&job.session_id)?;
+        snapshot.history_for(job)
+    }
     /// Ensure a live session exists (idempotent). Creates the session if missing.
     fn ensure_live(&self, session_id: &SessionId) -> Result<()>;
 
@@ -118,7 +211,7 @@ pub trait Transcript: Send + Sync {
         session_id: &SessionId,
         tool_call_id: &ToolCallId,
         tool_name: &ToolName,
-        input: &Value,
+        input: &ToolArguments,
     ) -> Result<RecordResult>;
 
     /// Append a tool-result row. Requires a live session.

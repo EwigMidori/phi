@@ -235,6 +235,9 @@ impl ScrollbackPainter {
                             }
                             TurnItem::ToolCall { .. } | TurnItem::ToolResult { .. } => Color::Gray,
                             TurnItem::Assistant { .. } => Color::Green,
+                            TurnItem::Continuation { .. } | TurnItem::ModelResponse { .. } => {
+                                Color::Gray
+                            }
                         };
                         Line::from(Span::styled(t.clone(), Style::default().fg(fg)))
                     })

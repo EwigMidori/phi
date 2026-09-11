@@ -171,9 +171,7 @@ impl TurnDriver {
         let api_style = Some(cfg.api_style);
         let api_base = cfg.api_base.clone();
         // Product strategy: lean chat context (not owned by phi-ext-llm).
-        let agent = Arc::new(
-            OpenAiCompatRuntime::new(cfg).with_projector(Arc::new(ChatTextOnly)),
-        );
+        let agent = Arc::new(OpenAiCompatRuntime::new(cfg).with_projector(Arc::new(ChatTextOnly)));
         Self {
             host: Some(SessionHost::new(agent)),
             config_error: None,
@@ -344,17 +342,24 @@ struct ChatTextOnly;
 
 impl HistoryProjector for ChatTextOnly {
     fn project(&self, history: &[TurnItem]) -> Vec<TurnItem> {
-        history
-            .iter()
-            .filter(|item| match item {
-                TurnItem::User { .. } => true,
-                TurnItem::Assistant { content } => !content.is_empty(),
-                TurnItem::Reasoning { .. }
-                | TurnItem::ToolCall { .. }
-                | TurnItem::ToolResult { .. } => false,
-            })
-            .cloned()
-            .collect()
+        let mut projected = Vec::new();
+        for item in history {
+            match item {
+                TurnItem::User { .. } => projected.push(item.clone()),
+                TurnItem::Assistant { content } if !content.is_empty() => {
+                    projected.push(item.clone())
+                }
+                TurnItem::ModelResponse { response } => {
+                    for row in &response.rows {
+                        if matches!(&row.item,TurnItem::Assistant{content} if !content.is_empty()) {
+                            projected.push(row.item.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        projected
     }
 }
 

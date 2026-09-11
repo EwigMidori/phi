@@ -9,7 +9,6 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
-use futures::StreamExt;
 use phi_kernel::{
     AgentPrefix, AgentRuntime, ContentPart, ImageId, JobId, MessageContent, SessionId, TailState,
     ToolCallSealPolicy, TurnCancel, TurnItem, TurnRequest,
@@ -383,8 +382,10 @@ async fn confirmed_missing_file_is_repaired_once_but_auth_and_rate_errors_are_no
             .unwrap();
         let service = Arc::new(ProviderImages::new(source, cache).unwrap());
         let runtime = OpenAiCompatRuntime::new(config).with_images(service, policy());
-        let result = runtime.run(request(&ImageId::generate())).await;
+        let mut run = runtime.run(request(&ImageId::generate())).await.unwrap();
+        let result = run.next().await.unwrap();
         assert_eq!(result.is_ok(), status == 400);
+        run.close_and_join().await.unwrap();
         assert_eq!(
             server.state.uploads.load(Ordering::SeqCst),
             usize::from(status == 400)
@@ -424,7 +425,9 @@ async fn persistent_rejection_stops_after_one_confirmed_file_repair() {
         .unwrap();
     let service = Arc::new(ProviderImages::new(source, cache).unwrap());
     let runtime = OpenAiCompatRuntime::new(config).with_images(service, policy());
-    assert!(runtime.run(request(&ImageId::generate())).await.is_err());
+    let mut run = runtime.run(request(&ImageId::generate())).await.unwrap();
+    assert!(run.next().await.unwrap().is_err());
+    run.close_and_join().await.unwrap();
     assert_eq!(server.state.uploads.load(Ordering::SeqCst), 1);
     assert_eq!(server.state.probes.load(Ordering::SeqCst), 1);
     assert_eq!(server.state.calls.lock().unwrap().len(), 2);

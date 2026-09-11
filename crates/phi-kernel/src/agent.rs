@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::content::{MessageContent, TailState};
-use crate::ids::{JobId, SessionId};
+use crate::ids::{JobId, ModelResponseId, SessionId};
 
 // ── Turn history projection ────────────────────────────────────────────────
 
@@ -55,7 +55,7 @@ pub enum TurnItem {
     ToolCall {
         tool_call_id: ToolCallId,
         tool_name: ToolName,
-        input: Value,
+        input: ToolArguments,
     },
     #[serde(rename_all = "camelCase")]
     ToolResult {
@@ -64,6 +64,56 @@ pub enum TurnItem {
         output: Value,
         status: ToolResultStatus,
     },
+    /// Provider-owned replay material, stored with its response group.
+    Continuation { continuation: ProviderContinuation },
+    /// Materialized response group. Never nested in persisted response rows.
+    ModelResponse { response: ModelResponse },
+}
+
+/// Exact arguments emitted by the provider, including malformed JSON.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ToolArguments(String);
+
+impl ToolArguments {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn parse(&self) -> Result<Value, String> {
+        serde_json::from_str(&self.0).map_err(|error| format!("invalid tool arguments: {error}"))
+    }
+    pub fn observation(&self) -> Value {
+        self.parse()
+            .unwrap_or_else(|_| Value::String(self.0.clone()))
+    }
+}
+impl From<Value> for ToolArguments {
+    fn from(value: Value) -> Self {
+        Self(value.to_string())
+    }
+}
+impl std::fmt::Display for ToolArguments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderContinuation {
+    pub scope: String,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelResponse {
+    pub id: ModelResponseId,
+    pub rows: Vec<crate::transcript::TranscriptRow>,
+    pub continuation: Option<ProviderContinuation>,
+    /// False for interrupted visible text; incomplete calls are never included.
+    pub complete: bool,
 }
 
 // ── Tools / tool-result status ─────────────────────────────────────────────
@@ -376,18 +426,24 @@ impl Usage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum AgentEvent {
+    ResponseStarted {
+        response_id: ModelResponseId,
+        assistant_message_id: crate::MessageId,
+    },
+    ModelResponseCompleted {
+        response: ModelResponse,
+    },
     #[serde(rename_all = "camelCase")]
-    TextDelta { text: String },
+    TextDelta {
+        text: String,
+    },
     #[serde(rename_all = "camelCase")]
-    ReasoningDelta { text: String },
-    #[serde(rename_all = "camelCase")]
-    ToolCall {
-        tool_call_id: ToolCallId,
-        tool_name: ToolName,
-        input: Value,
+    ReasoningDelta {
+        text: String,
     },
     #[serde(rename_all = "camelCase")]
     ToolResult {
+        response_id: ModelResponseId,
         tool_call_id: ToolCallId,
         output: Value,
         /// Sole outcome authority. Opaque `output` must not re-encode this.
@@ -402,9 +458,13 @@ pub enum AgentEvent {
     },
     /// Provider token usage (notice path only; not transcript).
     #[serde(rename_all = "camelCase")]
-    Usage { usage: Usage },
+    Usage {
+        usage: Usage,
+    },
     #[serde(rename_all = "camelCase")]
-    Error { message: String },
+    Error {
+        message: String,
+    },
     #[serde(rename_all = "camelCase")]
     Finished {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -421,8 +481,76 @@ pub enum AgentEvent {
 pub type AgentEventStream = Pin<Box<dyn Stream<Item = Result<AgentEvent, String>> + Send>>;
 
 #[async_trait]
+pub trait AgentRunLifecycle: Send + Sync {
+    async fn close_and_join(&self) -> Result<(), String>;
+}
+
+/// A pull-driven run. No further effect may begin until the consumer requests
+/// the next event after durably committing the previous event.
+pub struct AgentRun {
+    stream: Option<AgentEventStream>,
+    lifecycle: Option<Arc<dyn AgentRunLifecycle>>,
+}
+
+impl AgentRun {
+    /// A complete text response, useful to hosts providing deterministic agents.
+    pub fn text(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let response_id = ModelResponseId::generate();
+        let assistant_message_id = crate::MessageId::generate();
+        let response = ModelResponse {
+            id: response_id.clone(),
+            rows: vec![crate::TranscriptRow::new(
+                assistant_message_id.clone(),
+                TurnItem::Assistant {
+                    content: text.clone(),
+                },
+            )],
+            continuation: None,
+            complete: true,
+        };
+        Self::new(Box::pin(futures::stream::iter([
+            Ok(AgentEvent::ResponseStarted {
+                response_id,
+                assistant_message_id,
+            }),
+            Ok(AgentEvent::TextDelta { text }),
+            Ok(AgentEvent::ModelResponseCompleted { response }),
+            Ok(AgentEvent::Finished { reason: None }),
+        ])))
+    }
+    pub fn new(stream: AgentEventStream) -> Self {
+        Self {
+            stream: Some(stream),
+            lifecycle: None,
+        }
+    }
+    pub fn with_lifecycle(stream: AgentEventStream, lifecycle: Arc<dyn AgentRunLifecycle>) -> Self {
+        Self {
+            stream: Some(stream),
+            lifecycle: Some(lifecycle),
+        }
+    }
+    pub async fn next(&mut self) -> Option<Result<AgentEvent, String>> {
+        use futures::StreamExt;
+        match self.stream.as_mut() {
+            Some(stream) => stream.next().await,
+            None => None,
+        }
+    }
+    pub async fn close_and_join(&mut self) -> Result<(), String> {
+        self.stream.take();
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.close_and_join().await?;
+        }
+        self.lifecycle.take();
+        Ok(())
+    }
+}
+
+#[async_trait]
 pub trait AgentRuntime: Send + Sync {
-    async fn run(&self, request: TurnRequest) -> Result<AgentEventStream, String>;
+    async fn run(&self, request: TurnRequest) -> Result<AgentRun, String>;
 }
 
 // ── Oneshot text complete (mechanism, not product labeling policy) ─────────

@@ -80,7 +80,13 @@ impl SessionHost {
     /// Durable history from the kernel transcript.
     pub fn history(&self) -> Result<Vec<TurnItem>, String> {
         self.transcript
-            .load_turn_history(&self.session_id)
+            .load_rows(&self.session_id)
+            .map(|rows| {
+                rows.into_iter()
+                    .filter(|row| !matches!(row.item, TurnItem::Continuation { .. }))
+                    .map(|row| row.item)
+                    .collect()
+            })
             .map_err(|e| e.to_string())
     }
 

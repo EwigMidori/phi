@@ -91,6 +91,24 @@ impl SessionDirectory {
             q.abort_current_turn_only();
         }
     }
+    pub fn pause_claim(&self, session_id: &SessionId) {
+        self.activate(session_id);
+        if let Some(queue) = self.get(session_id) {
+            queue.pause_claims();
+        }
+    }
+    pub fn resume_claim(&self, session_id: &SessionId) -> Result<()> {
+        match self.get(session_id) {
+            Some(queue) => queue.resume_claims(),
+            None => Ok(()),
+        }
+    }
+    pub async fn stop_and_wait(&self, session_id: &SessionId) -> Result<()> {
+        match self.get(session_id) {
+            Some(queue) => queue.stop_and_wait().await,
+            None => Ok(()),
+        }
+    }
 
     /// Whether this session has neither a running generation nor pending work.
     #[must_use]
@@ -112,6 +130,13 @@ impl SessionDirectory {
             q.cancel_all_pending()
         };
         (n, q.pending_ids())
+    }
+    pub fn pending_ids(&self, session_id: &SessionId) -> Vec<JobId> {
+        self.get(session_id)
+            .map_or_else(Vec::new, |queue| queue.pending_ids())
+    }
+    pub fn fault(&self, session_id: &SessionId) -> Option<(JobId, String)> {
+        self.get(session_id)?.fault()
     }
 
     /// Deliver pump only. Missing queue → `Ok(())`.

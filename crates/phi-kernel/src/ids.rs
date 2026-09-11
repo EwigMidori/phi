@@ -92,6 +92,13 @@ string_id! {
     generate as generate;
 }
 
+string_id! {
+    /// One complete provider response within a generation.
+    pub struct ModelResponseId;
+    empty = "model response id empty";
+    generate as generate;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

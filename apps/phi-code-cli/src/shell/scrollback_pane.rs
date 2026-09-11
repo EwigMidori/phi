@@ -93,6 +93,11 @@ impl ScrollbackPane {
 
     fn apply_event(&mut self, driver: &TurnDriver, ev: &KernelEvent) {
         match ev {
+            KernelEvent::GenerationModelResponseCommitted { .. } => {
+                self.scrollback.end_live();
+                self.resync_durable(driver);
+                self.scrollback.begin_live();
+            }
             KernelEvent::GenerationStart { .. } => {
                 if !self.scrollback.is_streaming() {
                     self.scrollback.begin_live();

@@ -4,6 +4,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum KernelError {
+    #[error("generation commit failed: {0}")]
+    CommitFailed(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
     #[error("session is not live: {0}")]

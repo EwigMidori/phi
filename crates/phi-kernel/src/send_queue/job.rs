@@ -12,7 +12,7 @@ use crate::ids::{JobId, MessageId, SessionId};
 /// here — that belongs on [`super::SendQueue`] and
 /// [`super::turn::GenerationTurn`]. Equality, if ever needed, is by `job_id`
 /// alone, not structural field equality of the whole ticket.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GenerationJob {
     pub job_id: JobId,
     pub session_id: SessionId,

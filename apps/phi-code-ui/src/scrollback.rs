@@ -329,6 +329,7 @@ impl Scrollback {
         let i = self.selected?;
         let item = self.items.get(i)?;
         Some(match item {
+            TurnItem::Continuation { .. } | TurnItem::ModelResponse { .. } => return None,
             TurnItem::User { content } => content.plain_text(),
             TurnItem::Assistant { content } | TurnItem::Reasoning { content } => content.clone(),
             TurnItem::ToolCall {
@@ -733,6 +734,7 @@ impl<'a> EntryView<'a> {
 
     fn accent(&self) -> Accent {
         match self.item {
+            TurnItem::Continuation { .. } | TurnItem::ModelResponse { .. } => Accent::Thinking,
             TurnItem::User { .. } => Accent::User,
             TurnItem::Reasoning { .. } => Accent::Thinking,
             TurnItem::Assistant { .. } => Accent::Assistant,
@@ -751,6 +753,7 @@ impl<'a> EntryView<'a> {
         }
         let width = width.max(1);
         match self.item {
+            TurnItem::Continuation { .. } | TurnItem::ModelResponse { .. } => Vec::new(),
             TurnItem::User { content } => {
                 Self::wrap_text(&format!("› {}", content.plain_text()), width)
             }
@@ -790,6 +793,7 @@ impl<'a> EntryView<'a> {
 
     fn summary(&self) -> String {
         match self.item {
+            TurnItem::Continuation { .. } | TurnItem::ModelResponse { .. } => String::new(),
             TurnItem::User { content } => {
                 let text = content.plain_text();
                 let one = text.lines().next().unwrap_or("").trim();
