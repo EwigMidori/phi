@@ -15,6 +15,7 @@ pub use memory::InMemoryTranscript;
 use serde_json::Value;
 
 use crate::agent::{ToolCallId, ToolName, ToolResultStatus, TurnItem};
+use crate::content::MessageContent;
 use crate::error::Result;
 use crate::ids::{MessageId, SessionId};
 
@@ -80,7 +81,8 @@ pub trait Transcript: Send + Sync {
     }
 
     /// Append a user message. Requires a live session.
-    fn record_user(&self, session_id: &SessionId, text: &str) -> Result<RecordResult>;
+    fn record_user(&self, session_id: &SessionId, content: &MessageContent)
+    -> Result<RecordResult>;
 
     /// Delete the anchor message and every later message in that session (by order).
     ///

@@ -72,6 +72,13 @@ string_id! {
 }
 
 string_id! {
+    /// Immutable image bytes owned and resolved by the host.
+    pub struct ImageId;
+    empty = "image id empty";
+    generate as generate;
+}
+
+string_id! {
     /// Transcript message identity.
     pub struct MessageId;
     empty = "message id empty";

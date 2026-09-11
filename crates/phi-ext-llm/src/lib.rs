@@ -17,7 +17,14 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod image_tests;
+mod images;
 mod openai_compat;
+pub use images::{
+    FileCacheKey, FileReference, FileReferenceCache, ImageDigest, ImageMetadata, ImagePolicy,
+    ImageSource, ImageTransfer, ProviderFileId, ProviderImages,
+};
 
 pub use openai_compat::{
     ApiBase, ApiKey, ApiStyle, HistoryProjector, LlmConfig, ModelId, OpenAiCompatRuntime,

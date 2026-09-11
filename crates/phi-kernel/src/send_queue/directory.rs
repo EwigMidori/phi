@@ -92,6 +92,12 @@ impl SessionDirectory {
         }
     }
 
+    /// Whether this session has neither a running generation nor pending work.
+    #[must_use]
+    pub fn is_idle(&self, session_id: &SessionId) -> bool {
+        self.get(session_id).is_none_or(|queue| queue.is_idle())
+    }
+
     pub fn cancel_pending(
         &self,
         session_id: &SessionId,

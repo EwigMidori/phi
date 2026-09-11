@@ -22,6 +22,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::content::{MessageContent, TailState};
 use crate::ids::{JobId, SessionId};
 
 // ── Turn history projection ────────────────────────────────────────────────
@@ -42,7 +43,7 @@ use crate::ids::{JobId, SessionId};
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TurnItem {
     #[serde(rename_all = "camelCase")]
-    User { content: String },
+    User { content: MessageContent },
     /// Model chain-of-thought / reasoning summary for this span of the turn.
     /// Sits **before** (or between tool rows preceding) the answering
     /// [`TurnItem::Assistant`] — not nested inside it.
@@ -243,6 +244,7 @@ impl AgentPrefix {
 #[derive(Clone, Debug, Default)]
 pub struct TurnCancel {
     cancelled: Arc<AtomicBool>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl TurnCancel {
@@ -250,16 +252,31 @@ impl TurnCancel {
     pub fn new() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.changed.notify_waiters();
     }
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Wake every waiter on cancellation, including callers arriving afterwards.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -273,9 +290,25 @@ pub struct TurnRequest {
     pub session_id: SessionId,
     pub job_id: JobId,
     pub history: Vec<TurnItem>,
+    /// Transient material, separate from durable history and the stable prefix.
+    pub tail_state: Option<TailState>,
     pub prefix: AgentPrefix,
     pub tool_call_seal: ToolCallSealPolicy,
     pub cancel: TurnCancel,
+}
+
+impl TurnRequest {
+    /// Materialize transient tail state after host history projection, without
+    /// mutating this request or its durable-history snapshot.
+    pub fn materialize_history(
+        &self,
+        mut projected: Vec<TurnItem>,
+    ) -> crate::error::Result<Vec<TurnItem>> {
+        if let Some(tail) = &self.tail_state {
+            tail.materialize(&mut projected)?;
+        }
+        Ok(projected)
+    }
 }
 
 // ── Usage (provider metering observation) ──────────────────────────────────
@@ -293,6 +326,10 @@ pub struct Usage {
     pub completion_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_miss_tokens: Option<u64>,
 }
 
 impl Usage {
@@ -306,7 +343,20 @@ impl Usage {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cached_tokens: None,
+            cache_miss_tokens: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_cache(
+        mut self,
+        cached_tokens: Option<u64>,
+        cache_miss_tokens: Option<u64>,
+    ) -> Self {
+        self.cached_tokens = cached_tokens;
+        self.cache_miss_tokens = cache_miss_tokens;
+        self
     }
 
     /// True when the provider reported no counters.
@@ -315,6 +365,8 @@ impl Usage {
         self.prompt_tokens.is_none()
             && self.completion_tokens.is_none()
             && self.total_tokens.is_none()
+            && self.cached_tokens.is_none()
+            && self.cache_miss_tokens.is_none()
     }
 }
 
@@ -466,6 +518,7 @@ impl TurnMaterials for SourcesTurnMaterials {
             session_id: session_id.clone(),
             job_id,
             history,
+            tail_state: None,
             prefix: self.prefix.prefix_for(session_id),
             tool_call_seal: self.tool_call_seal.tool_call_seal_for(session_id),
             cancel,

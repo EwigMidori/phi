@@ -37,6 +37,7 @@ struct RunningClaim {
     job: GenerationJob,
     /// `cancel_epoch` at claim time; void once live has been bumped past this.
     epoch: Epoch,
+    cancel: TurnCancel,
 }
 
 struct QueueInner {
@@ -94,15 +95,19 @@ impl SendQueue {
     pub fn abort_current_turn_only(&self) {
         let mut g = self.lock();
         g.cancel_epoch = g.cancel_epoch.bump();
+        if let Some(claim) = &g.running {
+            claim.cancel.cancel();
+        }
     }
 
     /// Abort turn and drop all pending jobs.
     pub fn abort_turn_and_clear_queue(&self) {
         let mut g = self.lock();
         g.cancel_epoch = g.cancel_epoch.bump();
+        if let Some(claim) = &g.running {
+            claim.cancel.cancel();
+        }
         g.pending.clear();
-        g.running = None;
-        g.pump_active = false;
     }
 
     fn try_begin_pump(&self) -> bool {
@@ -133,19 +138,21 @@ impl SendQueue {
         Ok(())
     }
 
-    fn claim_for_pump(&self) -> Option<(GenerationJob, Epoch)> {
+    fn claim_for_pump(&self) -> Option<(GenerationJob, Epoch, TurnCancel)> {
         let mut g = self.lock();
         debug_assert!(g.pump_active, "claim_for_pump without pump seat");
         if let Some(claim) = g.running.clone() {
-            return Some((claim.job, claim.epoch));
+            return Some((claim.job, claim.epoch, claim.cancel));
         }
         let job = g.pending.pop_front()?;
         let epoch = g.cancel_epoch;
+        let cancel = TurnCancel::new();
         g.running = Some(RunningClaim {
             job: job.clone(),
             epoch,
+            cancel: cancel.clone(),
         });
-        Some((job, epoch))
+        Some((job, epoch, cancel))
     }
 
     fn mark_finished(&self, job_id: &JobId) {
@@ -178,6 +185,12 @@ impl SendQueue {
             .collect()
     }
 
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        let g = self.lock();
+        g.running.is_none() && g.pending.is_empty()
+    }
+
     /// Sole worker: drain queue via [`AgentPorts`]; record on `Transcript`.
     ///
     /// Per job: claim → begin → [`EffectApplier`] → materials.prepare → `agent.run` →
@@ -201,7 +214,7 @@ impl SendQueue {
                 break;
             }
 
-            let Some((job, claimed_epoch)) = self.claim_for_pump() else {
+            let Some((job, claimed_epoch, cancel)) = self.claim_for_pump() else {
                 break;
             };
 
@@ -230,7 +243,6 @@ impl SendQueue {
                 continue;
             }
 
-            let cancel = TurnCancel::new();
             let request = ports.materials.prepare(
                 &session_id,
                 turn.job_id().clone(),
@@ -239,8 +251,22 @@ impl SendQueue {
             );
             let tool_call_seal = request.tool_call_seal;
 
-            // Adapter failed to start stream → Failed.
-            let stream = match ports.agent.run(request).await {
+            // Upload/request preparation belongs to run and can itself block.
+            // Stop wakes this wait, releases the adapter future, and stays Aborted.
+            let started = tokio::select! {
+                biased;
+                () = cancel.cancelled() => None,
+                result = ports.agent.run(request) => Some(result),
+            };
+            if cancel.is_cancelled() || self.is_cancelled(turn.claimed_epoch()) {
+                self.finish_outcome(turn.into_aborted(), &applier)?;
+                continue;
+            }
+            let Some(started) = started else {
+                self.finish_outcome(turn.into_aborted(), &applier)?;
+                continue;
+            };
+            let stream = match started {
                 Ok(s) => s,
                 Err(error) => {
                     self.finish_outcome(turn.into_failed(error), &applier)?;
@@ -284,6 +310,12 @@ impl Drop for PumpSeat<'_> {
 mod tests {
     use super::*;
     use crate::ids::MessageId;
+    use crate::{
+        AgentEvent, AgentEventStream, AgentRuntime, EmptyAgentPrefix, InMemoryTranscript,
+        KernelEvent, MessageContent, TurnRequest,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     #[test]
     fn enqueue_does_not_claim_until_pump() {
@@ -310,5 +342,127 @@ mod tests {
         q.end_pump();
         assert!(q.try_begin_pump());
         q.end_pump();
+    }
+
+    #[test]
+    fn clear_queue_keeps_old_pump_seat_until_it_exits() {
+        let sid = SessionId::generate();
+        let q = SendQueue::new(sid.clone());
+        q.enqueue(GenerationJob::new(sid.clone(), MessageId::generate()))
+            .unwrap();
+        assert!(q.try_begin_pump());
+        let (old, _, cancel) = q.claim_for_pump().unwrap();
+        q.abort_turn_and_clear_queue();
+        assert!(cancel.is_cancelled());
+        assert!(
+            !q.try_begin_pump(),
+            "aborting must not release another worker's seat"
+        );
+        assert!(!q.is_idle());
+        q.mark_finished(&old.job_id);
+        q.end_pump();
+        q.enqueue(GenerationJob::new(sid, MessageId::generate()))
+            .unwrap();
+        assert!(q.try_begin_pump());
+        let (new, _, fresh_cancel) = q.claim_for_pump().unwrap();
+        assert!(!fresh_cancel.is_cancelled());
+        q.mark_finished(&old.job_id);
+        assert_eq!(q.lock().running.as_ref().unwrap().job.job_id, new.job_id);
+    }
+
+    struct WaitingFirstRun {
+        preparing: bool,
+        started: Arc<Notify>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRuntime for WaitingFirstRun {
+        async fn run(
+            &self,
+            _request: TurnRequest,
+        ) -> std::result::Result<AgentEventStream, String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_one();
+                if self.preparing {
+                    return futures::future::pending().await;
+                }
+                return Ok(Box::pin(futures::stream::pending()));
+            }
+            Ok(Box::pin(futures::stream::iter([
+                Ok(AgentEvent::TextDelta {
+                    text: "second completed".into(),
+                }),
+                Ok(AgentEvent::Finished { reason: None }),
+            ])))
+        }
+    }
+
+    async fn stop_waiting_turn(preparing: bool) {
+        let sid = SessionId::generate();
+        let transcript = InMemoryTranscript::new();
+        transcript.ensure_live(&sid).unwrap();
+        let user = transcript
+            .record_user(&sid, &MessageContent::text("input"))
+            .unwrap();
+        let queue = SendQueue::new(sid.clone());
+        let first = GenerationJob::new(sid.clone(), user.message_id.clone());
+        let second = GenerationJob::new(sid.clone(), user.message_id);
+        queue.enqueue(first.clone()).unwrap();
+        queue.enqueue(second.clone()).unwrap();
+        let started = Arc::new(Notify::new());
+        let ports = AgentPorts::from_sources(
+            Arc::new(WaitingFirstRun {
+                preparing,
+                started: started.clone(),
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(EmptyAgentPrefix),
+            Arc::new(crate::FixedToolCallSeal(
+                crate::ToolCallSealPolicy::LeaveOpen,
+            )),
+        );
+        let (bus, mut events) = tokio::sync::broadcast::channel(32);
+        let pump = queue.run_until_idle(&transcript, &ports, &bus);
+        let stop = async {
+            started.notified().await;
+            queue.abort_current_turn_only();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(pump, stop)
+        })
+        .await
+        .expect("stop must wake a pending adapter future or idle stream");
+        result.unwrap();
+        assert!(queue.is_idle());
+        let history = transcript.load_turn_history(&sid).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(
+            matches!(&history[1], crate::TurnItem::Assistant { content } if content == "second completed")
+        );
+        let mut stopped = Vec::new();
+        let mut done = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                KernelEvent::GenerationStopped { job_id, .. } => stopped.push(job_id),
+                KernelEvent::GenerationDone { job_id, .. } => done.push(job_id),
+                KernelEvent::GenerationError { .. } => {
+                    panic!("cancellation must not become a fault")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(stopped, vec![first.job_id]);
+        assert_eq!(done, vec![second.job_id]);
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_run_preparation_and_preserves_pending_jobs() {
+        stop_waiting_turn(true).await;
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_silent_stream_and_preserves_pending_jobs() {
+        stop_waiting_turn(false).await;
     }
 }

@@ -33,6 +33,7 @@ mod string_newtype;
 
 // Modules are private; crate root re-exports are the public surface.
 mod agent;
+mod content;
 mod error;
 mod events;
 mod ids;
@@ -45,13 +46,12 @@ pub use agent::{
     SkillSlug, SourcesTurnMaterials, ToolCallId, ToolCallSealPolicy, ToolCallSealSource, ToolName,
     ToolResultStatus, ToolSpec, TurnCancel, TurnItem, TurnMaterials, TurnRequest, Usage,
 };
+pub use content::{ContentPart, MessageContent, TailState};
 pub use error::{KernelError, Result};
 pub use events::{EventBus, KernelEvent};
-pub use ids::{JobId, MessageId, SessionId};
+pub use ids::{ImageId, JobId, MessageId, SessionId};
 pub use send_queue::{GenerationJob, SendQueue, SessionDirectory};
-pub use transcript::{
-    InMemoryTranscript, RecordResult, Transcript, TranscriptRow, TruncateResult,
-};
+pub use transcript::{InMemoryTranscript, RecordResult, Transcript, TranscriptRow, TruncateResult};
 
 pub const KERNEL_NAME: &str = "phi-kernel";
 
@@ -140,10 +140,14 @@ mod integration {
         dir.activate(&sid);
         let events = bus();
 
-        let u1 = store.record_user(&sid, "one").unwrap();
+        let u1 = store
+            .record_user(&sid, &MessageContent::text("one"))
+            .unwrap();
         dir.enqueue(&sid, GenerationJob::new(sid.clone(), u1.message_id))
             .unwrap();
-        let u2 = store.record_user(&sid, "two").unwrap();
+        let u2 = store
+            .record_user(&sid, &MessageContent::text("two"))
+            .unwrap();
         dir.enqueue(&sid, GenerationJob::new(sid.clone(), u2.message_id))
             .unwrap();
 
@@ -166,14 +170,18 @@ mod integration {
         let store = InMemoryTranscript::new();
         let sid = SessionId::generate();
         store.ensure_live(&sid).unwrap();
-        let u = store.record_user(&sid, "hello").unwrap();
+        let u = store
+            .record_user(&sid, &MessageContent::text("hello"))
+            .unwrap();
         let aid = MessageId::generate();
         store.record_assistant(&sid, &aid, "world").unwrap();
 
         let rows = store.load_rows(&sid).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].id, u.message_id);
-        assert!(matches!(&rows[0].item, TurnItem::User { content } if content == "hello"));
+        assert!(
+            matches!(&rows[0].item, TurnItem::User { content } if content.plain_text() == "hello")
+        );
         assert_eq!(rows[1].id, aid);
         assert!(matches!(&rows[1].item, TurnItem::Assistant { content } if content == "world"));
 
@@ -222,7 +230,9 @@ mod integration {
         dir.activate(&sid);
         let events = bus();
 
-        let u = store.record_user(&sid, "keep me").unwrap();
+        let u = store
+            .record_user(&sid, &MessageContent::text("keep me"))
+            .unwrap();
         dir.enqueue(&sid, GenerationJob::new(sid.clone(), u.message_id))
             .unwrap();
 
@@ -240,7 +250,9 @@ mod integration {
 
         let history = store.load_turn_history(&sid).unwrap();
         assert_eq!(history.len(), 1);
-        assert!(matches!(&history[0], TurnItem::User { content } if content == "keep me"));
+        assert!(
+            matches!(&history[0], TurnItem::User { content } if content.plain_text() == "keep me")
+        );
     }
 
     #[tokio::test]
@@ -252,12 +264,16 @@ mod integration {
         dir.activate(&sid);
         let events = bus();
 
-        let u1 = store.record_user(&sid, "one").unwrap();
+        let u1 = store
+            .record_user(&sid, &MessageContent::text("one"))
+            .unwrap();
         dir.enqueue(&sid, GenerationJob::new(sid.clone(), u1.message_id))
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 
-        let u2 = store.record_user(&sid, "two").unwrap();
+        let u2 = store
+            .record_user(&sid, &MessageContent::text("two"))
+            .unwrap();
         let u2_id = u2.message_id.clone();
         dir.enqueue(&sid, GenerationJob::new(sid.clone(), u2_id.clone()))
             .unwrap();
@@ -272,19 +288,25 @@ mod integration {
         assert_eq!(cut.removed_count, 2); // U2 + A2
         assert_eq!(store.load_turn_history(&sid).unwrap().len(), 2);
 
-        let u2b = store.record_user(&sid, "two-edited").unwrap();
+        let u2b = store
+            .record_user(&sid, &MessageContent::text("two-edited"))
+            .unwrap();
         dir.enqueue(&sid, GenerationJob::new(sid.clone(), u2b.message_id))
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
 
         let history = store.load_turn_history(&sid).unwrap();
         assert_eq!(history.len(), 4);
-        assert!(matches!(&history[0], TurnItem::User { content } if content == "one"));
-        assert!(matches!(&history[2], TurnItem::User { content } if content == "two-edited"));
+        assert!(matches!(&history[0], TurnItem::User { content } if content.plain_text() == "one"));
+        assert!(
+            matches!(&history[2], TurnItem::User { content } if content.plain_text() == "two-edited")
+        );
         assert!(matches!(&history[3], TurnItem::Assistant { content } if content == "new-reply"));
-        assert!(!history
-            .iter()
-            .any(|t| matches!(t, TurnItem::User { content } if content == "two")));
+        assert!(
+            !history
+                .iter()
+                .any(|t| matches!(t, TurnItem::User { content } if content.plain_text() == "two"))
+        );
     }
 
     #[tokio::test]
@@ -307,7 +329,9 @@ mod integration {
         ));
         dir.activate(&sid);
         let events = bus();
-        let u = store.record_user(&sid, "use tool").unwrap();
+        let u = store
+            .record_user(&sid, &MessageContent::text("use tool"))
+            .unwrap();
         dir.enqueue(&sid, GenerationJob::new(sid.clone(), u.message_id))
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
@@ -358,7 +382,9 @@ mod integration {
         dir.activate(&sid);
         let events = bus();
 
-        let u = store.record_user(&sid, "use tool").unwrap();
+        let u = store
+            .record_user(&sid, &MessageContent::text("use tool"))
+            .unwrap();
         dir.enqueue(&sid, GenerationJob::new(sid.clone(), u.message_id))
             .unwrap();
         dir.run_until_idle(&sid, &store, &events).await.unwrap();
@@ -367,7 +393,11 @@ mod integration {
         assert!(matches!(&history[0], TurnItem::User { .. }));
         assert!(matches!(&history[1], TurnItem::ToolCall { .. }));
         // No fabricated Incomplete result row under the default posture.
-        assert!(!history.iter().any(|t| matches!(t, TurnItem::ToolResult { .. })));
+        assert!(
+            !history
+                .iter()
+                .any(|t| matches!(t, TurnItem::ToolResult { .. }))
+        );
     }
 
     #[tokio::test]
@@ -403,13 +433,13 @@ mod integration {
         let sid = SessionId::generate();
         store.ensure_live(&sid).unwrap();
         let last = Arc::new(Mutex::new(None));
-        let dir = SessionDirectory::new(test_ports(Arc::new(CaptureAgent {
-            last: last.clone(),
-        })));
+        let dir = SessionDirectory::new(test_ports(Arc::new(CaptureAgent { last: last.clone() })));
         dir.activate(&sid);
         let events = bus();
 
-        let u = store.record_user(&sid, "use tool").unwrap();
+        let u = store
+            .record_user(&sid, &MessageContent::text("use tool"))
+            .unwrap();
         let tc = ToolCallId::new("tc1");
         let name = ToolName::new("echo");
         // Orchestration writes the tool round-trip directly (external execution).
@@ -431,7 +461,9 @@ mod integration {
 
         let req = last.lock().unwrap().clone().expect("agent ran");
         // Interleaved order preserved: user → tool call → tool result.
-        assert!(matches!(&req.history[0], TurnItem::User { content } if content == "use tool"));
+        assert!(
+            matches!(&req.history[0], TurnItem::User { content } if content.plain_text() == "use tool")
+        );
         assert!(matches!(
             &req.history[1],
             TurnItem::ToolCall { tool_call_id, tool_name, .. }

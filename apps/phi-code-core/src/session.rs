@@ -95,16 +95,13 @@ impl SessionHost {
         }
         let rec = self
             .transcript
-            .record_user(&self.session_id, text)
+            .record_user(&self.session_id, &phi_kernel::MessageContent::text(text))
             .map_err(|e| e.to_string())?;
         if !rec.wrote {
             return Err("transcript refused user write".into());
         }
         self.queue
-            .enqueue(GenerationJob::new(
-                self.session_id.clone(),
-                rec.message_id,
-            ))
+            .enqueue(GenerationJob::new(self.session_id.clone(), rec.message_id))
             .map_err(|e| e.to_string())?;
         self.ensure_pump();
         Ok(())

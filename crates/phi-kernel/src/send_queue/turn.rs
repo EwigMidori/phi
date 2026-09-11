@@ -42,11 +42,7 @@ pub(crate) struct GenerationTurn {
 
 impl GenerationTurn {
     #[must_use]
-    pub(crate) fn begin(
-        job: GenerationJob,
-        claimed_epoch: Epoch,
-        history: Vec<TurnItem>,
-    ) -> Self {
+    pub(crate) fn begin(job: GenerationJob, claimed_epoch: Epoch, history: Vec<TurnItem>) -> Self {
         Self {
             job,
             assistant_message_id: MessageId::generate(),
@@ -183,10 +179,7 @@ impl GenerationTurn {
             assistant_message_id: self.assistant_message_id.clone(),
             text,
         });
-        (
-            Disposition::Continue,
-            self.prepend_reasoning_flush(batch),
-        )
+        (Disposition::Continue, self.prepend_reasoning_flush(batch))
     }
 
     fn on_reasoning_delta(&mut self, text: String) -> (Disposition, EffectBatch) {
@@ -219,10 +212,7 @@ impl GenerationTurn {
             tool_name,
             input,
         });
-        (
-            Disposition::Continue,
-            self.prepend_reasoning_flush(batch),
-        )
+        (Disposition::Continue, self.prepend_reasoning_flush(batch))
     }
 
     /// Known open call → write only (projection in applier).
@@ -240,10 +230,7 @@ impl GenerationTurn {
                 output,
                 status,
             });
-            (
-                Disposition::Continue,
-                self.prepend_reasoning_flush(batch),
-            )
+            (Disposition::Continue, self.prepend_reasoning_flush(batch))
         } else {
             let batch = EffectBatch::from_notice(KernelEvent::GenerationToolResult {
                 session_id: self.session_id().clone(),
@@ -252,10 +239,7 @@ impl GenerationTurn {
                 output,
                 status,
             });
-            (
-                Disposition::Continue,
-                self.prepend_reasoning_flush(batch),
-            )
+            (Disposition::Continue, self.prepend_reasoning_flush(batch))
         }
     }
 
@@ -296,8 +280,17 @@ impl GenerationTurn {
         let mut terminal: Option<TurnTerminal> = None;
         let mut stream_err: Option<String> = None;
 
-        while let Some(item) = stream.next().await {
-            if is_cancelled() {
+        loop {
+            let item = tokio::select! {
+                biased;
+                () = agent_cancel.cancelled() => {
+                    stopped = true;
+                    break;
+                }
+                item = stream.next() => item,
+            };
+            let Some(item) = item else { break };
+            if is_cancelled() || agent_cancel.is_cancelled() {
                 agent_cancel.cancel();
                 stopped = true;
                 break;
@@ -323,7 +316,7 @@ impl GenerationTurn {
 
         // aborting = cooperative stop mid-stream or cancel-epoch stale after stream.
         // Abort outranks agent terminal / stream error (interrupt, not fault classification).
-        let aborting = stopped || is_cancelled();
+        let aborting = stopped || is_cancelled() || agent_cancel.is_cancelled();
         // Flush any open CoT span before seal / terminal (durable sibling row).
         if !self.reasoning_buffer.is_empty() {
             let job_id = self.job_id().clone();

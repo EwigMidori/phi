@@ -5,12 +5,12 @@
 //! - **Thinking chrome:** [`ThinkingPresenter`] — stable **open** span while streaming;
 //!   **sealed** by frozen content key only after flush (preserves expand across text).
 
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 use phi_kernel::{ToolResultStatus, TurnItem};
-use textwrap::{wrap, Options};
+use textwrap::{Options, wrap};
 
 use crate::markdown::ProductMarkdown;
 use crate::scrollbar::ScrollInfo;
@@ -219,7 +219,7 @@ impl Scrollback {
     /// Durable-only helpers for tests / offline paint.
     pub fn push_user(&mut self, content: impl Into<String>) {
         self.durable.push(TurnItem::User {
-            content: content.into(),
+            content: phi_kernel::MessageContent::text(content),
         });
         self.rematerialize();
     }
@@ -329,9 +329,8 @@ impl Scrollback {
         let i = self.selected?;
         let item = self.items.get(i)?;
         Some(match item {
-            TurnItem::User { content }
-            | TurnItem::Assistant { content }
-            | TurnItem::Reasoning { content } => content.clone(),
+            TurnItem::User { content } => content.plain_text(),
+            TurnItem::Assistant { content } | TurnItem::Reasoning { content } => content.clone(),
             TurnItem::ToolCall {
                 tool_name, input, ..
             } => format!("{tool_name}\n{input}"),
@@ -684,8 +683,10 @@ impl ThinkingChrome {
     }
 
     fn elapsed_ms(&self) -> Option<u64> {
-        self.finished_elapsed_ms
-            .or_else(|| self.streaming.then(|| self.started_at.elapsed().as_millis() as u64))
+        self.finished_elapsed_ms.or_else(|| {
+            self.streaming
+                .then(|| self.started_at.elapsed().as_millis() as u64)
+        })
     }
 
     fn header_line(&self) -> String {
@@ -750,7 +751,9 @@ impl<'a> EntryView<'a> {
         }
         let width = width.max(1);
         match self.item {
-            TurnItem::User { content } => Self::wrap_text(&format!("› {content}"), width),
+            TurnItem::User { content } => {
+                Self::wrap_text(&format!("› {}", content.plain_text()), width)
+            }
             TurnItem::Reasoning { content } => {
                 let chrome = self.thinking_chrome;
                 let expanded = chrome.is_some_and(|c| c.expanded);
@@ -788,7 +791,8 @@ impl<'a> EntryView<'a> {
     fn summary(&self) -> String {
         match self.item {
             TurnItem::User { content } => {
-                let one = content.lines().next().unwrap_or("").trim();
+                let text = content.plain_text();
+                let one = text.lines().next().unwrap_or("").trim();
                 format!("› {one} …")
             }
             TurnItem::Reasoning { content } => {
@@ -802,10 +806,7 @@ impl<'a> EntryView<'a> {
             TurnItem::ToolCall { tool_name, .. } => format!("⚙ {tool_name}  [folded]"),
             TurnItem::ToolResult {
                 tool_name, status, ..
-            } => format!(
-                "↳ {tool_name} [{}]  [folded]",
-                Self::status_label(*status)
-            ),
+            } => format!("↳ {tool_name} [{}]  [folded]", Self::status_label(*status)),
         }
     }
 
@@ -895,11 +896,16 @@ mod tests {
         sb.live_reasoning_delta("secret cot");
         assert!(sb.live_text_delta("visible"));
         // Live CoT cleared once answer starts (caller reloads durable after true).
-        assert!(sb.items().iter().any(|i| matches!(i, TurnItem::Assistant { content } if content == "visible")));
-        assert!(!sb
-            .items()
-            .iter()
-            .any(|i| matches!(i, TurnItem::Reasoning { content } if content == "secret cot")));
+        assert!(
+            sb.items()
+                .iter()
+                .any(|i| matches!(i, TurnItem::Assistant { content } if content == "visible"))
+        );
+        assert!(
+            !sb.items()
+                .iter()
+                .any(|i| matches!(i, TurnItem::Reasoning { content } if content == "secret cot"))
+        );
     }
 
     #[test]

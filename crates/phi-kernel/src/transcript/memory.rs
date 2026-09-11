@@ -179,13 +179,17 @@ impl Transcript for InMemoryTranscript {
         Ok(s.messages.clone())
     }
 
-    fn record_user(&self, session_id: &SessionId, text: &str) -> Result<RecordResult> {
+    fn record_user(
+        &self,
+        session_id: &SessionId,
+        content: &crate::MessageContent,
+    ) -> Result<RecordResult> {
         self.append_live(
             session_id,
             TranscriptRow {
                 id: MessageId::generate(),
                 item: TurnItem::User {
-                    content: text.to_owned(),
+                    content: content.clone(),
                 },
             },
         )

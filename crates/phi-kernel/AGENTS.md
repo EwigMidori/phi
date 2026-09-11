@@ -8,6 +8,9 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 
 - Ids / `KernelError` / `KernelEvent`
 - `AgentRuntime` / `TurnRequest` / `AgentEvent` / `Usage` (provider metering observation)
+- `MessageContent` / `ContentPart` / `ImageId` — ordered user input; no bytes IO in kernel
+- `TailState` / `TurnRequest.tail_state` — independent transient state; adapter calls `materialize_history` once after projection; product owns policy, kernel owns placement
+- `TurnCancel::cancelled` — wakeable preparation/stream cancellation; token belongs to a queue claim
 - `KernelEvent::GenerationUsage` — notice only; **not** transcript
 - `AgentPorts` = runtime + `TurnMaterials` (pump inject); `SourcesTurnMaterials` = default prepare from sources
 - `AgentPrefix` / `AgentPrefixSource` / `PreambleSection` / `SkillSlug` / `SkillDesc` / `ToolSpec` (`name: ToolName`)
@@ -21,7 +24,7 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 | Layer | Fields | Owner |
 |-------|--------|--------|
 | **Prefix** | `preamble` (`Vec<PreambleSection>`), `tools`, `skill_index` (`BTreeMap<SkillSlug, SkillDesc>`) | Session/agent **binding** via `AgentPrefixSource`; `TurnRequest.prefix` is a **read-only snapshot** |
-| **Turn** | `history` (`Vec<TurnItem>`), `cancel`, `job_id`, `tool_call_seal` (snapshot) | This generation; assembled by `TurnMaterials::prepare` |
+| **Turn** | `history` (`Vec<TurnItem>`), independent `tail_state`, `cancel`, `job_id`, `tool_call_seal` (snapshot) | This generation; assembled by `TurnMaterials::prepare` |
 | **Transcript read** | `load_rows` → `TranscriptRow { id, item }`; `load_turn_history` = items only | Durable authority vs model material |
 | **Oneshot** | `OneshotText::complete(&str) -> String` | Bare text; no product prefix/tools; not session labeling policy |
 | **Pump inject** | `AgentPorts` { agent, materials } | Directory/queue plumbing — not a domain aggregate |
