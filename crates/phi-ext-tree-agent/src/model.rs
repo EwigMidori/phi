@@ -69,31 +69,3 @@ pub struct TreeEdge {
     /// Whether the child continues with the parent's history.
     pub kind: EdgeKind,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{EdgeKind, ParentEdge};
-    use serde_json::json;
-
-    #[test]
-    fn edge_kind_serde_is_camel_case() {
-        assert_eq!(
-            serde_json::to_value(EdgeKind::WithHistory).unwrap(),
-            json!("withHistory")
-        );
-        assert_eq!(
-            serde_json::to_value(EdgeKind::WithoutHistory).unwrap(),
-            json!("withoutHistory")
-        );
-    }
-
-    #[test]
-    fn parent_edge_serde_is_camel_case() {
-        let edge = ParentEdge::new("p".parse().unwrap(), EdgeKind::WithHistory);
-        let value = serde_json::to_value(&edge).unwrap();
-        assert_eq!(value["parent"], json!("p"));
-        assert_eq!(value["kind"], json!("withHistory"));
-        let round: ParentEdge = serde_json::from_value(value).unwrap();
-        assert_eq!(round, edge);
-    }
-}

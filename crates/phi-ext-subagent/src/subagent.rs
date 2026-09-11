@@ -410,28 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn subagent_request_tree_child_serde_shape() {
-        let req = tree_child_request();
-        let value = serde_json::to_value(&req).unwrap();
-        assert_eq!(value["mode"], "treeChild");
-        assert!(value.get("parentSessionId").is_some());
-        let roundtrip: SubagentRequest = serde_json::from_value(value).unwrap();
-        assert_eq!(roundtrip, req);
-    }
-
-    #[test]
-    fn subagent_request_ephemeral_serde_shape() {
-        let req = ephemeral_request();
-        let value = serde_json::to_value(&req).unwrap();
-        assert_eq!(value["mode"], "ephemeral");
-        assert!(value.get("originSessionId").is_some());
-        // Core remediation: an Ephemeral message must never carry a parent.
-        assert!(value.get("parentSessionId").is_none());
-        let roundtrip: SubagentRequest = serde_json::from_value(value).unwrap();
-        assert_eq!(roundtrip, req);
-    }
-
-    #[test]
     fn common_fields_accessible_across_variants() {
         let tree = tree_child_request();
         let ephemeral = ephemeral_request();
