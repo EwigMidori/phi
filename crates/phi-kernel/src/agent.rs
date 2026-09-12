@@ -544,6 +544,24 @@ impl AgentRun {
         self
     }
 
+    /// Hosts may commit an observed fact before it reaches the consumer. A failed commit
+    /// becomes a stream error; the run retains its original shutdown owner.
+    pub fn try_inspect_events(
+        mut self,
+        mut inspect: impl FnMut(&AgentEvent) -> Result<(), String> + Send + 'static,
+    ) -> Self {
+        use futures::StreamExt;
+        self.stream = self.stream.take().map(|stream| {
+            Box::pin(stream.map(move |event| {
+                if let Ok(value) = &event {
+                    inspect(value)?;
+                }
+                event
+            })) as AgentEventStream
+        });
+        self
+    }
+
     pub async fn next(&mut self) -> Option<Result<AgentEvent, String>> {
         use futures::StreamExt;
         match self.stream.as_mut() {
@@ -812,6 +830,22 @@ mod run_inspection_tests {
         run.close_and_join().await.unwrap();
         assert_eq!(closed.load(Ordering::SeqCst), 1);
         assert_eq!(observed.load(Ordering::SeqCst), 2);
+        assert!(run.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fallible_inspection_reports_host_failure_and_keeps_shutdown() {
+        let closed = Arc::new(AtomicUsize::new(0));
+        let mut run = AgentRun::with_lifecycle(
+            Box::pin(futures::stream::iter([Ok(AgentEvent::Usage {
+                usage: Usage::new(Some(12), None, None),
+            })])),
+            Arc::new(Lifecycle(closed.clone())),
+        )
+        .try_inspect_events(|_| Err("host write failed".into()));
+        assert!(matches!(run.next().await, Some(Err(error)) if error == "host write failed"));
+        run.close_and_join().await.unwrap();
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
         assert!(run.next().await.is_none());
     }
 }
