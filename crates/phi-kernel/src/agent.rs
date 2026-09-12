@@ -14,8 +14,8 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -531,6 +531,19 @@ impl AgentRun {
             lifecycle: Some(lifecycle),
         }
     }
+    /// Observe events without changing pull order or losing the run's shutdown owner.
+    pub fn inspect_events(
+        mut self,
+        inspect: impl FnMut(&Result<AgentEvent, String>) + Send + 'static,
+    ) -> Self {
+        use futures::StreamExt;
+        self.stream = self
+            .stream
+            .take()
+            .map(|stream| Box::pin(stream.inspect(inspect)) as AgentEventStream);
+        self
+    }
+
     pub async fn next(&mut self) -> Option<Result<AgentEvent, String>> {
         use futures::StreamExt;
         match self.stream.as_mut() {
@@ -755,5 +768,50 @@ mod tests {
         assert!(req.history.is_empty());
         assert!(req.prefix.tools.is_empty());
         assert_eq!(req.tool_call_seal, ToolCallSealPolicy::SealAlways);
+    }
+}
+
+#[cfg(test)]
+mod run_inspection_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Lifecycle(Arc<AtomicUsize>);
+    #[async_trait]
+    impl AgentRunLifecycle for Lifecycle {
+        async fn close_and_join(&self) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn inspection_is_pull_driven_and_preserves_shutdown() {
+        let observed = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let count = observed.clone();
+        let mut run = AgentRun::with_lifecycle(
+            Box::pin(futures::stream::iter([
+                Ok(AgentEvent::Usage {
+                    usage: Usage::new(Some(12), None, None),
+                }),
+                Err("failed".into()),
+            ])),
+            Arc::new(Lifecycle(closed.clone())),
+        )
+        .inspect_events(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            run.next().await,
+            Some(Ok(AgentEvent::Usage { .. }))
+        ));
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert!(matches!(run.next().await, Some(Err(message)) if message == "failed"));
+        run.close_and_join().await.unwrap();
+        run.close_and_join().await.unwrap();
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        assert_eq!(observed.load(Ordering::SeqCst), 2);
+        assert!(run.next().await.is_none());
     }
 }
