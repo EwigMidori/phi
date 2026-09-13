@@ -14,8 +14,8 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use futures::Stream;
@@ -293,40 +293,68 @@ impl AgentPrefix {
 
 #[derive(Clone, Debug, Default)]
 pub struct TurnCancel {
-    cancelled: Arc<AtomicBool>,
-    changed: Arc<tokio::sync::Notify>,
+    state: Arc<TurnCancelState>,
+    ancestors: Vec<Arc<TurnCancelState>>,
+}
+
+#[derive(Debug, Default)]
+struct TurnCancelState {
+    cancelled: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl TurnCancelState {
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl TurnCancel {
     #[must_use]
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parent cancellation reaches this child and its descendants. Cancelling
+    /// the child never cancels its parent or siblings. No relay task is spawned.
+    #[must_use]
+    pub fn child(&self) -> Self {
+        let mut ancestors = self.ancestors.clone();
+        ancestors.push(self.state.clone());
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            changed: Arc::new(tokio::sync::Notify::new()),
+            state: Arc::default(),
+            ancestors,
         }
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-        self.changed.notify_waiters();
+        self.state.cancelled.store(true, Ordering::SeqCst);
+        self.state.changed.notify_waiters();
     }
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        std::iter::once(&self.state)
+            .chain(&self.ancestors)
+            .any(|state| state.cancelled.load(Ordering::SeqCst))
     }
 
-    /// Wake every waiter on cancellation, including callers arriving afterwards.
+    /// Wake every waiter when this token or an ancestor is cancelled, including
+    /// callers arriving afterwards. Dropping the future removes its waiters.
     pub async fn cancelled(&self) {
-        loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.is_cancelled() {
-                return;
-            }
-            notified.await;
-        }
+        let waiters: Vec<_> = std::iter::once(&self.state)
+            .chain(&self.ancestors)
+            .map(|state| Box::pin(state.cancelled()))
+            .collect();
+        futures::future::select_all(waiters).await;
     }
 }
 
@@ -485,11 +513,20 @@ pub trait AgentRunLifecycle: Send + Sync {
     async fn close_and_join(&self) -> Result<(), String>;
 }
 
+/// Optional capability to stop generation while reading the current response's
+/// remaining usage. After `begin`, subsequent polls may yield only Usage and a
+/// terminal event: no tool execution, next request, text or response commits.
+/// The consumer bounds the wait and still owns `close_and_join`.
+pub trait ResponseUsageDrain: Send + Sync {
+    fn begin(&self);
+}
+
 /// A pull-driven run. No further effect may begin until the consumer requests
 /// the next event after durably committing the previous event.
 pub struct AgentRun {
     stream: Option<AgentEventStream>,
     lifecycle: Option<Arc<dyn AgentRunLifecycle>>,
+    usage_drain: Option<Arc<dyn ResponseUsageDrain>>,
 }
 
 impl AgentRun {
@@ -523,13 +560,33 @@ impl AgentRun {
         Self {
             stream: Some(stream),
             lifecycle: None,
+            usage_drain: None,
         }
     }
     pub fn with_lifecycle(stream: AgentEventStream, lifecycle: Arc<dyn AgentRunLifecycle>) -> Self {
         Self {
             stream: Some(stream),
             lifecycle: Some(lifecycle),
+            usage_drain: None,
         }
+    }
+    pub fn with_usage_drain(mut self, control: Arc<dyn ResponseUsageDrain>) -> Self {
+        self.usage_drain = Some(control);
+        self
+    }
+
+    pub fn usage_drain(&self) -> Option<Arc<dyn ResponseUsageDrain>> {
+        self.usage_drain.clone()
+    }
+    /// Transform the pull stream without replacing its shutdown owner. Even if
+    /// the transformed stream ends early, callers must await `close_and_join`
+    /// to drop the upstream stream and finish the original run's cleanup.
+    pub fn map_stream(
+        mut self,
+        transform: impl FnOnce(AgentEventStream) -> AgentEventStream,
+    ) -> Self {
+        self.stream = self.stream.take().map(transform);
+        self
     }
     /// Observe events without changing pull order or losing the run's shutdown owner.
     pub fn inspect_events(
@@ -575,6 +632,7 @@ impl AgentRun {
             lifecycle.close_and_join().await?;
         }
         self.lifecycle.take();
+        self.usage_drain.take();
         Ok(())
     }
 }
@@ -790,6 +848,59 @@ mod tests {
 }
 
 #[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn child_cancellation_wakes_descendants_without_cancelling_parent_or_sibling() {
+        let parent = TurnCancel::new();
+        let child = parent.child();
+        let sibling = parent.child();
+        let grandchild = child.child();
+        let child_wait = child.cancelled();
+        let grandchild_wait = grandchild.cancelled();
+        tokio::pin!(child_wait, grandchild_wait);
+        assert!(futures::poll!(&mut child_wait).is_pending());
+        assert!(futures::poll!(&mut grandchild_wait).is_pending());
+        child.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            child_wait.await;
+            grandchild_wait.await;
+        })
+        .await
+        .unwrap();
+        assert!(child.is_cancelled());
+        assert!(grandchild.is_cancelled());
+        assert!(child.child().is_cancelled());
+        assert!(!parent.is_cancelled());
+        assert!(!sibling.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn parent_cancellation_wakes_all_levels_and_late_children() {
+        let parent = TurnCancel::new();
+        let child = parent.child();
+        let grandchild = child.child();
+        let child_wait = child.cancelled();
+        let grandchild_wait = grandchild.cancelled();
+        tokio::pin!(child_wait, grandchild_wait);
+        assert!(futures::poll!(&mut child_wait).is_pending());
+        assert!(futures::poll!(&mut grandchild_wait).is_pending());
+        parent.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            child_wait.await;
+            grandchild_wait.await;
+            parent.child().cancelled().await;
+        })
+        .await
+        .unwrap();
+        assert!(parent.is_cancelled());
+        assert!(child.is_cancelled());
+        assert!(grandchild.is_cancelled());
+    }
+}
+
+#[cfg(test)]
 mod run_inspection_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -801,6 +912,64 @@ mod run_inspection_tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+    #[tokio::test]
+    async fn mapped_early_end_keeps_upstream_cleanup_and_drops_stream_before_join() {
+        use futures::StreamExt;
+        struct StreamGuard(Arc<AtomicBool>);
+        impl Drop for StreamGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct CheckedLifecycle {
+            dropped: Arc<AtomicBool>,
+            closed: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl AgentRunLifecycle for CheckedLifecycle {
+            async fn close_and_join(&self) -> Result<(), String> {
+                assert!(self.dropped.load(Ordering::SeqCst));
+                self.closed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let upstream = futures::stream::unfold(
+            (StreamGuard(dropped.clone()), polls.clone()),
+            |state| async move {
+                state.1.fetch_add(1, Ordering::SeqCst);
+                Some((
+                    Ok(AgentEvent::TextDelta {
+                        text: "one event".into(),
+                    }),
+                    state,
+                ))
+            },
+        );
+        let mut run = AgentRun::with_lifecycle(
+            Box::pin(upstream),
+            Arc::new(CheckedLifecycle {
+                dropped: dropped.clone(),
+                closed: closed.clone(),
+            }),
+        )
+        .map_stream(|stream| Box::pin(stream.take(1)));
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            run.next().await,
+            Some(Ok(AgentEvent::TextDelta { .. }))
+        ));
+        assert!(run.next().await.is_none());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(closed.load(Ordering::SeqCst), 0);
+        run.close_and_join().await.unwrap();
+        run.close_and_join().await.unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(closed.load(Ordering::SeqCst), 1);
+        assert!(run.next().await.is_none());
     }
     #[tokio::test]
     async fn inspection_is_pull_driven_and_preserves_shutdown() {

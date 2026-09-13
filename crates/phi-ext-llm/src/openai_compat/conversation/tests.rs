@@ -343,6 +343,134 @@ async fn byte_fragmentation_and_duplicate_ids_are_validated_before_execution() {
     }
 }
 
+#[tokio::test]
+async fn usage_only_drain_reads_both_protocol_tails_without_tools_or_another_request() {
+    for style in [ApiStyle::Completions, ApiStyle::Responses] {
+        for after_batch in [false, true] {
+            let server = Server::start(vec![if style == ApiStyle::Completions {
+                chat_calls()
+            } else {
+                responses_calls(false)
+            }])
+            .await;
+            let executions = Arc::new(AtomicUsize::new(0));
+            let mut registry = ToolRegistry::new();
+            registry
+                .register(Arc::new(Compute(executions.clone())))
+                .unwrap();
+            let registry = Arc::new(registry);
+            let mut run = server
+                .runtime(style, registry.clone())
+                .run(TurnRequest {
+                    session_id: SessionId::generate(),
+                    job_id: JobId::generate(),
+                    history: vec![TurnItem::User {
+                        content: "calculate".into(),
+                    }],
+                    prefix: AgentPrefix {
+                        tools: registry.specs(),
+                        ..Default::default()
+                    },
+                    cancel: TurnCancel::new(),
+                    tail_state: None,
+                    tool_call_seal: ToolCallSealPolicy::SealAlways,
+                })
+                .await
+                .unwrap();
+            loop {
+                let event = run.next().await.unwrap().unwrap();
+                if (after_batch && matches!(event, AgentEvent::ModelResponseCompleted { .. }))
+                    || (!after_batch && matches!(event, AgentEvent::TextDelta { .. }))
+                {
+                    break;
+                }
+            }
+            // After-batch mode also covers already queued, executable calls.
+            run.usage_drain().unwrap().begin();
+            let mut usage = None;
+            let mut finished = false;
+            while let Some(event) = run.next().await {
+                match event.unwrap() {
+                    AgentEvent::Usage { usage: reported } => usage = Some(reported),
+                    AgentEvent::Finished { .. } => finished = true,
+                    other => panic!("usage drain leaked an event: {other:?}"),
+                }
+            }
+            assert!(finished);
+            if !after_batch {
+                assert_eq!(usage.unwrap(), Usage::new(Some(12), Some(4), Some(16)));
+            }
+            run.close_and_join().await.unwrap();
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+            assert_eq!(server.state.requests.lock().unwrap().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn usage_drain_ignores_output_validation_and_bounds_the_unwanted_tail() {
+    let mut reader = SseReader::from_byte_stream(
+        stream::iter(
+            responses_calls(true)
+                .into_bytes()
+                .into_iter()
+                .map(|byte| Ok(Bytes::from(vec![byte]))),
+        ),
+        TurnCancel::new(),
+        ApiStyle::Responses,
+        "test".into(),
+    );
+    while !matches!(
+        reader.next().await.unwrap(),
+        Some(AgentEvent::TextDelta { .. })
+    ) {}
+    let accepted = reader.decoder.text.clone();
+    reader.begin_usage_drain();
+    assert!(
+        matches!(reader.next().await.unwrap(), Some(AgentEvent::Usage { usage }) if usage.total_tokens == Some(16))
+    );
+    assert!(reader.next().await.unwrap().is_none());
+    assert_eq!(reader.decoder.text, accepted);
+
+    let tail = sse(
+        vec![
+            json!({"choices":[{"delta":{"content":"x".repeat(256 * 1024)}}]}),
+            json!({"usage":{"total_tokens":16}}),
+        ],
+        true,
+    );
+    let mut reader = SseReader::from_byte_stream(
+        stream::iter([Ok(Bytes::from(tail))]),
+        TurnCancel::new(),
+        ApiStyle::Completions,
+        "test".into(),
+    );
+    reader.begin_usage_drain();
+    assert!(reader.next().await.unwrap().is_none());
+    assert!(reader.decoder.text.is_empty());
+
+    // Capture a report within the budget even when a large trailing transport
+    // chunk also contains unwanted output beyond that budget.
+    let tail = sse(
+        vec![
+            json!({"usage":{"total_tokens":16}}),
+            json!({"choices":[{"delta":{"content":"x".repeat(256 * 1024)}}]}),
+        ],
+        true,
+    );
+    let mut reader = SseReader::from_byte_stream(
+        stream::iter([Ok(Bytes::from(tail))]),
+        TurnCancel::new(),
+        ApiStyle::Completions,
+        "test".into(),
+    );
+    reader.begin_usage_drain();
+    assert!(
+        matches!(reader.next().await.unwrap(), Some(AgentEvent::Usage { usage }) if usage.total_tokens == Some(16))
+    );
+    assert!(reader.next().await.unwrap().is_none());
+}
+
 #[test]
 fn malformed_arguments_remain_model_correctable_and_incomplete_responses_fail() {
     let mut decoder = ResponseDecoder::new(ApiStyle::Completions, "scope".into());
@@ -360,53 +488,151 @@ fn malformed_arguments_remain_model_correctable_and_incomplete_responses_fail() 
     );
 }
 
-#[tokio::test]
-async fn incompatible_continuation_fails_before_network_and_oneshot_never_executes() {
-    let server = Server::start(vec![chat_calls()]).await;
-    let executions = Arc::new(AtomicUsize::new(0));
-    let mut registry = ToolRegistry::new();
-    registry
-        .register(Arc::new(Compute(executions.clone())))
+#[test]
+fn continuation_replay_projects_visible_text_without_changing_opaque_items() {
+    // Responses protocol fixture: reasoning and tool correlation must survive
+    // a host projection across multiple message and output_text items.
+    let original = json!([
+        {"type":"reasoning","id":"reasoning","summary":[],"encrypted_content":"opaque"},
+        {"type":"message","id":"first","role":"assistant","content":[
+            {"type":"output_text","text":"hello ","annotations":[]},
+            {"type":"output_text","text":"world","annotations":[]}
+        ]},
+        {"type":"function_call","id":"call-item","call_id":"call","name":"compute","arguments":"{\"value\":2}"},
+        {"type":"message","id":"second","role":"assistant","content":[
+            {"type":"output_text","text":"after tool","annotations":[]}
+        ]}
+    ]);
+    let mut decoder = ResponseDecoder::new(ApiStyle::Responses, "scope".into());
+    decoder
+        .consume(
+            json!({"type":"response.completed","response":{"output":original}}),
+            None,
+            &mut VecDeque::new(),
+        )
         .unwrap();
-    let registry = Arc::new(registry);
-    let runtime = server.runtime(ApiStyle::Responses, registry.clone());
-    let response = ModelResponse {
-        id: ModelResponseId::generate(),
-        rows: Vec::new(),
-        complete: true,
-        continuation: Some(ProviderContinuation {
-            scope: "different-provider".into(),
-            payload: json!([]),
-        }),
-    };
-    let mut run = runtime
-        .run(TurnRequest {
-            session_id: SessionId::generate(),
-            job_id: JobId::generate(),
-            history: vec![
-                TurnItem::User {
-                    content: MessageContent::text("continue"),
-                },
-                TurnItem::ModelResponse { response },
-            ],
-            prefix: AgentPrefix::baseline_chat(Vec::new()),
-            cancel: TurnCancel::new(),
-            tail_state: None,
-            tool_call_seal: ToolCallSealPolicy::SealAlways,
-        })
-        .await
+    let mut response = decoder.complete().unwrap();
+    let stored = response.clone();
+    let codec = WireCodec::for_style(ApiStyle::Responses);
+    let mut unchanged = Vec::new();
+    codec
+        .encode_history(
+            &TurnItem::ModelResponse {
+                response: response.clone(),
+            },
+            &PreparedImages::new(),
+            "scope",
+            &mut unchanged,
+        )
         .unwrap();
+    assert_eq!(unchanged, original.as_array().unwrap().clone());
+
+    for row in &mut response.rows {
+        if let TurnItem::Assistant { content } = &mut row.item {
+            *content = format!("[Alice] {content}");
+        }
+    }
+    let mut replay = Vec::new();
+    codec
+        .encode_history(
+            &TurnItem::ModelResponse {
+                response: response.clone(),
+            },
+            &PreparedImages::new(),
+            "scope",
+            &mut replay,
+        )
+        .unwrap();
+    let mut expected = original.clone();
+    expected[1]["content"][0]["text"] = json!("[Alice] hello world");
+    expected[1]["content"][1]["text"] = json!("");
+    expected[3]["content"][0]["text"] = json!("[Alice] after tool");
+    assert_eq!(replay, expected.as_array().unwrap().clone());
+    assert_eq!(response.continuation, stored.continuation);
+
+    response
+        .rows
+        .retain(|row| !matches!(row.item, TurnItem::Assistant { .. }));
     assert!(
-        run.next()
-            .await
-            .unwrap()
+        codec
+            .encode_history(
+                &TurnItem::ModelResponse { response },
+                &PreparedImages::new(),
+                "scope",
+                &mut Vec::new(),
+            )
             .unwrap_err()
-            .contains("persisted reasoning")
+            .contains("do not match")
     );
-    run.close_and_join().await.unwrap();
-    assert!(server.state.requests.lock().unwrap().is_empty());
-    let runtime = server.runtime(ApiStyle::Completions, registry);
-    assert!(runtime.complete("name this conversation").await.is_err());
-    assert_eq!(executions.load(Ordering::SeqCst), 0);
-    assert_eq!(server.state.requests.lock().unwrap().len(), 1);
+
+    let mut extra = stored;
+    extra.rows.push(TranscriptRow::new(
+        MessageId::generate(),
+        TurnItem::Assistant {
+            content: "unmatched".into(),
+        },
+    ));
+    assert!(
+        codec
+            .encode_history(
+                &TurnItem::ModelResponse { response: extra },
+                &PreparedImages::new(),
+                "scope",
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+            .contains("do not match")
+    );
+}
+
+#[tokio::test]
+async fn foreign_continuation_projects_visible_rows_and_still_requests() {
+    for style in [ApiStyle::Completions, ApiStyle::Responses] {
+        let server = Server::start(vec![final_response(style)]).await;
+        let runtime = server.runtime(style, Arc::new(ToolRegistry::new()));
+        let response = ModelResponse {
+            id: ModelResponseId::generate(),
+            rows: vec![TranscriptRow::new(
+                MessageId::generate(),
+                TurnItem::Assistant {
+                    content: "visible from other model".into(),
+                },
+            )],
+            complete: true,
+            continuation: Some(ProviderContinuation {
+                scope: "different-provider".into(),
+                payload: json!([{"type":"reasoning","encrypted_content":"must-not-leak"}]),
+            }),
+        };
+        let mut run = runtime
+            .run(TurnRequest {
+                session_id: SessionId::generate(),
+                job_id: JobId::generate(),
+                history: vec![
+                    TurnItem::User {
+                        content: MessageContent::text("continue"),
+                    },
+                    TurnItem::ModelResponse { response },
+                ],
+                prefix: AgentPrefix::baseline_chat(Vec::new()),
+                cancel: TurnCancel::new(),
+                tail_state: None,
+                tool_call_seal: ToolCallSealPolicy::SealAlways,
+            })
+            .await
+            .unwrap();
+        while let Some(item) = run.next().await {
+            item.unwrap();
+        }
+        run.close_and_join().await.unwrap();
+        let requests = server.state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let encoded = if style == ApiStyle::Responses {
+            serde_json::to_string(&requests[0]["input"]).unwrap()
+        } else {
+            serde_json::to_string(&requests[0]["messages"]).unwrap()
+        };
+        assert!(encoded.contains("visible from other model"));
+        assert!(!encoded.contains("must-not-leak"));
+    }
 }

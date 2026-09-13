@@ -29,5 +29,6 @@ before requesting the next event, and every exit must await `close_and_join`.
 Both Chat Completions and Responses support streamed function arguments, multiple
 serial tools, explicit error results, and continuation. Responses reasoning
 replay material is scoped to the provider, protocol, and model and must survive
-transcript persistence; scope mismatches fail explicitly. Provider response
+transcript persistence. A matching Responses scope replays the opaque payload;
+any other provider/protocol/model gets the portable visible rows. Provider response
 completion is distinct from the generation's final `Finished` event.

@@ -14,7 +14,7 @@
 //! **SRP:** queue owns job lifecycle + pump exclusivity. Stream interpretation
 //! lives on [`GenerationTurn`](super::turn::GenerationTurn) (`drive`).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::agent::{AgentPorts, TurnCancel};
@@ -190,15 +190,35 @@ impl SendQueue {
     ///
     /// Rejects jobs whose `session_id` does not match this queue (invariant).
     pub fn enqueue(&self, job: GenerationJob) -> Result<()> {
+        self.enqueue_many(vec![job]).map(|_| ())
+    }
+
+    /// Validate and append an ordered batch under one queue lock.
+    /// Returns the pending ids at that same boundary; a rejected batch changes nothing.
+    pub fn enqueue_many(&self, jobs: Vec<GenerationJob>) -> Result<Vec<JobId>> {
         let mut g = self.lock();
-        if job.session_id != g.id {
-            return Err(KernelError::InvalidArgument(format!(
-                "job session {} does not match queue {}",
-                job.session_id, g.id
-            )));
+        let mut ids = HashSet::new();
+        for job in &jobs {
+            if job.session_id != g.id {
+                return Err(KernelError::InvalidArgument(format!(
+                    "job session {} does not match queue {}",
+                    job.session_id, g.id
+                )));
+            }
+            if !ids.insert(&job.job_id)
+                || g.pending.iter().any(|pending| pending.job_id == job.job_id)
+                || g.running
+                    .as_ref()
+                    .is_some_and(|claim| claim.job.job_id == job.job_id)
+            {
+                return Err(KernelError::InvalidArgument(format!(
+                    "generation {} is already queued or running",
+                    job.job_id
+                )));
+            }
         }
-        g.pending.push_back(job);
-        Ok(())
+        g.pending.extend(jobs);
+        Ok(g.pending.iter().map(|job| job.job_id.clone()).collect())
     }
 
     fn claim_for_pump(&self) -> Option<(GenerationJob, Epoch, TurnCancel)> {
@@ -421,6 +441,55 @@ mod tests {
         let q = SendQueue::new(SessionId::generate());
         let foreign = GenerationJob::new(SessionId::generate(), MessageId::generate());
         assert!(q.enqueue(foreign).is_err());
+    }
+
+    #[test]
+    fn rejected_batch_preserves_the_entire_pending_queue() {
+        let sid = SessionId::generate();
+        let queue = SendQueue::new(sid.clone());
+        let existing = GenerationJob::new(sid.clone(), MessageId::generate());
+        queue.enqueue(existing.clone()).unwrap();
+        let next = GenerationJob::new(sid, MessageId::generate());
+        let foreign = GenerationJob::new(SessionId::generate(), MessageId::generate());
+        for batch in [
+            vec![next.clone(), foreign],
+            vec![next.clone(), next.clone()],
+            vec![next, existing.clone()],
+        ] {
+            assert!(queue.enqueue_many(batch).is_err());
+            assert_eq!(queue.pending_ids(), vec![existing.job_id.clone()]);
+        }
+    }
+
+    #[test]
+    fn batch_claims_preserve_order_and_reject_the_running_job() {
+        let sid = SessionId::generate();
+        let queue = SendQueue::new(sid.clone());
+        let first = GenerationJob::new(sid.clone(), MessageId::generate());
+        queue.enqueue(first.clone()).unwrap();
+        assert!(queue.try_begin_pump());
+        assert_eq!(queue.claim_for_pump().unwrap().0.job_id, first.job_id);
+        let second = GenerationJob::new(sid.clone(), MessageId::generate());
+        let third = GenerationJob::new(sid, second.user_message_id.clone());
+        assert!(
+            queue
+                .enqueue_many(vec![second.clone(), first.clone()])
+                .is_err()
+        );
+        assert!(queue.pending_ids().is_empty());
+        assert_eq!(
+            queue
+                .enqueue_many(vec![second.clone(), third.clone()])
+                .unwrap(),
+            vec![second.job_id.clone(), third.job_id.clone()]
+        );
+        queue.mark_finished(&first.job_id);
+        assert_eq!(queue.claim_for_pump().unwrap().0.job_id, second.job_id);
+        queue.mark_finished(&second.job_id);
+        assert_eq!(queue.claim_for_pump().unwrap().0.job_id, third.job_id);
+        queue.mark_finished(&third.job_id);
+        assert!(queue.is_idle());
+        queue.end_pump();
     }
 
     #[test]

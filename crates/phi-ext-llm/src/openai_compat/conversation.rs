@@ -4,7 +4,8 @@ use futures::{Stream, StreamExt, stream};
 use phi_ext_tools::{ToolExecution, ToolExecutionScope};
 use phi_kernel::{
     AgentEventStream, AgentRun, AgentRunLifecycle, MessageId, ModelResponse, ModelResponseId,
-    ProviderContinuation, ToolArguments, ToolCallId, ToolName, TranscriptRow, Usage,
+    ProviderContinuation, ResponseUsageDrain, ToolArguments, ToolCallId, ToolName, TranscriptRow,
+    Usage,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -17,6 +18,12 @@ mod tests;
 struct RunLifecycle {
     scope: Arc<ToolExecutionScope>,
     finished: AtomicBool,
+    usage_only: AtomicBool,
+}
+impl ResponseUsageDrain for RunLifecycle {
+    fn begin(&self) {
+        self.usage_only.store(true, Ordering::SeqCst);
+    }
 }
 #[async_trait]
 impl AgentRunLifecycle for RunLifecycle {
@@ -52,6 +59,7 @@ impl AgentRuntime for OpenAiCompatRuntime {
         let lifecycle = Arc::new(RunLifecycle {
             scope: Arc::new(self.tools.scope(request.cancel.clone())),
             finished: AtomicBool::new(false),
+            usage_only: AtomicBool::new(false),
         });
         let conversation = ProviderConversation {
             runtime: self.clone(),
@@ -78,7 +86,7 @@ impl AgentRuntime for OpenAiCompatRuntime {
                 Some((event, conversation))
             },
         ));
-        Ok(AgentRun::with_lifecycle(stream, lifecycle))
+        Ok(AgentRun::with_lifecycle(stream, lifecycle.clone()).with_usage_drain(lifecycle))
     }
 }
 
@@ -104,6 +112,25 @@ impl ProviderConversation {
     async fn next(&mut self) -> Result<AgentEvent, String> {
         if self.request.cancel.is_cancelled() {
             return Err("generation cancelled".into());
+        }
+        if self.lifecycle.usage_only.load(Ordering::SeqCst) {
+            // This branch is before the commit acknowledgement/tool loop. Even
+            // already-decoded calls can never execute after usage draining begins.
+            if let Some(reader) = &mut self.reader {
+                reader.begin_usage_drain();
+                match reader.next().await {
+                    Ok(Some(event @ AgentEvent::Usage { .. })) => return Ok(event),
+                    // The accepted answer is independent of optional metadata.
+                    // A malformed/failed tail simply leaves counters unknown.
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            self.reader = None;
+            self.done = true;
+            self.lifecycle.finished.store(true, Ordering::SeqCst);
+            return Ok(AgentEvent::Finished {
+                reason: Some("response usage drained".into()),
+            });
         }
         // Reaching this poll acknowledges the previous response/result commit.
         if let Some(response) = self.pending_response.take() {
@@ -211,8 +238,16 @@ pub(super) struct SseReader {
     cancel: TurnCancel,
     queued: VecDeque<AgentEvent>,
     done: bool,
+    usage_bytes_left: Option<usize>,
 }
 impl SseReader {
+    fn begin_usage_drain(&mut self) {
+        if self.usage_bytes_left.is_none() {
+            self.usage_bytes_left = Some(256 * 1024);
+            self.queued
+                .retain(|event| matches!(event, AgentEvent::Usage { .. }));
+        }
+    }
     pub(super) fn from_byte_stream<S>(
         stream: S,
         cancel: TurnCancel,
@@ -237,6 +272,7 @@ impl SseReader {
             cancel,
             queued,
             done: false,
+            usage_bytes_left: None,
         }
     }
     async fn next(&mut self) -> Result<Option<AgentEvent>, String> {
@@ -247,7 +283,18 @@ impl SseReader {
             if self.done {
                 return Ok(None);
             }
+            if self.usage_bytes_left == Some(0) {
+                self.done = true;
+                return Ok(None);
+            }
             while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                if let Some(remaining) = &mut self.usage_bytes_left {
+                    if index + 1 > *remaining {
+                        self.done = true;
+                        return Ok(None);
+                    }
+                    *remaining -= index + 1;
+                }
                 let line: Vec<_> = self.buffer.drain(..=index).collect();
                 let line = std::str::from_utf8(&line)
                     .map_err(|_| "invalid UTF-8 in provider stream")?
@@ -268,10 +315,22 @@ impl SseReader {
             if !self.queued.is_empty() || self.done {
                 continue;
             }
+            if self
+                .usage_bytes_left
+                .is_some_and(|remaining| self.buffer.len() >= remaining)
+            {
+                self.done = true;
+                return Ok(None);
+            }
             let next = tokio::select! {()=self.cancel.cancelled()=>return Err("request cancelled".into()),next=self.stream.next()=>next};
             match next {
                 Some(Ok(bytes)) => {
-                    self.buffer.extend(bytes);
+                    if let Some(remaining) = self.usage_bytes_left {
+                        let allowed = remaining.saturating_sub(self.buffer.len()).min(bytes.len());
+                        self.buffer.extend_from_slice(&bytes[..allowed]);
+                    } else {
+                        self.buffer.extend(bytes);
+                    }
                     if self.buffer.len() > 8 * 1024 * 1024 {
                         return Err("provider SSE frame exceeds limit".into());
                     }
@@ -284,7 +343,9 @@ impl SseReader {
                     if !self.data.is_empty() {
                         self.dispatch()?;
                     }
-                    if !self.done {
+                    if self.usage_bytes_left.is_some() {
+                        self.done = true;
+                    } else if !self.done {
                         if self.decoder.style == ApiStyle::Completions
                             && self.decoder.finish_reason.is_some()
                         {
@@ -304,6 +365,27 @@ impl SseReader {
         }
         let data = std::mem::take(&mut self.data).join("\n");
         let event = self.event.take();
+        if self.usage_bytes_left.is_some() {
+            if data == "[DONE]" {
+                self.done = true;
+                return Ok(());
+            }
+            let value: Value = serde_json::from_str(&data)
+                .map_err(|error| format!("invalid usage-tail SSE JSON: {error}"))?;
+            if let Some(usage) = ResponseDecoder::usage(&value) {
+                self.queued.push_back(AgentEvent::Usage { usage });
+            }
+            if matches!(
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .or(event.as_deref()),
+                Some("response.completed" | "response.failed" | "response.incomplete" | "error")
+            ) {
+                self.done = true;
+            }
+            return Ok(());
+        }
         if data == "[DONE]" {
             if self.decoder.style != ApiStyle::Completions {
                 return Err("unexpected DONE in Responses stream".into());

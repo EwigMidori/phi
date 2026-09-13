@@ -11,8 +11,8 @@ use crate::images::{PreparedImage, PreparedImages};
 use crate::{ImagePolicy, ProviderImages};
 use async_trait::async_trait;
 use phi_kernel::{
-    AgentEvent, AgentPrefix, AgentRuntime, ContentPart, JobId, MessageContent, OneshotText,
-    SessionId, ToolCallSealPolicy, TurnCancel, TurnItem, TurnRequest,
+    AgentEvent, AgentPrefix, AgentRuntime, ContentPart, JobId, MessageContent, ModelResponse,
+    OneshotText, SessionId, ToolCallSealPolicy, TurnCancel, TurnItem, TurnRequest,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -273,10 +273,10 @@ impl WireCodec {
         match item {
             TurnItem::ModelResponse{response}=>{
                 if let Some(continuation)=&response.continuation {
-                    if continuation.scope!=scope{return Err("provider/model/protocol differs from persisted reasoning continuation".into());}
-                    if self.style!=ApiStyle::Responses{return Err("unsupported continuation protocol".into());}
-                    let items=continuation.payload.as_array().ok_or("invalid persisted continuation")?;
-                    out.extend(items.iter().cloned());return Ok(());
+                    if continuation.scope==scope && self.style==ApiStyle::Responses {
+                        let items=continuation.payload.as_array().ok_or("invalid persisted continuation")?;
+                        out.extend(self.project_continuation(response, items)?);return Ok(());
+                    }
                 }
                 if self.style==ApiStyle::Completions {
                     let mut text=String::new();let mut calls=Vec::new();
@@ -303,6 +303,63 @@ impl WireCodec {
             _=>{if let Some(message)=self.encode_role_message(item,images)?{out.push(message);}}
         }
         Ok(())
+    }
+
+    /// Replay opaque provider state while honoring the host's visible-text projection.
+    /// ResponseDecoder emits one Assistant row per nonempty message, in payload order.
+    /// Structural projections cannot use this correspondence and must fail explicitly.
+    fn project_continuation(
+        &self,
+        response: &ModelResponse,
+        items: &[Value],
+    ) -> Result<Vec<Value>, String> {
+        let mut assistants = response.rows.iter().filter_map(|row| match &row.item {
+            TurnItem::Assistant { content } => Some(content),
+            _ => None,
+        });
+        let mut replay = items.to_vec();
+        for item in &mut replay {
+            if item.get("type").and_then(Value::as_str) != Some("message") {
+                continue;
+            }
+            let parts = item
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+                .ok_or("continuation message content is missing")?;
+            let mut original = String::new();
+            for part in parts.iter() {
+                if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                    original.push_str(
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .ok_or("continuation output text is missing")?,
+                    );
+                }
+            }
+            if original.is_empty() {
+                continue;
+            }
+            let projected = assistants
+                .next()
+                .ok_or("continuation visible messages do not match assistant rows")?;
+            if projected == &original {
+                continue;
+            }
+            // Keep opaque item fields and nontext parts intact. A row owns the
+            // combined visible text, so place its projection once in the first
+            // output_text part and clear subsequent text fragments.
+            let mut replacement = projected.as_str();
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                    part["text"] = Value::String(replacement.to_owned());
+                    replacement = "";
+                }
+            }
+        }
+        if assistants.next().is_some() {
+            return Err("continuation visible messages do not match assistant rows".into());
+        }
+        Ok(replay)
     }
 
     /// Map one transcript row to a role message when this dialect can express it.

@@ -72,7 +72,16 @@ impl SessionDirectory {
     ///
     /// `job.session_id` must equal `session_id`.
     pub fn enqueue(&self, session_id: &SessionId, job: GenerationJob) -> Result<Vec<JobId>> {
-        if &job.session_id != session_id {
+        self.enqueue_many(session_id, vec![job])
+    }
+
+    /// Deliver one ordered batch; validation failure never publishes a partial batch.
+    pub fn enqueue_many(
+        &self,
+        session_id: &SessionId,
+        jobs: Vec<GenerationJob>,
+    ) -> Result<Vec<JobId>> {
+        if let Some(job) = jobs.iter().find(|job| &job.session_id != session_id) {
             return Err(KernelError::InvalidArgument(format!(
                 "job session {} does not match enqueue target {}",
                 job.session_id, session_id
@@ -82,8 +91,7 @@ impl SessionDirectory {
         let q = map
             .entry(session_id.as_str().to_owned())
             .or_insert_with(|| SendQueue::new(session_id.clone()));
-        q.enqueue(job)?;
-        Ok(q.pending_ids())
+        q.enqueue_many(jobs)
     }
 
     pub fn stop(&self, session_id: &SessionId) {

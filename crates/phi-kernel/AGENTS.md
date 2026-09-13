@@ -11,11 +11,13 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 - `MessageContent` / `ContentPart` / `ImageId` — ordered user input; no bytes IO in kernel
 - `TailState` / `TurnRequest.tail_state` — independent transient state; adapter calls `materialize_history` once after projection; product owns policy, kernel owns placement
 - `TurnCancel::cancelled` — wakeable preparation/stream cancellation; token belongs to a queue claim
+- `TurnCancel::child` inherits ancestor cancellation without cancelling ancestors or siblings; direct waiter composition, no background relay tasks.
 - `KernelEvent::GenerationUsage` — notice only; **not** transcript
 - `AgentPorts` = runtime + `TurnMaterials` (pump inject); `SourcesTurnMaterials` = default prepare from sources
 - `AgentPrefix` / `AgentPrefixSource` / `PreambleSection` / `SkillSlug` / `SkillDesc` / `ToolSpec` (`name: ToolName`)
 - `ToolCallSealPolicy` / `ToolCallSealSource` (seal; **opt-in** — default posture `LeaveOpen`; no enum default; usually behind materials)
 - **`SendQueue`** / `GenerationJob` / `SessionDirectory` (never call this "mailbox")
+- `enqueue_many` validates and appends an ordered batch atomically; pending/running or batch-duplicate JobIds are rejected without partial enqueue.
 - `Transcript` / `truncate_from` / `record_reasoning` (trait in `transcript/`); reference impl `InMemoryTranscript` (re-exported)
 - Reasoning is a durable sibling row (flushed from the generation turn before text/tools/end); live path is still `GenerationReasoningDelta` notices
 
@@ -37,6 +39,8 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 ## Generation turn (send_queue)
 
 - `AgentRuntime::run` returns owned `AgentRun`; the consumer uses `next` and always awaits `close_and_join`, including commit failures.
+- `AgentRun::map_stream` transforms the pull stream while retaining its lifecycle owner; early transformed termination still requires `close_and_join` for upstream cleanup.
+- `ResponseUsageDrain` is an optional explicit run capability: `begin` prevents further tool execution/provider requests and permits only usage/terminal events from the current response. Stream transforms/observers retain this capability; hosts bound the wait and still close/join the run. Kernel does not choose product delimiters or wait durations.
 - `GenerationTurn` buffers only the current visible response. `ModelResponseCompleted` commits the complete ordered response batch; terminal never writes a merged assistant body again.
 - `EffectApplier` is the sole commit/publish path. `Transcript::commit_generation` success means durable host commit. A response is committed before the adapter is polled again to execute tools; a result is committed before the next tool/provider request.
 - `GenerationCommit`: `Enqueue`, `Start`, `Response`, `ToolResult`, `Finish`; `TranscriptSession` persists rows plus generation records.
