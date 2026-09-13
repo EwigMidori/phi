@@ -11,7 +11,7 @@ fact — products orchestrate it out-of-band with `remove` / `remove_subtree` /
 | Area | API |
 |------|-----|
 | Aggregate | `SessionTree` (`open` / `add_root` / `derive` / `remove` / `remove_subtree` / `reparent`; accessors `contains` / `incoming_edge` / `children` / `path_to_root` / `is_leaf` / `root`; `snapshot` / `persist`) |
-| Model | `EdgeKind` (`WithHistory` / `WithoutHistory`), `ParentEdge`, `TreeEdge` |
+| Model | `EdgeKind` (`WithHistory` / `SummarizedHistory` / `WithoutHistory`), `ParentEdge`, `TreeEdge` |
 | Persistence | `TreeStore` (snapshot `save` / `load`), `TreeSnapshot` (+`validate`), `InMemoryTreeStore` |
 | Events | `TreeEvent` (`nodeCreated` / `edgeCreated` / `nodeRemoved` / `edgeReparented`) — projected by the caller, no built-in bus |
 | Errors | `TreeError` |

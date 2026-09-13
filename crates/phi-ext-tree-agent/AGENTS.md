@@ -11,7 +11,7 @@ no search (v1), no SQLite.
 ## Public surface
 
 - `SessionTree` (`open` / `add_root` / `derive` / `remove` / `remove_subtree` / `reparent`; accessors `contains` / `incoming_edge` / `children` / `path_to_root` / `is_leaf` / `root`; `snapshot` / `persist`)
-- `EdgeKind` (`WithHistory` / `WithoutHistory`), `ParentEdge`, `TreeEdge`
+- `EdgeKind` (`WithHistory` / `SummarizedHistory` / `WithoutHistory`), `ParentEdge`, `TreeEdge`
 - `TreeStore` / `TreeSnapshot` (+`validate`) / `InMemoryTreeStore`
 - `TreeEvent` (`nodeCreated` / `edgeCreated` / `nodeRemoved` / `edgeReparented`) — caller-projected, no built-in bus
 - `TreeError`

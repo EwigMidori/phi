@@ -24,6 +24,9 @@ pub enum EdgeKind {
     /// The child continues with the parent's history (e.g. a branch that keeps
     /// the whole dialogue).
     WithHistory,
+    /// The child receives a summarized representation of its parent's history.
+    /// Preparation, content and lifecycle belong to the host, not the tree.
+    SummarizedHistory,
     /// The child starts without the parent's history (e.g. a reset branch).
     WithoutHistory,
 }
