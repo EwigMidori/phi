@@ -32,3 +32,5 @@ replay material is scoped to the provider, protocol, and model and must survive
 transcript persistence. A matching Responses scope replays the opaque payload;
 any other provider/protocol/model gets the portable visible rows. Provider response
 completion is distinct from the generation's final `Finished` event.
+
+`with_tool_images` injects a host `ToolOutputImages` interpreter for opaque tool outputs. Images are projected into request-only, labelled user-role material after all adjacent tool replies (including Completions correlation constraints); persisted history is unchanged. The existing image service transfers actual bytes or provider file references. Text-only policies emit an explicit cannot-inspect notice instead of sending unsupported images.

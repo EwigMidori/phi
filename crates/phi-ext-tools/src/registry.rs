@@ -38,6 +38,14 @@ pub trait ToolExecutor: Send + Sync {
     fn spec(&self) -> ToolSpec;
     /// Must return only after owned resources have stopped, including cancellation.
     async fn execute(&self, input: Value, cancel: TurnCancel) -> ToolExecution;
+    async fn execute_in(
+        &self,
+        _session: &phi_kernel::SessionId,
+        input: Value,
+        cancel: TurnCancel,
+    ) -> ToolExecution {
+        self.execute(input, cancel).await
+    }
 }
 
 #[derive(Default)]
@@ -70,6 +78,7 @@ impl ToolRegistry {
     pub fn scope(self: &Arc<Self>, cancel: TurnCancel) -> ToolExecutionScope {
         ToolExecutionScope {
             registry: self.clone(),
+            session: None,
             cancel,
             closed: AtomicBool::new(false),
             joined: AtomicBool::new(false),
@@ -77,7 +86,23 @@ impl ToolRegistry {
         }
     }
 
-    async fn execute(&self, name: &ToolName, arguments: &str, cancel: TurnCancel) -> ToolExecution {
+    pub fn scope_for(
+        self: &Arc<Self>,
+        session: phi_kernel::SessionId,
+        cancel: TurnCancel,
+    ) -> ToolExecutionScope {
+        let mut scope = self.scope(cancel);
+        scope.session = Some(session);
+        scope
+    }
+
+    async fn execute(
+        &self,
+        session: Option<&phi_kernel::SessionId>,
+        name: &ToolName,
+        arguments: &str,
+        cancel: TurnCancel,
+    ) -> ToolExecution {
         if cancel.is_cancelled() {
             return ToolExecution::cancelled();
         }
@@ -94,12 +119,16 @@ impl ToolRegistry {
             Ok(input) => input,
             Err(error) => return ToolExecution::error("InvalidArguments", error.to_string()),
         };
-        tool.execute(input, cancel).await
+        match session {
+            Some(session) => tool.execute_in(session, input, cancel).await,
+            None => tool.execute(input, cancel).await,
+        }
     }
 }
 
 /// A single generation's owned executions. Dropping the stream does not lose child ownership.
 pub struct ToolExecutionScope {
+    session: Option<phi_kernel::SessionId>,
     registry: Arc<ToolRegistry>,
     cancel: TurnCancel,
     closed: AtomicBool,
@@ -118,6 +147,7 @@ impl ToolExecutionScope {
                 return ToolExecution::cancelled();
             }
             let (sender, receiver) = oneshot::channel();
+            let session = self.session.clone();
             let (registry, name, arguments, cancel) = (
                 self.registry.clone(),
                 name.clone(),
@@ -125,7 +155,9 @@ impl ToolExecutionScope {
                 self.cancel.clone(),
             );
             tasks.push(tokio::spawn(async move {
-                let result = registry.execute(&name, &arguments, cancel).await;
+                let result = registry
+                    .execute(session.as_ref(), &name, &arguments, cancel)
+                    .await;
                 let _ = sender.send(result);
             }));
             receiver

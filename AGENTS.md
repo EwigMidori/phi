@@ -1,4 +1,4 @@
-1. No backward compatibility. Outdated stuff? Delete it outright—no compatibility layers, no migration scripts, no fallbacks.
+1. Protect existing users' persisted data when changing formats or models. Provide explicit, tested migrations and rollback on failure. Keep one current runtime model rather than long-lived parallel implementations. Reject corrupt data or unsupported versions clearly; never silently reset or delete user files.
 
 2. Pick the simplest implementation that meets the current needs. No premature abstraction, no unnecessary config layers.
 
@@ -13,3 +13,5 @@
 7. Make architecture decisions for the long haul. No "we'll swap it out later" half-measures.
 
 8. See how mature products solve the same problem—use proven patterns, don't invent from scratch.
+
+9. Implement changes in a dedicated Git worktree on a task branch (default prefix: `codex/`). After validation, commit and merge into the primary branch (`main` here). Never leave completed, effective code uncommitted unless the user explicitly requests it. When used as a submodule, commit and merge here before committing the parent repository's updated gitlink. Push only when requested.

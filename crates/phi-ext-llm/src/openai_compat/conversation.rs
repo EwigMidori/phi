@@ -57,7 +57,10 @@ impl AgentRuntime for OpenAiCompatRuntime {
             }
         }
         let lifecycle = Arc::new(RunLifecycle {
-            scope: Arc::new(self.tools.scope(request.cancel.clone())),
+            scope: Arc::new(
+                self.tools
+                    .scope_for(request.session_id.clone(), request.cancel.clone()),
+            ),
             finished: AtomicBool::new(false),
             usage_only: AtomicBool::new(false),
         });

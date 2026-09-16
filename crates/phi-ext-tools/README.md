@@ -27,3 +27,5 @@ after a leader exits, and retained ownership after the consuming stream is dropp
 The desktop composition root additionally has a networked managed-Python smoke
 example which checks fresh venv provisioning, shared preparation cancellation,
 package installation/reuse, calculation, explicit repair, and strict existing files.
+
+`scope_for(session, cancel)` supplies execution identity to host-bound artifact services. Python receives an `artifacts.publish(relative_path, name=...)` helper and optional `inputs` staging by immutable artifact ID. Output collection happens after process-tree cleanup and before temporary-directory removal, only on successful execution. It is bounded to 16 files / 32 MiB per invocation; paths outside the run directory are rejected. Host storage commits before metadata references are returned. Standalone executors without an artifact service still compute, but publishing/reading artifacts fails explicitly. Matplotlib uses the headless Agg backend. Library versions and supported output formats remain host choices.

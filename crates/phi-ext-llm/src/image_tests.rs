@@ -222,6 +222,118 @@ async fn until(mut condition: impl FnMut() -> bool) {
     .expect("condition timeout");
 }
 
+struct PlotImages(ImageId);
+impl ToolOutputImages for PlotImages {
+    fn images(&self, _: &phi_kernel::ToolName, _: &Value) -> Result<Vec<ImageId>, String> {
+        Ok(vec![self.0.clone()])
+    }
+}
+
+/// OpenAI-compatible Completions / Responses image transport fixture, 2026-09-16.
+#[tokio::test]
+async fn tool_images_reach_both_protocols_after_all_replies_and_text_models_receive_an_explicit_notice()
+ {
+    use base64::Engine;
+    use phi_kernel::{ToolArguments, ToolCallId, ToolName, ToolResultStatus};
+    let server = Server::start().await;
+    for style in [ApiStyle::Completions, ApiStyle::Responses] {
+        for enabled in [true, false] {
+            let source = Arc::new(Source::new());
+            let service = Arc::new(
+                ProviderImages::new(source.clone(), Arc::new(MemoryCache::default())).unwrap(),
+            );
+            let mut image_policy = policy();
+            image_policy.enabled = enabled;
+            image_policy.transfer = Some(ImageTransfer::Inline);
+            let id = ImageId::generate();
+            let runtime = OpenAiCompatRuntime::new(server.config(style, "key"))
+                .with_images(service, image_policy)
+                .with_tool_images(Arc::new(PlotImages(id.clone())));
+            let mut request = request(&id);
+            request.history = vec![TurnItem::User {
+                content: MessageContent::text("make plots"),
+            }];
+            let calls: Vec<_> = ["first-plot", "second-plot"]
+                .into_iter()
+                .map(ToolCallId::new)
+                .collect();
+            request.history.push(TurnItem::ModelResponse {
+                response: phi_kernel::ModelResponse {
+                    id: phi_kernel::ModelResponseId::generate(),
+                    complete: true,
+                    continuation: None,
+                    rows: calls
+                        .iter()
+                        .map(|id| {
+                            phi_kernel::TranscriptRow::new(
+                                phi_kernel::MessageId::generate(),
+                                TurnItem::ToolCall {
+                                    tool_call_id: id.clone(),
+                                    tool_name: ToolName::new("plot"),
+                                    input: ToolArguments::new("{}"),
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            });
+            for id in &calls {
+                request.history.push(TurnItem::ToolResult {
+                    tool_call_id: id.clone(),
+                    tool_name: ToolName::new("plot"),
+                    output: json!({"summary":"fit complete"}),
+                    status: ToolResultStatus::Ok,
+                });
+            }
+            let mut run = runtime.run(request).await.unwrap();
+            while let Some(event) = run.next().await {
+                event.unwrap();
+            }
+            run.close_and_join().await.unwrap();
+            let requests = server.state.calls.lock().unwrap();
+            let body = requests.last().unwrap();
+            let messages = body[if style == ApiStyle::Responses {
+                "input"
+            } else {
+                "messages"
+            }]
+            .as_array()
+            .unwrap();
+            let tail = messages.last().unwrap();
+            assert_eq!(tail["role"], "user");
+            let preceding = &messages[messages.len() - 3..messages.len() - 1];
+            for (reply, id) in preceding.iter().zip(&calls) {
+                assert_eq!(
+                    reply[if style == ApiStyle::Responses {
+                        "call_id"
+                    } else {
+                        "tool_call_id"
+                    }],
+                    id.as_str()
+                );
+            }
+            if enabled {
+                let part = &tail["content"][1];
+                let url = if style == ApiStyle::Responses {
+                    part["image_url"].as_str().unwrap()
+                } else {
+                    part["image_url"]["url"].as_str().unwrap()
+                };
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(url.split_once(',').unwrap().1)
+                        .unwrap(),
+                    source.bytes
+                );
+                assert!(source.reads.load(Ordering::SeqCst) > 0);
+            } else {
+                assert!(tail.to_string().contains("cannot view"));
+                assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn two_dialects_preserve_content_and_tail_order_and_reuse_one_upload() {
     let server = Server::start().await;

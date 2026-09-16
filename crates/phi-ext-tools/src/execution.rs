@@ -213,18 +213,24 @@ pub trait PythonEnvironment: Send + Sync {
 }
 
 pub struct PythonExecutor {
+    artifacts: Option<Arc<dyn crate::ExecutionArtifacts>>,
     environment: Arc<dyn PythonEnvironment>,
     runs: PathBuf,
     limits: ExecutionLimits,
     supervisor: ProcessSupervisor,
 }
 impl PythonExecutor {
+    pub fn with_artifacts(mut self, artifacts: Arc<dyn crate::ExecutionArtifacts>) -> Self {
+        self.artifacts = Some(artifacts);
+        self
+    }
     pub fn new(
         environment: Arc<dyn PythonEnvironment>,
         runs: PathBuf,
         limits: ExecutionLimits,
     ) -> Self {
         Self {
+            artifacts: None,
             environment,
             runs,
             limits,
@@ -235,12 +241,44 @@ impl PythonExecutor {
 #[async_trait]
 impl ToolExecutor for PythonExecutor {
     fn spec(&self) -> ToolSpec {
-        CodeSpec::build(
+        let mut spec = CodeSpec::build(
             "run_python",
-            "Execute Python calculations in the application's dedicated virtual environment. Fresh process and temporary working directory each call; variables and files do not persist. Use print() for results; the last expression is not automatically printed. Standard library and pip are available. Install packages with subprocess.run([sys.executable, '-m', 'pip', 'install', 'package'], check=True); installed packages persist. The execution deadline includes package installation.",
-        )
+            "Execute Python in a fresh process and temporary directory. print() returns text. Use artifacts.publish('plot.png') or artifacts.publish('data.csv') to persist files; published files are collected only on successful exit, maximum 16 files and 32 MiB total. Matplotlib uses Agg: savefig(), then publish(); do not use show(). Files from earlier results can be staged using inputs:[{id: artifact ID, path: relative filename}]. Variables do not persist. pip packages persist; install with subprocess.run([sys.executable, '-m', 'pip', 'install', 'package'], check=True). Return useful numeric summaries with print even when publishing a plot.",
+        );
+        spec.parameters.as_mut().expect("code schema")["properties"]["inputs"] = json!({"type":"array","maxItems":16,"items":{"type":"object","properties":{"id":{"type":"string"},"path":{"type":"string"}},"required":["id","path"],"additionalProperties":false}});
+        spec
     }
+
     async fn execute(&self, input: Value, cancel: TurnCancel) -> ToolExecution {
+        self.run(None, input, cancel).await
+    }
+    async fn execute_in(
+        &self,
+        session: &phi_kernel::SessionId,
+        input: Value,
+        cancel: TurnCancel,
+    ) -> ToolExecution {
+        self.run(Some(session), input, cancel).await
+    }
+}
+impl PythonExecutor {
+    async fn run(
+        &self,
+        session: Option<&phi_kernel::SessionId>,
+        mut input: Value,
+        cancel: TurnCancel,
+    ) -> ToolExecution {
+        let inputs: Vec<crate::artifacts::ArtifactInput> =
+            match input.as_object_mut().and_then(|v| v.remove("inputs")) {
+                Some(value) => match serde_json::from_value(value) {
+                    Ok(v) => v,
+                    Err(e) => return ToolExecution::error("InvalidArguments", e.to_string()),
+                },
+                None => Vec::new(),
+            };
+        if inputs.len() > crate::MAX_ARTIFACTS {
+            return ToolExecution::error("InvalidArguments", "At most 16 input artifacts");
+        }
         let (input, timeout) = match CodeInput::parse(input, &self.limits) {
             Ok(value) => value,
             Err(error) => return error,
@@ -256,6 +294,60 @@ impl ToolExecutor for PythonExecutor {
             Ok(value) => value,
             Err(error) => return error,
         };
+        let mut input_bytes = 0usize;
+        for artifact in inputs {
+            let (Some(store), Some(session)) = (&self.artifacts, session) else {
+                return ToolExecution::error(
+                    "ArtifactsUnavailable",
+                    "No artifact store bound to this session",
+                );
+            };
+            let path = match crate::artifacts::ArtifactWorkspace::relative(&artifact.path) {
+                Ok(path)
+                    if !matches!(
+                        path.to_str(),
+                        Some("calculation.py" | "bootstrap.py" | ".artifacts.json")
+                    ) =>
+                {
+                    directory.path().join(path)
+                }
+                _ => {
+                    return ToolExecution::error(
+                        "InvalidArguments",
+                        "Invalid or reserved input path",
+                    );
+                }
+            };
+            let bytes = match store.read(session, &artifact.id).await {
+                Ok(v) => v,
+                Err(e) => return ToolExecution::error("ArtifactRead", e),
+            };
+            input_bytes = input_bytes.saturating_add(bytes.len());
+            if input_bytes > crate::MAX_ARTIFACT_BYTES {
+                return ToolExecution::error("ArtifactRead", "Input artifacts exceed 32 MiB");
+            }
+            if cancel.is_cancelled() {
+                return ToolExecution::cancelled();
+            }
+            let written = (|| -> std::io::Result<()> {
+                std::fs::create_dir_all(path.parent().expect("input parent"))?;
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path)?
+                    .write_all(&bytes)
+            })();
+            if let Err(e) = written {
+                return ToolExecution::error("ArtifactRead", e.to_string());
+            }
+        }
+        if let Err(e) = std::fs::write(
+            directory.path().join("bootstrap.py"),
+            include_str!("python_bootstrap.py"),
+        ) {
+            return ToolExecution::error("WorkspaceUnavailable", e.to_string());
+        }
         let source = directory.path().join("calculation.py");
         if let Err(error) = std::fs::write(&source, input.code) {
             return ToolExecution::error("WorkspaceUnavailable", error.to_string());
@@ -271,7 +363,7 @@ impl ToolExecutor for PythonExecutor {
             "-X".into(),
             "utf8".into(),
             "-u".into(),
-            source.into_os_string(),
+            directory.path().join("bootstrap.py").into_os_string(),
         ];
         request.remove_environment = [
             "PYTHONHOME",
@@ -298,7 +390,35 @@ impl ToolExecutor for PythonExecutor {
                 .to_owned(),
         );
         match self.supervisor.run(request, &cancel).await {
-            Ok(result) => CodeSpec::outcome(&result),
+            Ok(result) => {
+                let mut execution = CodeSpec::outcome(&result);
+                if execution.status != ToolResultStatus::Ok {
+                    return execution;
+                }
+                if cancel.is_cancelled() {
+                    return ToolExecution::cancelled();
+                }
+                let published = async {
+                    let files = crate::artifacts::ArtifactWorkspace::collect(directory.path())?;
+                    if files.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let (Some(store), Some(session)) = (&self.artifacts, session) else {
+                        return Err("No artifact store bound to this session".to_string());
+                    };
+                    store.publish(session, files).await
+                }
+                .await;
+                match published {
+                    Ok(artifacts) => execution.output["artifacts"] = json!(artifacts),
+                    Err(error) => {
+                        execution.status = ToolResultStatus::Error;
+                        execution.output["error"] =
+                            json!({"kind":"ArtifactPublish", "message":error});
+                    }
+                }
+                execution
+            }
             Err(error) => ToolExecution::error("InterpreterUnavailable", error.to_string()),
         }
     }

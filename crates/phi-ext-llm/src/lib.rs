@@ -20,6 +20,8 @@
 #[cfg(test)]
 mod image_tests;
 mod images;
+mod tool_images;
+pub use tool_images::ToolOutputImages;
 mod openai_compat;
 pub use images::{
     FileCacheKey, FileReference, FileReferenceCache, ImageDigest, ImageMetadata, ImagePolicy,

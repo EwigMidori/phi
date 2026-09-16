@@ -1,7 +1,12 @@
 #![forbid(unsafe_code)]
 //! Host-bound tools. No product paths, downloads, or permission policy.
 
+mod artifacts;
 mod execution;
+pub use artifacts::{
+    ArtifactFile, ArtifactId, ArtifactMetadata, ExecutionArtifacts, MAX_ARTIFACT_BYTES,
+    MAX_ARTIFACTS,
+};
 mod process;
 mod registry;
 pub mod worker_protocol;

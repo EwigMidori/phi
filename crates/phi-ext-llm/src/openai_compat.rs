@@ -420,6 +420,7 @@ impl WireCodec {
 /// HTTP streaming runtime: projector → wire codec → SSE reader → [`AgentEvent`].
 #[derive(Clone)]
 pub struct OpenAiCompatRuntime {
+    tool_images: Option<Arc<dyn crate::ToolOutputImages>>,
     tools: Arc<phi_ext_tools::ToolRegistry>,
     client: Client,
     config: LlmConfig,
@@ -429,6 +430,10 @@ pub struct OpenAiCompatRuntime {
 }
 
 impl OpenAiCompatRuntime {
+    pub fn with_tool_images(mut self, source: Arc<dyn crate::ToolOutputImages>) -> Self {
+        self.tool_images = Some(source);
+        self
+    }
     #[must_use]
     pub fn with_tools(mut self, tools: Arc<phi_ext_tools::ToolRegistry>) -> Self {
         self.tools = tools;
@@ -448,6 +453,7 @@ impl OpenAiCompatRuntime {
         let codec = WireCodec::for_style(config.api_style);
         Self {
             tools: Arc::new(phi_ext_tools::ToolRegistry::new()),
+            tool_images: None,
             client: Client::new(),
             config,
             projector: Arc::new(PassThrough),
@@ -505,6 +511,16 @@ impl OpenAiCompatRuntime {
         let history = request
             .materialize_history(history.to_vec())
             .map_err(|e| e.to_string())?;
+        let history = match &self.tool_images {
+            Some(source) => crate::tool_images::ToolImageProjection::project(
+                history,
+                source.as_ref(),
+                self.images
+                    .as_ref()
+                    .is_some_and(|(_, policy)| policy.enabled),
+            )?,
+            None => history,
+        };
         let mut images = match &self.images {
             Some((service, policy)) => {
                 service
