@@ -100,6 +100,26 @@ pub struct JavaScriptExecutor {
     supervisor: ProcessSupervisor,
 }
 impl JavaScriptExecutor {
+    pub fn tool_spec() -> ToolSpec {
+        CodeSpec::build(
+            "eval_js",
+            "Evaluate synchronous JavaScript for calculations. Fresh globals on every call. No Node, DOM, imports, or asynchronous tasks. console.log/error produce output; the script completion value is returned. BigInt is returned as an exact decimal string with a type marker.",
+        )
+    }
+
+    pub fn request(
+        input: Value,
+        limits: &ExecutionLimits,
+    ) -> Result<JavaScriptRequest, ToolExecution> {
+        let (input, timeout) = CodeInput::parse(input, limits)?;
+        Ok(JavaScriptRequest {
+            code: input.code,
+            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            output_limit: limits.output_bytes,
+            result_limit: limits.result_bytes,
+        })
+    }
+
     pub fn new(worker: PathBuf, runs: PathBuf, limits: ExecutionLimits) -> Self {
         Self {
             worker,
@@ -112,10 +132,7 @@ impl JavaScriptExecutor {
 #[async_trait]
 impl ToolExecutor for JavaScriptExecutor {
     fn spec(&self) -> ToolSpec {
-        CodeSpec::build(
-            "eval_js",
-            "Evaluate synchronous JavaScript for calculations. Fresh globals and temporary working directory on every call. No Node, DOM, imports, or asynchronous tasks. console.log/error produce output; the script completion value is returned. BigInt is returned as an exact decimal string with a type marker.",
-        )
+        Self::tool_spec()
     }
     async fn execute(&self, input: Value, cancel: TurnCancel) -> ToolExecution {
         let (input, timeout) = match CodeInput::parse(input, &self.limits) {
@@ -156,7 +173,10 @@ impl ToolExecutor for JavaScriptExecutor {
         let response: JavaScriptResponse = match serde_json::from_str(&result.stdout.text) {
             Ok(value) if !result.stdout.truncated => value,
             Ok(_) => {
-                return ToolExecution::error("WorkerProtocol", "Worker response exceeded its bound");
+                return ToolExecution::error(
+                    "WorkerProtocol",
+                    "Worker response exceeded its bound",
+                );
             }
             Err(error) => return ToolExecution::error("WorkerProtocol", error.to_string()),
         };
