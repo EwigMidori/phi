@@ -29,3 +29,10 @@ example which checks fresh venv provisioning, shared preparation cancellation,
 package installation/reuse, calculation, explicit repair, and strict existing files.
 
 `scope_for(session, cancel)` supplies execution identity to host-bound artifact services. Python receives an `artifacts.publish(relative_path, name=...)` helper and optional `inputs` staging by immutable artifact ID. Output collection happens after process-tree cleanup and before temporary-directory removal, only on successful execution. It is bounded to 16 files / 32 MiB per invocation; paths outside the run directory are rejected. Host storage commits before metadata references are returned. Standalone executors without an artifact service still compute, but publishing/reading artifacts fails explicitly. Matplotlib uses the headless Agg backend. Library versions and supported output formats remain host choices.
+
+Within `run_python`, `artifacts` is a preloaded, invocation-local Python module.
+Direct `artifacts.publish(...)`, `import artifacts`, and `from artifacts import publish`
+all use the same publisher and limits. No pip installation is needed. It is not a
+package installed into the environment for separately launched Python processes.
+Run the bootstrap behavior tests with
+`python -I crates/phi-ext-tools/tests/python_bootstrap_test.py`.

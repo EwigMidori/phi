@@ -1,11 +1,14 @@
 """One invocation; files are explicitly published only after successful execution."""
 import json
 import os
+import sys
 from pathlib import Path
+from types import ModuleType
 
 
-class Artifacts:
+class Artifacts(ModuleType):
     def __init__(self):
+        super().__init__("artifacts", "Publish files from the current run_python invocation.")
         self._root = Path.cwd().resolve()
         self._entries = []
 
@@ -24,6 +27,7 @@ class Artifacts:
 
 os.environ["MPLBACKEND"] = "Agg"
 artifacts = Artifacts()
+sys.modules["artifacts"] = artifacts
 source = Path("calculation.py")
 exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"),
      {"__name__": "__main__", "__file__": str(source.resolve()), "artifacts": artifacts})
