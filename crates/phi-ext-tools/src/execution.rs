@@ -103,7 +103,7 @@ impl JavaScriptExecutor {
     pub fn tool_spec() -> ToolSpec {
         CodeSpec::build(
             "eval_js",
-            "Evaluate synchronous JavaScript for calculations. Fresh globals on every call. No Node, DOM, imports, or asynchronous tasks. console.log/error produce output; the script completion value is returned. BigInt is returned as an exact decimal string with a type marker.",
+            "Evaluate synchronous JavaScript for calculations. Fresh globals on every call. No Node, DOM, imports, or asynchronous tasks. console.log/error/warn inspect objects and arrays into readable output (up to 8 levels deep); the script completion value is returned separately. BigInt is returned as an exact decimal string with a type marker.",
         )
     }
 

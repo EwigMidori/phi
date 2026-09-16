@@ -63,8 +63,16 @@ impl JavaScriptEngine {
                     output.truncated |= keep < text.len();
                 }),
             )?;
-            // Closure owns pristine intrinsics: evaluated code cannot replace the encoder.
-            let formatter: Function = ctx.eval(include_str!("runtime.js"))?;
+            // Use object-inspect's browser configuration: its sole Node util dependency
+            // is disabled upstream for browsers. Keep CommonJS globals local to setup.
+            let inspector: Function = ctx.eval(concat!(
+                "(() => { const module = { exports: {} }; const require = (id) => { if (id === './util.inspect') return {}; throw new Error('Unknown bundled module'); };\n",
+                include_str!("../vendor/object-inspect/index.js"),
+                "\nreturn module.exports; })()"
+            ))?;
+            // Closures capture intrinsics before evaluated code starts.
+            let install: Function = ctx.eval(include_str!("runtime.js"))?;
+            let formatter: Function = install.call((inspector,))?;
             let completion = ctx.eval::<Value, _>(request.code.as_bytes());
             let mut response = JavaScriptResponse {
                 stdout: CapturedOutput::default(),
@@ -207,6 +215,91 @@ mod tests {
                 .error
                 .is_none()
         );
+    }
+    #[test]
+    fn console_keeps_qr_calculation_fields_and_nested_array_values() {
+        let result = calculate(
+            r#"
+            const r11 = 5;
+            const q1 = [3/5, 4/5];
+            const r12 = q1[0]*(-1) + q1[1]*2;
+            const u2 = [-1 - r12*q1[0], 2 - r12*q1[1]];
+            const r22 = Math.hypot(u2[0], u2[1]);
+            const q2 = [u2[0]/r22, u2[1]/r22];
+            console.log({r11, r12, r22, q1, q2});
+        "#,
+        );
+        assert!(result.error.is_none());
+        for field in [
+            "r11: 5",
+            "r12: 1",
+            "r22: 2",
+            "q1: [ 0.6, 0.8 ]",
+            "q2: [ -0.8, 0.6 ]",
+        ] {
+            assert!(result.stdout.text.contains(field), "{}", result.stdout.text);
+        }
+        assert!(!result.stdout.text.contains("[object Object]"));
+    }
+
+    #[test]
+    fn console_inspects_cycles_special_values_and_preserves_channels_and_return_value() {
+        let result = calculate(
+            r#"
+            const cycle = {answer: 42}; cycle.self = cycle;
+            console.log('result', cycle, 9007199254740993n, undefined, NaN, Infinity);
+            console.warn(new Map([['key', {x: 2}]]), new Set([1, 2]));
+            console.error(new Error('bad input'));
+            ({answer: 42})
+        "#,
+        );
+        assert!(result.error.is_none());
+        for text in [
+            "result",
+            "answer: 42",
+            "[Circular]",
+            "9007199254740993n",
+            "undefined",
+            "NaN",
+            "Infinity",
+        ] {
+            assert!(result.stdout.text.contains(text), "{}", result.stdout.text);
+        }
+        for text in ["Map (1)", "'key' =>", "x: 2", "Set (2)", "Error: bad input"] {
+            assert!(result.stderr.text.contains(text), "{}", result.stderr.text);
+        }
+        assert_eq!(result.value, Some(serde_json::json!({"answer":42})));
+    }
+
+    #[test]
+    fn console_does_not_lose_other_arguments_when_inspection_fails() {
+        let result = calculate(
+            r#"
+            console.log('', 'before', {get fail() {throw new Error('getter');}}, 'after');
+            console.log({answer: 42, toJSON() {throw new Error('not JSON');}});
+            7
+        "#,
+        );
+        assert!(result.error.is_none());
+        assert!(
+            result
+                .stdout
+                .text
+                .starts_with(" before [Inspection failed] after\n")
+        );
+        assert!(result.stdout.text.contains("answer: 42"));
+        assert_eq!(result.value, Some(serde_json::json!(7)));
+    }
+
+    #[test]
+    fn inspected_objects_keep_utf8_output_bounded_and_survive_script_errors() {
+        let result =
+            calculate("console.log({text: '计算'.repeat(2000)}); throw new Error('after logging')");
+        assert_eq!(result.error.unwrap().kind, "JavaScriptError");
+        assert!(result.stdout.text.starts_with("{\n  text: '计算"));
+        assert!(result.stdout.truncated);
+        assert!(result.stdout.text.len() <= 1024);
+        assert!(!result.stdout.invalid_utf8);
     }
     #[test]
     fn rejects_cycles_and_keeps_bounded_console_after_failure() {

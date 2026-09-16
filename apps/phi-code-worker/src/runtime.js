@@ -1,4 +1,4 @@
-(() => {
+((inspect) => {
   const stringify = JSON.stringify;
   const keys = Object.keys;
   const ownKeys = Reflect.ownKeys;
@@ -18,9 +18,19 @@
   const capture = globalThis.__capture;
   delete globalThis.__capture;
   function log(error, args) {
-    let message = '';
-    for (const arg of args) message += (message ? ' ' : '') + string(arg);
-    capture(error, message + '\n');
+    for (let index = 0; index < args.length; index++) {
+      if (index) capture(error, ' ');
+      const arg = args[index];
+      let message;
+      try {
+        message = typeof arg === 'string' ? arg : inspect(arg, { depth: 8, customInspect: false, indent: 2 });
+      } catch (_) {
+        // A throwing accessor/proxy must not discard other arguments or the calculation.
+        message = '[Inspection failed]';
+      }
+      capture(error, message);
+    }
+    capture(error, '\n');
   }
   globalThis.console = Object.freeze({ log: (...args) => log(false, args), error: (...args) => log(true, args), warn: (...args) => log(true, args) });
   return (value, limit) => {
@@ -76,4 +86,4 @@
     if (encoded.length > limit) throw new encodingError('Result exceeds encoding limit');
     return encoded;
   };
-})()
+})
