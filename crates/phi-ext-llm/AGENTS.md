@@ -18,7 +18,7 @@ LLM **provider adapters** for **phi**: HTTP/SSE → `AgentRuntime` / `AgentEvent
 
 ## Rules
 
-- Implement `AgentRuntime` and the existing bare `OneshotText`; no second runtime path
+- `OneshotModel::generate` makes one explicit multimodal request with caller instructions and cancellation. It bypasses `ProviderConversation`, history projection, tail state and tool execution. `OneshotText` is its bare text convenience adapter. Agent turns and standalone requests share the same `open_response` HTTP/image preparation and `SseReader`; never duplicate the wire stack.
 - Tool responses complete only a provider round. Only the final response emits `Finished`; malformed/incomplete streams never execute accumulated calls
 - Each batch/result yield is a pull commit barrier. No background producer may execute the next tool before the consumer advances
 - Completions must consume trailing usage and group multiple tool calls in one assistant message; Responses must retain opaque reasoning items

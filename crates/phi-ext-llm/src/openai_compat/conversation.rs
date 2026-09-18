@@ -5,7 +5,7 @@ use phi_ext_tools::{ToolExecution, ToolExecutionScope};
 use phi_kernel::{
     AgentEventStream, AgentRun, AgentRunLifecycle, MessageId, ModelResponse, ModelResponseId,
     ProviderContinuation, ResponseUsageDrain, ToolArguments, ToolCallId, ToolName, TranscriptRow,
-    Usage,
+    TurnRequest, Usage,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -187,9 +187,29 @@ impl ProviderConversation {
                 return Err("generation exceeded 16 model responses".into());
             }
             self.response_count += 1;
+            let history = self
+                .request
+                .materialize_history(self.history.clone())
+                .map_err(|error| error.to_string())?;
+            let history = match &self.runtime.tool_images {
+                Some(source) => crate::tool_images::ToolImageProjection::project(
+                    history,
+                    source.as_ref(),
+                    self.runtime
+                        .images
+                        .as_ref()
+                        .is_some_and(|(_, policy)| policy.enabled),
+                )?,
+                None => history,
+            };
             self.reader = Some(
                 self.runtime
-                    .open_response(&self.request, &self.history)
+                    .open_response(
+                        &self.request.session_id,
+                        &self.request.prefix,
+                        &history,
+                        &self.request.cancel,
+                    )
                     .await?,
             );
         }
@@ -278,7 +298,7 @@ impl SseReader {
             usage_bytes_left: None,
         }
     }
-    async fn next(&mut self) -> Result<Option<AgentEvent>, String> {
+    pub(super) async fn next(&mut self) -> Result<Option<AgentEvent>, String> {
         loop {
             if let Some(event) = self.queued.pop_front() {
                 return Ok(Some(event));

@@ -4,8 +4,8 @@ use super::*;
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
 use phi_ext_tools::{ToolExecutor, ToolRegistry};
 use phi_kernel::{
-    AgentPorts, FixedAgentPrefix, FixedToolCallSeal, GenerationJob, InMemoryTranscript,
-    SessionDirectory, ToolResultStatus, Transcript,
+    AgentPorts, FixedAgentPrefix, FixedToolCallSeal, GenerationJob, InMemoryTranscript, JobId,
+    SessionDirectory, ToolCallSealPolicy, ToolResultStatus, Transcript,
 };
 use std::sync::{Mutex, atomic::AtomicUsize};
 
@@ -69,6 +69,128 @@ fn final_response(style: ApiStyle) -> String {
 }
 
 struct Compute(Arc<AtomicUsize>);
+
+struct DialogueOnlyProjection;
+impl HistoryProjector for DialogueOnlyProjection {
+    fn project(&self, _: &[TurnItem]) -> Vec<TurnItem> {
+        panic!("standalone completions must not enter dialogue history projection")
+    }
+}
+
+#[tokio::test]
+async fn standalone_completion_bypasses_dialogue_and_collects_trailing_usage() {
+    for style in [ApiStyle::Completions, ApiStyle::Responses] {
+        let response = match style {
+            ApiStyle::Completions => sse(
+                vec![
+                    json!({"choices":[{"delta":{"content":"完成"}}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                    json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}),
+                ],
+                true,
+            ),
+            ApiStyle::Responses => sse(
+                vec![json!({"type":"response.completed","response":{
+                    "output":[{"type":"message","id":"answer","role":"assistant","content":[{"type":"output_text","text":"完成"}]}],
+                    "usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16}
+                }})],
+                false,
+            ),
+        };
+        let server = Server::start(vec![response, final_response(style)]).await;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(Compute(executions.clone())))
+            .unwrap();
+        let runtime = server
+            .runtime(style, Arc::new(registry))
+            .with_projector(Arc::new(DialogueOnlyProjection));
+        let mut run = runtime
+            .generate(OneshotRequest {
+                session_id: SessionId::generate(),
+                input: "材料".into(),
+                instructions: vec![phi_kernel::PreambleSection::new("task", "只总结材料")],
+                cancel: TurnCancel::new(),
+            })
+            .await
+            .unwrap();
+        let mut text = String::new();
+        let mut usage = Vec::new();
+        let mut finished = false;
+        while let Some(event) = run.next().await {
+            match event.unwrap() {
+                AgentEvent::ModelResponseCompleted { response } => {
+                    for row in response.rows {
+                        if let TurnItem::Assistant { content } = row.item {
+                            text.push_str(&content);
+                        }
+                    }
+                }
+                AgentEvent::Usage { usage: value } => usage.push(value),
+                AgentEvent::Finished { .. } => finished = true,
+                _ => {}
+            }
+        }
+        run.close_and_join().await.unwrap();
+        assert_eq!(text, "完成");
+        assert!(finished);
+        assert_eq!(usage[0].total_tokens, Some(16));
+        assert_eq!(runtime.complete("给材料命名").await.unwrap(), "结果是 2");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        let requests = server.state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|body| body.get("tools").is_none()));
+        match style {
+            ApiStyle::Completions => {
+                assert_eq!(
+                    requests[0]["messages"][0]["content"],
+                    "<task>只总结材料</task>"
+                );
+                assert_eq!(requests[1]["messages"].as_array().unwrap().len(), 1);
+                assert_eq!(requests[1]["messages"][0]["role"], "user");
+            }
+            ApiStyle::Responses => {
+                assert_eq!(requests[0]["instructions"], "<task>只总结材料</task>");
+                assert!(requests[1].get("instructions").is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn standalone_completion_rejects_tool_requests_without_execution_or_continuation() {
+    for style in [ApiStyle::Completions, ApiStyle::Responses] {
+        let server = Server::start(vec![if style == ApiStyle::Completions {
+            chat_calls()
+        } else {
+            responses_calls(false)
+        }])
+        .await;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(Compute(executions.clone())))
+            .unwrap();
+        let runtime = server.runtime(style, Arc::new(registry));
+        let failure = runtime.complete("不执行工具").await.unwrap_err();
+        assert!(failure.contains("no tools enabled"), "{failure}");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(server.state.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn standalone_completion_never_accepts_partial_text_as_success() {
+    let server = Server::start(vec![sse(
+        vec![json!({"choices":[{"delta":{"content":"unfinished"}}]})],
+        false,
+    )])
+    .await;
+    let runtime = server.runtime(ApiStyle::Completions, Arc::new(ToolRegistry::new()));
+    assert!(runtime.complete("summarize").await.is_err());
+    assert_eq!(server.state.requests.lock().unwrap().len(), 1);
+}
 #[async_trait]
 impl ToolExecutor for Compute {
     fn spec(&self) -> phi_kernel::ToolSpec {

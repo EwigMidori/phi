@@ -642,6 +642,24 @@ pub trait AgentRuntime: Send + Sync {
     async fn run(&self, request: TurnRequest) -> Result<AgentRun, String>;
 }
 
+/// Explicit input for one model completion, independent of dialogue orchestration.
+/// The session identifies image assets only. There are no tools, transcript reads,
+/// persona bindings, tail state or implicit product instructions.
+#[derive(Clone, Debug)]
+pub struct OneshotRequest {
+    pub session_id: SessionId,
+    pub input: MessageContent,
+    pub instructions: Vec<PreambleSection>,
+    pub cancel: TurnCancel,
+}
+
+/// One model response, using the shared response events and owned stream lifecycle.
+/// Implementations must not enter an agent/tool loop or accept tool calls.
+#[async_trait]
+pub trait OneshotModel: Send + Sync {
+    async fn generate(&self, request: OneshotRequest) -> Result<AgentRun, String>;
+}
+
 // ── Oneshot text complete (mechanism, not product labeling policy) ─────────
 
 /// Bare text completion: **string in → string out**.

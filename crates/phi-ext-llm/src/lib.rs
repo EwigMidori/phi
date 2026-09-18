@@ -10,7 +10,8 @@
 //! | Runtime | [`OpenAiCompatRuntime`] — [`phi_kernel::AgentRuntime`] + [`phi_kernel::OneshotText`] |
 //!
 //! Context policy is **product-owned** (inject a projector). This crate is wire
-//! mechanism only. Oneshot uses the **same** client with an empty product prefix.
+//! mechanism only. Standalone completions bypass the agent loop and share its wire reader.
+//! OneshotText adapts that single-response path without implicit instructions.
 //!
 //! **Not in this crate:** product turn orchestration (`SessionHost` / SendQueue),
 //! TUI, tool hosts, permission engines. Kernel stays free of provider loops.

@@ -11,13 +11,14 @@ use crate::images::{PreparedImage, PreparedImages};
 use crate::{ImagePolicy, ProviderImages};
 use async_trait::async_trait;
 use phi_kernel::{
-    AgentEvent, AgentPrefix, AgentRuntime, ContentPart, JobId, MessageContent, ModelResponse,
-    OneshotText, SessionId, ToolCallSealPolicy, TurnCancel, TurnItem, TurnRequest,
+    AgentEvent, AgentPrefix, AgentRun, AgentRuntime, ContentPart, MessageContent, ModelResponse,
+    OneshotModel, OneshotRequest, OneshotText, SessionId, TurnCancel, TurnItem,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
 use strum::{Display, EnumString};
 mod conversation;
+mod oneshot;
 
 // ── Config ─────────────────────────────────────────────────────────────────
 
@@ -505,32 +506,15 @@ impl OpenAiCompatRuntime {
 impl OpenAiCompatRuntime {
     async fn open_response(
         &self,
-        request: &TurnRequest,
+        session: &SessionId,
+        prefix: &AgentPrefix,
         history: &[TurnItem],
+        cancel: &TurnCancel,
     ) -> Result<SseReader, String> {
-        let history = request
-            .materialize_history(history.to_vec())
-            .map_err(|e| e.to_string())?;
-        let history = match &self.tool_images {
-            Some(source) => crate::tool_images::ToolImageProjection::project(
-                history,
-                source.as_ref(),
-                self.images
-                    .as_ref()
-                    .is_some_and(|(_, policy)| policy.enabled),
-            )?,
-            None => history,
-        };
         let mut images = match &self.images {
             Some((service, policy)) => {
                 service
-                    .prepare(
-                        &self.config,
-                        policy,
-                        &request.session_id,
-                        &history,
-                        &request.cancel,
-                    )
+                    .prepare(&self.config, policy, session, history, cancel)
                     .await?
             }
             None => PreparedImages::new(),
@@ -540,8 +524,8 @@ impl OpenAiCompatRuntime {
         let response = loop {
             let body = self.codec.request_body(
                 self.config.model.as_str(),
-                &request.prefix,
-                &history,
+                prefix,
+                history,
                 &images,
                 &self.continuation_scope(),
             )?;
@@ -554,7 +538,7 @@ impl OpenAiCompatRuntime {
                 return Err("请求体超出 Provider 限制，请减少当前上下文的图片或文字".into());
             }
             let response = tokio::select! {
-                () = request.cancel.cancelled() => return Err("request cancelled".into()),
+                () = cancel.cancelled() => return Err("request cancelled".into()),
                 result = self.client.post(&url).bearer_auth(self.config.api_key.as_str())
                     .header("Content-Type", "application/json").body(body).send() => result.map_err(|e| format!("HTTP request failed: {e}"))?,
             };
@@ -565,17 +549,11 @@ impl OpenAiCompatRuntime {
             if !repaired && matches!(status.as_u16(), 400 | 404) {
                 if let Some((service, policy)) = &self.images {
                     if service
-                        .repair_missing(&self.config, &images, &request.cancel)
+                        .repair_missing(&self.config, &images, cancel)
                         .await?
                     {
                         images = service
-                            .prepare(
-                                &self.config,
-                                policy,
-                                &request.session_id,
-                                &history,
-                                &request.cancel,
-                            )
+                            .prepare(&self.config, policy, session, history, cancel)
                             .await?;
                         repaired = true;
                         continue;
@@ -588,47 +566,11 @@ impl OpenAiCompatRuntime {
 
         let reader = SseReader::from_byte_stream(
             response.bytes_stream(),
-            request.cancel.clone(),
+            cancel.clone(),
             self.config.api_style,
             self.continuation_scope(),
         );
         Ok(reader)
-    }
-}
-
-/// Same client as [`AgentRuntime`]: bare complete with **empty** product prefix / tools.
-#[async_trait]
-impl OneshotText for OpenAiCompatRuntime {
-    async fn complete(&self, input: &str) -> Result<String, String> {
-        let input = input.trim();
-        if input.is_empty() {
-            return Err("oneshot input empty".into());
-        }
-        // Explicit bare turn: empty AgentPrefix — never product binding materials.
-        let request = TurnRequest {
-            session_id: SessionId::generate(),
-            job_id: JobId::generate(),
-            history: vec![TurnItem::User {
-                content: MessageContent::text(input),
-            }],
-            prefix: AgentPrefix::baseline_chat(Vec::new()),
-            tool_call_seal: ToolCallSealPolicy::LeaveOpen,
-            cancel: TurnCancel::new(),
-            tail_state: None,
-        };
-        let mut stream = AgentRuntime::run(self, request).await?;
-        let mut text = String::new();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(AgentEvent::TextDelta { text: t }) => text.push_str(&t),
-                Ok(AgentEvent::Finished { .. }) => break,
-                Ok(AgentEvent::Error { message }) => return Err(message),
-                Err(message) => return Err(message),
-                Ok(_) => {}
-            }
-        }
-        stream.close_and_join().await?;
-        Ok(text)
     }
 }
 

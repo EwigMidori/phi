@@ -8,6 +8,7 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 
 - Ids / `KernelError` / `KernelEvent`
 - `AgentRuntime` / `TurnRequest` / `AgentEvent` / `Usage` (provider metering observation)
+- `OneshotModel` / `OneshotRequest`: one standalone multimodal completion with explicit instructions and cancellation, no agent/tool loop. Reuses `AgentRun` for owned response events and cleanup; session identity resolves image assets only.
 - `MessageContent` / `ContentPart` / `ImageId` — ordered user input; no bytes IO in kernel
 - `TailState` / `TurnRequest.tail_state` — independent transient state; adapter calls `materialize_history` once after projection; product owns policy, kernel owns placement
 - `TurnCancel::cancelled` — wakeable preparation/stream cancellation; token belongs to a queue claim
