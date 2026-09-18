@@ -21,6 +21,9 @@ process management, not a security sandbox.
 fresh globals. `PythonExecutor` receives a host's `PythonEnvironment` and holds its
 `PythonLease` through process cleanup. Runtime locations, downloads, environment
 repair, dependency choices, and default execution limits belong to the host.
+`PythonLease::with_environment` carries host-selected environment variables into
+the Python child before startup (including native-library initialization). It
+does not mutate the parent process environment or the installed virtual environment.
 
 Tests cover real process-tree cancellation, deadlines, output flooding, cleanup
 after a leader exits, and retained ownership after the consuming stream is dropped.

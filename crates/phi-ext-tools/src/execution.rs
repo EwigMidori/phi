@@ -8,6 +8,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+#[cfg(test)]
+#[path = "python_lease_test.rs"]
+mod lease_tests;
+
 #[derive(Clone)]
 pub struct ExecutionLimits {
     pub default_timeout: Duration,
@@ -193,17 +197,33 @@ impl ToolExecutor for JavaScriptExecutor {
 /// Keeps a host-owned environment lease alive through process reaping.
 pub struct PythonLease {
     interpreter: PathBuf,
+    environment: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     _guard: Box<dyn Send + Sync>,
 }
 impl PythonLease {
     pub fn new(interpreter: PathBuf, guard: impl Send + Sync + 'static) -> Self {
         Self {
             interpreter,
+            environment: std::collections::BTreeMap::new(),
             _guard: Box::new(guard),
         }
     }
     pub fn interpreter(&self) -> &std::path::Path {
         &self.interpreter
+    }
+
+    /// Host-selected process settings, installed before Python imports any library.
+    #[must_use]
+    pub fn with_environment(
+        mut self,
+        environment: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    ) -> Self {
+        self.environment = environment;
+        self
+    }
+
+    fn apply_environment(&self, request: &mut ProcessRequest) {
+        request.environment.extend(self.environment.clone());
     }
 }
 
@@ -358,6 +378,7 @@ impl PythonExecutor {
             timeout,
             self.limits.output_bytes,
         );
+        lease.apply_environment(&mut request);
         request.arguments = vec![
             "-I".into(),
             "-X".into(),
