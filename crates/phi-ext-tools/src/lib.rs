@@ -12,7 +12,7 @@ mod registry;
 pub mod worker_protocol;
 
 pub use execution::{
-    ExecutionLimits, JavaScriptExecutor, PythonEnvironment, PythonExecutor, PythonLease,
+    CodeInput, ExecutionLimits, JavaScriptExecutor, PythonEnvironment, PythonExecutor, PythonLease,
 };
 pub use process::{
     CapturedOutput, ProcessOutcome, ProcessRequest, ProcessSupervisor, ProcessTermination,

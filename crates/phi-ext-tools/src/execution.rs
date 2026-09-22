@@ -22,38 +22,40 @@ pub struct ExecutionLimits {
 }
 
 #[derive(Deserialize)]
-struct CodeInput {
+pub struct CodeInput {
     code: String,
     timeout_ms: Option<u64>,
 }
 impl CodeInput {
-    fn parse(
-        mut input: Value,
-        limits: &ExecutionLimits,
-    ) -> Result<(Self, Duration), ToolExecution> {
-        if let Some(arguments) = input.as_object_mut() {
-            if !arguments.contains_key("code") {
-                // Some model harnesses insist on their own code parameter name.
-                let mut candidates = arguments.iter().filter_map(|(name, value)| {
-                    if matches!(name.as_str(), "timeout_ms" | "inputs") {
-                        None
-                    } else {
-                        value.as_str()
-                    }
-                });
-                if let Some(code) = candidates.next() {
-                    if candidates.next().is_some() {
-                        return Err(ToolExecution::error(
-                            "InvalidArguments",
-                            "Multiple string arguments could supply code; provide code explicitly",
-                        ));
-                    }
-                    let code = code.to_owned();
-                    arguments.insert("code".into(), Value::String(code));
+    /// Canonicalize harness-specific code keys before recording or executing a call.
+    pub fn normalize(mut input: Value) -> Result<Value, ToolExecution> {
+        if let Some(arguments) = input.as_object_mut()
+            && !arguments.contains_key("code")
+        {
+            // Some model harnesses insist on their own code parameter name.
+            let mut candidates = arguments.iter().filter_map(|(name, value)| {
+                if matches!(name.as_str(), "timeout_ms" | "inputs") {
+                    None
+                } else {
+                    value.as_str().map(|_| name.clone())
                 }
+            });
+            if let Some(alias) = candidates.next() {
+                if candidates.next().is_some() {
+                    return Err(ToolExecution::error(
+                        "InvalidArguments",
+                        "Multiple string arguments could supply code; provide code explicitly",
+                    ));
+                }
+                let code = arguments.remove(&alias).expect("code alias exists");
+                arguments.insert("code".into(), code);
             }
         }
-        let input: Self = serde_json::from_value(input)
+        Ok(input)
+    }
+
+    fn parse(input: Value, limits: &ExecutionLimits) -> Result<(Self, Duration), ToolExecution> {
+        let input: Self = serde_json::from_value(Self::normalize(input)?)
             .map_err(|e| ToolExecution::error("InvalidArguments", e.to_string()))?;
         if input.code.is_empty() || input.code.len() > limits.code_bytes {
             return Err(ToolExecution::error(
@@ -161,6 +163,9 @@ impl JavaScriptExecutor {
 impl ToolExecutor for JavaScriptExecutor {
     fn spec(&self) -> ToolSpec {
         Self::tool_spec()
+    }
+    fn normalize_input(&self, input: Value) -> Result<Value, ToolExecution> {
+        CodeInput::normalize(input)
     }
     async fn execute(&self, input: Value, cancel: TurnCancel) -> ToolExecution {
         let (input, timeout) = match CodeInput::parse(input, &self.limits) {
@@ -287,10 +292,14 @@ impl ToolExecutor for PythonExecutor {
     fn spec(&self) -> ToolSpec {
         let mut spec = CodeSpec::build(
             "run_python",
-            "Execute Python in a fresh process and temporary directory. print() returns text. Use artifacts.publish('plot.png') or artifacts.publish('data.csv') to persist files. artifacts is provided by this tool: use it directly, import artifacts, or from artifacts import publish; do not pip install artifacts. Published files are collected only on successful exit, maximum 16 files and 32 MiB total. Matplotlib uses Agg: savefig(), then publish(); do not use show(). Files from earlier results can be staged using inputs:[{id: artifact ID, path: relative filename}]. Variables do not persist. pip packages persist; install with subprocess.run([sys.executable, '-m', 'pip', 'install', 'package'], check=True). Return useful numeric summaries with print even when publishing a plot.",
+            "Execute Python in a fresh process and temporary directory. To return a file, first save it, then publish it IN THE SAME CALL: fig.savefig('plot.png'); artifacts.publish('plot.png'), or df.to_csv('data.csv', index=False); artifacts.publish('data.csv'). publish() only registers an existing file; it does not create or save one. print() returns text. artifacts is provided by this tool: use it directly, import artifacts, or from artifacts import publish; do not pip install artifacts. Published files must remain present until successful exit, when they are collected, maximum 16 files and 32 MiB total. Matplotlib uses Agg; do not use show(). Files and variables do not persist between executions. Files from earlier results can be staged using inputs:[{id: artifact ID, path: relative filename}]. pip packages persist; install with subprocess.run([sys.executable, '-m', 'pip', 'install', 'package'], check=True). Return useful numeric summaries with print even when publishing a plot.",
         );
         spec.parameters.as_mut().expect("code schema")["properties"]["inputs"] = json!({"type":"array","maxItems":16,"items":{"type":"object","properties":{"id":{"type":"string"},"path":{"type":"string"}},"required":["id","path"],"additionalProperties":false}});
         spec
+    }
+
+    fn normalize_input(&self, input: Value) -> Result<Value, ToolExecution> {
+        CodeInput::normalize(input)
     }
 
     async fn execute(&self, input: Value, cancel: TurnCancel) -> ToolExecution {

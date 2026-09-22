@@ -213,14 +213,14 @@ impl ProviderConversation {
                     .await?,
             );
         }
-        let event = self
+        let mut event = self
             .reader
             .as_mut()
             .expect("response reader")
             .next()
             .await?
             .ok_or("provider ended without a complete response")?;
-        if let AgentEvent::ModelResponseCompleted { response } = &event {
+        if let AgentEvent::ModelResponseCompleted { response } = &mut event {
             if self.request.prefix.tools.is_empty()
                 && response
                     .rows
@@ -229,13 +229,26 @@ impl ProviderConversation {
             {
                 return Err("provider requested tools for a turn with no tools enabled".into());
             }
-            for row in &response.rows {
+            for row in &mut response.rows {
                 if let TurnItem::ToolCall {
                     tool_call_id,
                     tool_name,
                     input,
-                } = &row.item
+                } = &mut row.item
                 {
+                    // Persist and execute the same canonical input. Invalid calls
+                    // stay intact so execution reports a tool error to the model.
+                    if self
+                        .request
+                        .prefix
+                        .tools
+                        .iter()
+                        .any(|spec| spec.name == *tool_name)
+                        && let Ok(normalized) =
+                            self.runtime.tools.normalize_arguments(tool_name, input)
+                    {
+                        *input = normalized;
+                    }
                     self.tools.push_back(PendingCall {
                         response_id: response.id.clone(),
                         id: tool_call_id.clone(),

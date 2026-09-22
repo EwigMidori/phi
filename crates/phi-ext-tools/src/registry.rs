@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use phi_kernel::{ToolName, ToolResultStatus, ToolSpec, TurnCancel};
+use phi_kernel::{ToolArguments, ToolName, ToolResultStatus, ToolSpec, TurnCancel};
 use serde_json::{Value, json};
 use tokio::{
     sync::{Mutex, oneshot},
@@ -36,6 +36,10 @@ impl ToolExecution {
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    /// Shared by durable call recording and execution; must be idempotent.
+    fn normalize_input(&self, input: Value) -> Result<Value, ToolExecution> {
+        Ok(input)
+    }
     /// Must return only after owned resources have stopped, including cancellation.
     async fn execute(&self, input: Value, cancel: TurnCancel) -> ToolExecution;
     async fn execute_in(
@@ -75,6 +79,15 @@ impl ToolRegistry {
         self.tools.iter().map(|tool| tool.spec()).collect()
     }
 
+    pub fn normalize_arguments(
+        &self,
+        name: &ToolName,
+        arguments: &ToolArguments,
+    ) -> Result<ToolArguments, ToolExecution> {
+        let input = self.prepare_input(name, arguments.as_str())?;
+        Ok(ToolArguments::new(input.to_string()))
+    }
+
     pub fn scope(self: &Arc<Self>, cancel: TurnCancel) -> ToolExecutionScope {
         ToolExecutionScope {
             registry: self.clone(),
@@ -106,23 +119,37 @@ impl ToolRegistry {
         if cancel.is_cancelled() {
             return ToolExecution::cancelled();
         }
-        if arguments.len() > 2 * 1024 * 1024 {
-            return ToolExecution::error("InvalidArguments", "Tool arguments exceed 2 MiB");
-        }
-        let Some(tool) = self.tools.iter().find(|tool| tool.spec().name == *name) else {
-            return ToolExecution::error(
-                "UnknownTool",
-                format!("No executable binding for {}", name.as_str()),
-            );
-        };
-        let input = match serde_json::from_str(arguments) {
+        let input = match self.prepare_input(name, arguments) {
             Ok(input) => input,
-            Err(error) => return ToolExecution::error("InvalidArguments", error.to_string()),
+            Err(error) => return error,
         };
+        let tool = self
+            .tools
+            .iter()
+            .find(|tool| tool.spec().name == *name)
+            .expect("prepared tool binding");
         match session {
             Some(session) => tool.execute_in(session, input, cancel).await,
             None => tool.execute(input, cancel).await,
         }
+    }
+
+    fn prepare_input(&self, name: &ToolName, arguments: &str) -> Result<Value, ToolExecution> {
+        if arguments.len() > 2 * 1024 * 1024 {
+            return Err(ToolExecution::error(
+                "InvalidArguments",
+                "Tool arguments exceed 2 MiB",
+            ));
+        }
+        let Some(tool) = self.tools.iter().find(|tool| tool.spec().name == *name) else {
+            return Err(ToolExecution::error(
+                "UnknownTool",
+                format!("No executable binding for {}", name.as_str()),
+            ));
+        };
+        let input = serde_json::from_str(arguments)
+            .map_err(|error| ToolExecution::error("InvalidArguments", error.to_string()))?;
+        tool.normalize_input(input)
     }
 }
 

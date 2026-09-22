@@ -13,10 +13,21 @@ class Artifacts(ModuleType):
         self._entries = []
 
     def publish(self, path, *, name=None):
+        """Register an existing file; save it first in this same execution."""
         path = Path(path)
         if path.is_absolute() or ".." in path.parts:
             raise ValueError("publish requires a relative path inside this execution")
         relative = path.resolve().relative_to(self._root)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Cannot publish {str(path)!r}: file does not exist. "
+                "publish() registers an existing file; it does not create or save one. "
+                "Save it first in this same run_python call using fig.savefig(...) for plots "
+                f"or df.to_csv(...) for CSV, then artifacts.publish({str(path)!r}). "
+                "Each call uses a new temporary directory."
+            )
+        if not path.is_file():
+            raise ValueError(f"Cannot publish {str(path)!r}: expected a file, not a directory")
         self._entries.append({"path": str(relative), "name": name or path.name})
         if len(self._entries) > 16:
             raise ValueError("At most 16 artifacts may be published")

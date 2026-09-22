@@ -80,6 +80,16 @@ struct Publication {
 
 pub(crate) struct ArtifactWorkspace;
 impl ArtifactWorkspace {
+    fn publication_error(path: &str, error: &std::io::Error) -> String {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "Cannot publish {path:?}: file does not exist. Save the file before artifacts.publish() in the same run_python call and keep it until execution finishes. publish() does not create or save files."
+            )
+        } else {
+            format!("Cannot publish {path:?}: {error}")
+        }
+    }
+
     pub fn relative(path: &str) -> Result<&Path, String> {
         let path = Path::new(path);
         if path.as_os_str().is_empty()
@@ -92,17 +102,22 @@ impl ArtifactWorkspace {
     pub fn collect(root: &Path) -> Result<Vec<ArtifactFile>, String> {
         let manifest = root.join(".artifacts.json");
         // The bootstrap always writes a manifest on success, including zero outputs.
-        let metadata = std::fs::symlink_metadata(&manifest).map_err(|e| e.to_string())?;
+        let metadata = std::fs::symlink_metadata(&manifest)
+            .map_err(|e| format!("Cannot read artifact manifest .artifacts.json: {e}"))?;
         if !metadata.file_type().is_file() || metadata.len() > 64 * 1024 {
             return Err("Invalid artifact manifest".into());
         }
-        let entries: Vec<Publication> =
-            serde_json::from_slice(&std::fs::read(manifest).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
+        let entries: Vec<Publication> = serde_json::from_slice(
+            &std::fs::read(manifest)
+                .map_err(|e| format!("Cannot read artifact manifest .artifacts.json: {e}"))?,
+        )
+        .map_err(|e| format!("Invalid artifact manifest .artifacts.json: {e}"))?;
         if entries.len() > MAX_ARTIFACTS {
             return Err("Too many artifacts (maximum 16)".into());
         }
-        let root = root.canonicalize().map_err(|e| e.to_string())?;
+        let root = root
+            .canonicalize()
+            .map_err(|e| format!("Cannot access artifact execution directory: {e}"))?;
         let mut total = 0usize;
         let mut files = Vec::new();
         for entry in entries {
@@ -116,24 +131,36 @@ impl ArtifactWorkspace {
             let path = root
                 .join(&entry.path)
                 .canonicalize()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| Self::publication_error(&entry.path, &e))?;
             if !path.starts_with(&root) {
-                return Err("Artifact is outside the execution directory".into());
+                return Err(format!(
+                    "Artifact {:?} is outside the execution directory",
+                    entry.path
+                ));
             }
-            let metadata = path.metadata().map_err(|e| e.to_string())?;
+            let metadata = path
+                .metadata()
+                .map_err(|e| Self::publication_error(&entry.path, &e))?;
             if !metadata.is_file()
                 || metadata.len() == 0
                 || metadata.len() > MAX_ARTIFACT_BYTES as u64
             {
-                return Err("Artifact must be a nonempty file of at most 32 MiB".into());
+                return Err(format!(
+                    "Artifact {:?} must be a nonempty file of at most 32 MiB",
+                    entry.path
+                ));
             }
             total = total.saturating_add(metadata.len() as usize);
             if total > MAX_ARTIFACT_BYTES {
                 return Err("Artifacts exceed the 32 MiB execution limit".into());
             }
-            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let bytes =
+                std::fs::read(&path).map_err(|e| Self::publication_error(&entry.path, &e))?;
             if bytes.len() as u64 != metadata.len() {
-                return Err("Artifact changed during collection".into());
+                return Err(format!(
+                    "Artifact {:?} changed during collection",
+                    entry.path
+                ));
             }
             files.push(ArtifactFile {
                 name: entry.name,
