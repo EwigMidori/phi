@@ -639,6 +639,11 @@ impl AgentRun {
 
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
+    /// Optional bound catalog for the host to freeze into the initial prefix.
+    /// `run` must honor the supplied prefix, including an intentionally empty catalog.
+    fn tool_specs(&self) -> Option<Vec<ToolSpec>> {
+        None
+    }
     async fn run(&self, request: TurnRequest) -> Result<AgentRun, String>;
 }
 

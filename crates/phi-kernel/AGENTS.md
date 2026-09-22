@@ -40,6 +40,7 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 ## Generation turn (send_queue)
 
 - `AgentRuntime::run` returns owned `AgentRun`; the consumer uses `next` and always awaits `close_and_join`, including commit failures.
+- `AgentRuntime::tool_specs` optionally advertises the binding catalog for the host's initial prefix snapshot. `run` honors the supplied catalog, including an explicitly empty tool list for a text-only continuation; decorators must not silently repopulate it.
 - `AgentRun::map_stream` transforms the pull stream while retaining its lifecycle owner; early transformed termination still requires `close_and_join` for upstream cleanup.
 - `ResponseUsageDrain` is an optional explicit run capability: `begin` prevents further tool execution/provider requests and permits only usage/terminal events from the current response. Stream transforms/observers retain this capability; hosts bound the wait and still close/join the run. Kernel does not choose product delimiters or wait durations.
 - `GenerationTurn` buffers only the current visible response. `ModelResponseCompleted` commits the complete ordered response batch; terminal never writes a merged assistant body again.
