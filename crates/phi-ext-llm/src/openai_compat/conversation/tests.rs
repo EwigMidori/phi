@@ -758,3 +758,91 @@ async fn foreign_continuation_projects_visible_rows_and_still_requests() {
         assert!(!encoded.contains("must-not-leak"));
     }
 }
+
+// DeepSeek thinking protocol, api-docs.deepseek.com/guides/thinking_mode,
+// 2026-09-22: explicit off must survive, and enabled tool rounds replay reasoning.
+#[tokio::test]
+async fn deepseek_thinking_controls_requests_and_tool_continuation() {
+    for style in [ApiStyle::Completions, ApiStyle::Responses] {
+        for enabled in [true, false] {
+            let initial = if style == ApiStyle::Completions {
+                format!(
+                    "{}{}",
+                    sse(
+                        vec![
+                            json!({"choices":[{"delta":{"reasoning_content":"check arithmetic"}}]})
+                        ],
+                        false
+                    ),
+                    chat_calls()
+                )
+            } else {
+                responses_calls(false)
+            };
+            let server = Server::start(vec![initial, final_response(style)]).await;
+            let executions = Arc::new(AtomicUsize::new(0));
+            let mut registry = ToolRegistry::new();
+            registry
+                .register(Arc::new(Compute(executions.clone())))
+                .unwrap();
+            let registry = Arc::new(registry);
+            let runtime = server
+                .runtime(style, registry.clone())
+                .with_deepseek_thinking(enabled);
+            let mut run = runtime
+                .run(TurnRequest {
+                    session_id: SessionId::generate(),
+                    job_id: JobId::generate(),
+                    history: vec![TurnItem::User {
+                        content: MessageContent::text("calculate"),
+                    }],
+                    prefix: AgentPrefix {
+                        preamble: Vec::new(),
+                        tools: registry.specs(),
+                        skill_index: Default::default(),
+                    },
+                    cancel: TurnCancel::new(),
+                    tail_state: None,
+                    tool_call_seal: ToolCallSealPolicy::SealAlways,
+                })
+                .await
+                .unwrap();
+            let mut finished = false;
+            while let Some(event) = run.next().await {
+                if matches!(event.unwrap(), AgentEvent::Finished { .. }) {
+                    finished = true;
+                }
+            }
+            run.close_and_join().await.unwrap();
+            assert!(finished);
+            assert_eq!(executions.load(Ordering::SeqCst), 1);
+            let requests = server.state.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            for request in requests.iter() {
+                match style {
+                    ApiStyle::Completions => assert_eq!(
+                        request["thinking"]["type"],
+                        if enabled { "enabled" } else { "disabled" }
+                    ),
+                    ApiStyle::Responses => assert_eq!(
+                        request["reasoning"]["effort"],
+                        if enabled { "high" } else { "none" }
+                    ),
+                }
+            }
+            if style == ApiStyle::Completions {
+                let call = requests[1]["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row.get("tool_calls").is_some())
+                    .unwrap();
+                if enabled {
+                    assert_eq!(call["reasoning_content"], "check arithmetic");
+                } else {
+                    assert!(call.get("reasoning_content").is_none());
+                }
+            }
+        }
+    }
+}

@@ -197,11 +197,15 @@ impl HistoryProjector for PassThrough {
 #[derive(Clone)]
 struct WireCodec {
     style: ApiStyle,
+    deepseek_thinking: Option<bool>,
 }
 
 impl WireCodec {
     fn for_style(style: ApiStyle) -> Self {
-        Self { style }
+        Self {
+            style,
+            deepseek_thinking: None,
+        }
     }
 
     fn endpoint_path(&self) -> &'static str {
@@ -261,6 +265,16 @@ impl WireCodec {
             body["store"] = json!(false);
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
+        if let Some(enabled) = self.deepseek_thinking {
+            match self.style {
+                ApiStyle::Completions => {
+                    body["thinking"] = json!({"type": if enabled { "enabled" } else { "disabled" }})
+                }
+                ApiStyle::Responses => {
+                    body["reasoning"] = json!({"effort": if enabled { "high" } else { "none" }})
+                }
+            }
+        }
         Ok(body)
     }
 
@@ -280,14 +294,17 @@ impl WireCodec {
                     }
                 }
                 if self.style==ApiStyle::Completions {
-                    let mut text=String::new();let mut calls=Vec::new();
+                    let mut text=String::new();let mut calls=Vec::new();let mut reasoning=String::new();
                     for row in &response.rows {match &row.item{
                         TurnItem::Assistant{content}=>text.push_str(content),
                         TurnItem::ToolCall{tool_call_id,tool_name,input}=>calls.push(json!({"id":tool_call_id.as_str(),"type":"function","function":{"name":tool_name.as_str(),"arguments":input.as_str()}})),
-                        TurnItem::Reasoning{..}=>{},
+                        TurnItem::Reasoning{content}=>reasoning.push_str(content),
                         _=>return Err("invalid response group member".into()),
                     }}
                     let mut message=json!({"role":"assistant","content":text});
+                    if self.deepseek_thinking == Some(true) && (!reasoning.is_empty() || !calls.is_empty()) {
+                        message["reasoning_content"] = json!(reasoning);
+                    }
                     if !calls.is_empty(){message["tool_calls"]=json!(calls);}
                     out.push(message);
                 }else{for row in &response.rows{self.encode_history(&row.item,images,scope,out)?;}}
@@ -431,6 +448,14 @@ pub struct OpenAiCompatRuntime {
 }
 
 impl OpenAiCompatRuntime {
+    /// DeepSeek protocol option (2026-09): caller decides model capability and user policy.
+    /// Completions tool continuations must replay the assistant's reasoning_content.
+    #[must_use]
+    pub fn with_deepseek_thinking(mut self, enabled: bool) -> Self {
+        self.codec.deepseek_thinking = Some(enabled);
+        self
+    }
+
     pub fn with_tool_images(mut self, source: Arc<dyn crate::ToolOutputImages>) -> Self {
         self.tool_images = Some(source);
         self
