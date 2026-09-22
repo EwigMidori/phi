@@ -80,3 +80,6 @@ Minimal agent **mechanisms** for **phi**. No tree/graph, no Daan product strateg
 ## Dependencies
 
 Only crates declared in this package’s `Cargo.toml`. No `da-*`.
+
+- `RunFailure` is per-AgentRun retry disposition, retained through stream decorators. Error owners report `FailureDisposition`; consumers never derive retry intent from String text. Host observation/persistence errors are terminal.
+- `ModelResponse::project_visible` atomically projects Assistant display rows without touching opaque replay material. `invalidate_continuation` marks a semantically modified/cut response copy incomplete; neither message adds persisted fields.

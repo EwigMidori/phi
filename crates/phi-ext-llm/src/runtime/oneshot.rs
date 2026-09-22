@@ -1,9 +1,10 @@
 //! Single-response completions share the wire reader, never ProviderConversation.
 use super::*;
+use crate::ResponseStep;
 use futures::stream;
 
 #[async_trait]
-impl OneshotModel for OpenAiCompatRuntime {
+impl OneshotModel for LlmRuntime {
     async fn generate(&self, request: OneshotRequest) -> Result<AgentRun, String> {
         if !request.input.has_input() {
             return Err("oneshot input empty".into());
@@ -17,8 +18,11 @@ impl OneshotModel for OpenAiCompatRuntime {
         }];
         let reader = self
             .open_response(&request.session_id, &prefix, &history, &request.cancel)
-            .await?;
+            .await
+            .map_err(ProviderError::into_message)?;
+        let failure = Arc::new(phi_kernel::RunFailure::default());
         let response = SingleResponse {
+            failure: failure.clone(),
             reader,
             complete: false,
             done: false,
@@ -32,24 +36,29 @@ impl OneshotModel for OpenAiCompatRuntime {
                     return None;
                 }
                 let event = response.next().await;
-                if event.is_err() {
+                if let Err(error) = &event {
+                    response.failure.record(error.failure_disposition());
                     response.done = true;
+                    response.reader.close();
                 }
-                Some((event, response))
+                Some((event.map_err(ProviderError::into_message), response))
             },
-        ))))
+        )))
+        .with_failure_reporter(failure))
     }
 }
 
 struct SingleResponse {
-    reader: SseReader,
+    failure: Arc<phi_kernel::RunFailure>,
+    reader: Box<dyn ProviderResponse>,
     complete: bool,
     done: bool,
 }
 impl SingleResponse {
-    async fn next(&mut self) -> Result<AgentEvent, String> {
+    async fn next(&mut self) -> Result<AgentEvent, ProviderError> {
         match self.reader.next().await? {
-            Some(AgentEvent::ModelResponseCompleted { response }) => {
+            ResponseStep::ReadyToSeal => {
+                let response = self.reader.seal(&NoTools)?;
                 if self.complete || !response.complete {
                     return Err("oneshot response incomplete or repeated".into());
                 }
@@ -64,21 +73,35 @@ impl SingleResponse {
                 self.complete = true;
                 Ok(AgentEvent::ModelResponseCompleted { response })
             }
-            Some(event) => Ok(event),
-            None if self.complete => {
+            ResponseStep::Observation(event) => {
+                if !matches!(
+                    event,
+                    AgentEvent::ResponseStarted { .. }
+                        | AgentEvent::TextDelta { .. }
+                        | AgentEvent::ReasoningDelta { .. }
+                        | AgentEvent::Usage { .. }
+                ) {
+                    return Err(
+                        "protocol emitted an effect instead of a response observation".into(),
+                    );
+                }
+                Ok(event)
+            }
+            ResponseStep::Ended if self.complete => {
+                self.reader.close();
                 self.done = true;
                 Ok(AgentEvent::Finished {
                     reason: Some("stop".into()),
                 })
             }
-            None => Err("provider ended without a complete response".into()),
+            ResponseStep::Ended => Err("provider ended without a complete response".into()),
         }
     }
 }
 
 /// Plain-text convenience adapter over the same single-response implementation.
 #[async_trait]
-impl OneshotText for OpenAiCompatRuntime {
+impl OneshotText for LlmRuntime {
     async fn complete(&self, input: &str) -> Result<String, String> {
         let mut run = self
             .generate(OneshotRequest {
@@ -109,5 +132,11 @@ impl OneshotText for OpenAiCompatRuntime {
         .await;
         run.close_and_join().await?;
         result
+    }
+}
+
+impl Drop for SingleResponse {
+    fn drop(&mut self) {
+        self.reader.close();
     }
 }

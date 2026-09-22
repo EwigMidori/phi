@@ -116,6 +116,28 @@ pub struct ModelResponse {
     pub complete: bool,
 }
 
+impl ModelResponse {
+    /// Project assistant display text atomically without modifying protocol replay material.
+    /// Semantic user edits must invalidate continuation instead.
+    pub fn project_visible(
+        &mut self,
+        mut project: impl FnMut(&mut String) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut rows = self.rows.clone();
+        for row in &mut rows {
+            if let TurnItem::Assistant { content } = &mut row.item {
+                project(content)?;
+            }
+        }
+        self.rows = rows;
+        Ok(())
+    }
+    pub fn invalidate_continuation(&mut self) {
+        self.continuation = None;
+        self.complete = false;
+    }
+}
+
 // ── Tools / tool-result status ─────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -521,12 +543,42 @@ pub trait ResponseUsageDrain: Send + Sync {
     fn begin(&self);
 }
 
+/// Explicit retry classification supplied by the owner that produced the failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureDisposition {
+    Retryable,
+    Terminal,
+}
+
+/// Per-run error capability; stream decorators retain and can report their own failures.
+#[derive(Default)]
+pub struct RunFailure(std::sync::atomic::AtomicU8);
+impl RunFailure {
+    pub fn record(&self, disposition: FailureDisposition) {
+        self.0.store(
+            match disposition {
+                FailureDisposition::Retryable => 1,
+                FailureDisposition::Terminal => 2,
+            },
+            Ordering::SeqCst,
+        );
+    }
+    pub fn disposition(&self) -> Option<FailureDisposition> {
+        match self.0.load(Ordering::SeqCst) {
+            1 => Some(FailureDisposition::Retryable),
+            2 => Some(FailureDisposition::Terminal),
+            _ => None,
+        }
+    }
+}
+
 /// A pull-driven run. No further effect may begin until the consumer requests
 /// the next event after durably committing the previous event.
 pub struct AgentRun {
     stream: Option<AgentEventStream>,
     lifecycle: Option<Arc<dyn AgentRunLifecycle>>,
     usage_drain: Option<Arc<dyn ResponseUsageDrain>>,
+    failure: Arc<RunFailure>,
 }
 
 impl AgentRun {
@@ -561,6 +613,7 @@ impl AgentRun {
             stream: Some(stream),
             lifecycle: None,
             usage_drain: None,
+            failure: Arc::new(RunFailure::default()),
         }
     }
     pub fn with_lifecycle(stream: AgentEventStream, lifecycle: Arc<dyn AgentRunLifecycle>) -> Self {
@@ -568,7 +621,18 @@ impl AgentRun {
             stream: Some(stream),
             lifecycle: Some(lifecycle),
             usage_drain: None,
+            failure: Arc::new(RunFailure::default()),
         }
+    }
+    pub fn failure_disposition(&self) -> Option<FailureDisposition> {
+        self.failure.disposition()
+    }
+    pub fn failure_reporter(&self) -> Arc<RunFailure> {
+        self.failure.clone()
+    }
+    pub fn with_failure_reporter(mut self, failure: Arc<RunFailure>) -> Self {
+        self.failure = failure;
+        self
     }
     pub fn with_usage_drain(mut self, control: Arc<dyn ResponseUsageDrain>) -> Self {
         self.usage_drain = Some(control);
@@ -608,10 +672,14 @@ impl AgentRun {
         mut inspect: impl FnMut(&AgentEvent) -> Result<(), String> + Send + 'static,
     ) -> Self {
         use futures::StreamExt;
+        let failure = self.failure.clone();
         self.stream = self.stream.take().map(|stream| {
             Box::pin(stream.map(move |event| {
                 if let Ok(value) = &event {
-                    inspect(value)?;
+                    if let Err(error) = inspect(value) {
+                        failure.record(FailureDisposition::Terminal);
+                        return Err(error);
+                    }
                 }
                 event
             })) as AgentEventStream
@@ -925,6 +993,70 @@ mod cancellation_tests {
 
 #[cfg(test)]
 mod run_inspection_tests {
+    #[test]
+    fn visible_projection_is_atomic_and_does_not_rewrite_replay_material() {
+        let mut response = ModelResponse {
+            id: ModelResponseId::generate(),
+            rows: ["first", "second"]
+                .into_iter()
+                .map(|content| {
+                    crate::TranscriptRow::new(
+                        crate::MessageId::generate(),
+                        TurnItem::Assistant {
+                            content: content.into(),
+                        },
+                    )
+                })
+                .collect(),
+            continuation: Some(ProviderContinuation {
+                scope: "test".into(),
+                payload: serde_json::json!({"opaque":"original"}),
+            }),
+            complete: true,
+        };
+        let before = response.clone();
+        assert!(
+            response
+                .project_visible(|content| {
+                    if content == "second" {
+                        return Err("invalid display framing".into());
+                    }
+                    content.clear();
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(response, before);
+        response
+            .project_visible(|content| {
+                *content = format!("visible {content}");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(response.continuation, before.continuation);
+        assert!(
+            matches!(&response.rows[0].item, TurnItem::Assistant { content } if content == "visible first")
+        );
+        response.invalidate_continuation();
+        assert!(!response.complete);
+        assert!(response.continuation.is_none());
+    }
+    #[tokio::test]
+    async fn failed_host_observation_is_terminal_and_decorators_share_failure_reporting() {
+        let run = AgentRun::text("answer");
+        let failure = run.failure_reporter();
+        let mut run = run
+            .map_stream(|stream| stream)
+            .try_inspect_events(|_| Err("storage failed".into()));
+        assert!(run.next().await.unwrap().is_err());
+        assert_eq!(failure.disposition(), Some(FailureDisposition::Terminal));
+        assert_eq!(
+            run.failure_disposition(),
+            Some(FailureDisposition::Terminal)
+        );
+        run.close_and_join().await.unwrap();
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

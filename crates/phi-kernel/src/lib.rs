@@ -43,11 +43,11 @@ mod transcript;
 
 pub use agent::{
     AgentEvent, AgentEventStream, AgentPorts, AgentPrefix, AgentPrefixSource, AgentRun,
-    AgentRunLifecycle, AgentRuntime, EmptyAgentPrefix, FixedAgentPrefix, FixedToolCallSeal,
-    ModelResponse, OneshotModel, OneshotRequest, OneshotText, PreambleSection,
-    ProviderContinuation, ResponseUsageDrain, SkillDesc, SkillSlug, SourcesTurnMaterials,
-    ToolArguments, ToolCallId, ToolCallSealPolicy, ToolCallSealSource, ToolName, ToolResultStatus,
-    ToolSpec, TurnCancel, TurnItem, TurnMaterials, TurnRequest, Usage,
+    AgentRunLifecycle, AgentRuntime, EmptyAgentPrefix, FailureDisposition, FixedAgentPrefix,
+    FixedToolCallSeal, ModelResponse, OneshotModel, OneshotRequest, OneshotText, PreambleSection,
+    ProviderContinuation, ResponseUsageDrain, RunFailure, SkillDesc, SkillSlug,
+    SourcesTurnMaterials, ToolArguments, ToolCallId, ToolCallSealPolicy, ToolCallSealSource,
+    ToolName, ToolResultStatus, ToolSpec, TurnCancel, TurnItem, TurnMaterials, TurnRequest, Usage,
 };
 pub use content::{ContentPart, MessageContent, TailState};
 pub use error::{KernelError, Result};

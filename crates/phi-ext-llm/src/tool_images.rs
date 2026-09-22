@@ -6,22 +6,19 @@ pub trait ToolOutputImages: Send + Sync {
     fn images(&self, name: &ToolName, output: &Value) -> Result<Vec<ImageId>, String>;
 }
 
-pub(crate) struct ToolImageProjection;
+pub(crate) struct ToolImageProjection {
+    pub asset_history: Vec<TurnItem>,
+    pub materials: std::collections::HashMap<usize, MessageContent>,
+}
 impl ToolImageProjection {
     pub fn project(
-        history: Vec<TurnItem>,
+        history: &[TurnItem],
         source: &dyn ToolOutputImages,
         enabled: bool,
-    ) -> Result<Vec<TurnItem>, String> {
-        let mut projected = Vec::new();
-        let mut parts = Vec::new();
-        for item in history {
-            // Keep every response's tool replies adjacent before adding image material.
-            if !matches!(item, TurnItem::ToolResult { .. }) && !parts.is_empty() {
-                projected.push(TurnItem::User {
-                    content: MessageContent::from_parts(std::mem::take(&mut parts)),
-                });
-            }
+    ) -> Result<Self, String> {
+        let mut asset_history = history.to_vec();
+        let mut materials = std::collections::HashMap::new();
+        for (position, item) in history.iter().enumerate() {
             if let TurnItem::ToolResult {
                 tool_call_id,
                 tool_name,
@@ -31,6 +28,7 @@ impl ToolImageProjection {
             {
                 let images = source.images(tool_name, output)?;
                 if !images.is_empty() {
+                    let mut parts = Vec::new();
                     parts.push(ContentPart::Text { text: if enabled {
                         format!("Images produced by tool call {tool_call_id} (tool output, not a new user request):")
                     } else {
@@ -43,15 +41,18 @@ impl ToolImageProjection {
                                 .map(|image_id| ContentPart::Image { image_id }),
                         );
                     }
+                    let content = MessageContent::from_parts(parts);
+                    // This view is for immutable asset IO only, never protocol history.
+                    asset_history.push(TurnItem::User {
+                        content: content.clone(),
+                    });
+                    materials.insert(position, content);
                 }
             }
-            projected.push(item);
         }
-        if !parts.is_empty() {
-            projected.push(TurnItem::User {
-                content: MessageContent::from_parts(parts),
-            });
-        }
-        Ok(projected)
+        Ok(Self {
+            asset_history,
+            materials,
+        })
     }
 }

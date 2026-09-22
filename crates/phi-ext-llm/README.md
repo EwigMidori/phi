@@ -1,21 +1,26 @@
 # phi-ext-llm
 
-OpenAI-compatible HTTP/SSE → kernel `AgentRuntime`.
+OpenAI-compatible and native Gemini protocols → one pull-driven kernel `AgentRuntime`.
 
 | API | Role |
 |-----|------|
-| `LlmConfig` | `ApiBase` + `ApiKey` + `ModelId` + `ApiStyle` |
+| `LlmConfig` | OpenAI adapter configuration: `ApiBase` + `ApiKey` + `ModelId` + `ApiStyle` |
+| `HttpConnection` / `AuthMode` | Explicit endpoint and Bearer / Google API key header |
+| `ProviderProtocol` / `ProviderResponse` | A protocol opens and seals one response; it never executes tools |
+| `OpenAiProtocol` / `GeminiProtocol` | Independently composed wire implementations |
+| `ResponseMode` | Gemini streaming (`streamGenerateContent`) or buffered (`generateContent`) |
 | `ApiBase` / `ApiKey` / `ModelId` | validated wire config newtypes (`try_new`) |
 | `ApiStyle` | `responses` \| `completions` |
 | `ReasoningConfig` | explicit dialect + provider default / disabled / enabled / exact effort |
 | `HistoryProjector` | optional strategy **port** (product implements) |
 | `PassThrough` | default projector (no filter) |
-| `OpenAiCompatRuntime` | mechanism: project → provider response → durable batch → tools → continue |
+| `LlmRuntime` | mechanism: project → provider response → durable batch → tools → continue |
 
 Products own env vars and history policy, e.g.:
 
 ```rust
-OpenAiCompatRuntime::new(cfg).with_projector(Arc::new(MyChatTextOnly));
+LlmRuntime::new(Arc::new(OpenAiProtocol::new(cfg)))
+    .with_projector(Arc::new(MyChatTextOnly));
 ```
 
 ```bash
@@ -34,14 +39,17 @@ transcript persistence. A matching Responses scope replays the opaque payload;
 any other provider/protocol/model gets the portable visible rows. Provider response
 completion is distinct from the generation's final `Finished` event.
 
-`with_reasoning(ReasoningConfig { dialect, mode })` selects OpenAI, DeepSeek,
+`OpenAiProtocol::with_reasoning(ReasoningConfig { dialect, mode })` selects OpenAI, DeepSeek,
 Gemini's OpenAI compatibility endpoint, Qwen, SiliconFlow, or OpenRouter wire
 behavior. The host determines the endpoint and model capabilities; this crate
 never guesses them from a model name. `ProviderDefault` omits control parameters
 and still retains the selected dialect's continuation handling. Effort values
 are never converted to a nearby level, and `Enabled` is accepted only for real
 toggle protocols. Gemini, Qwen and SiliconFlow currently require Completions.
-Budget controls and native Gemini/Anthropic APIs are outside this adapter.
+These remain OpenAI-compatible controls. `GeminiProtocol::with_thinking` separately
+accepts exact native level/budget intent; native Gemini is not a compatibility dialect.
+Both native response modes share the same assembler, tools, cancellation and usage.
+No transport, authentication or protocol fallback is attempted.
 
 Completions preserves Gemini thought signatures and OpenRouter reasoning details
 in `ProviderContinuation`. DeepSeek and SiliconFlow replay their reasoning text
@@ -59,4 +67,6 @@ Protocol fixtures were reviewed on 2026-09-22 against the official
 [SiliconFlow API](https://docs.siliconflow.cn/docs/api/chat-completions-post), and
 [OpenRouter reasoning guide](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
 
-`with_tool_images` injects a host `ToolOutputImages` interpreter for opaque tool outputs. Images are projected into request-only, labelled user-role material after all adjacent tool replies (including Completions correlation constraints); persisted history is unchanged. The existing image service transfers actual bytes or provider file references. Text-only policies emit an explicit cannot-inspect notice instead of sending unsupported images.
+`with_tool_images` injects a host `ToolOutputImages` interpreter for opaque tool outputs. Request-local image material is associated with its precise tool-result history position. OpenAI encodes labelled user-role material after adjacent replies; native Gemini encodes functionResponse image parts without inventing a user turn. Persisted and logical request history remain unchanged. The existing image service transfers actual bytes or provider file references. Text-only policies emit an explicit cannot-inspect notice instead of sending unsupported images.
+
+`AgentRun::failure_disposition` reports explicit per-run retry intent; absence is not permission to retry. Stream decorators preserve the reporter and can classify their own failures without parsing error strings.

@@ -116,6 +116,9 @@ impl Server {
         });
         Self { state, base, task }
     }
+    fn protocol(&self, style: ApiStyle, key: &str) -> OpenAiProtocol {
+        OpenAiProtocol::new(self.config(style, key))
+    }
     fn config(&self, style: ApiStyle, key: &str) -> LlmConfig {
         LlmConfig::new(
             self.base.clone(),
@@ -246,9 +249,10 @@ async fn tool_images_reach_both_protocols_after_all_replies_and_text_models_rece
             image_policy.enabled = enabled;
             image_policy.transfer = Some(ImageTransfer::Inline);
             let id = ImageId::generate();
-            let runtime = OpenAiCompatRuntime::new(server.config(style, "key"))
-                .with_images(service, image_policy)
-                .with_tool_images(Arc::new(PlotImages(id.clone())));
+            let runtime =
+                LlmRuntime::new(Arc::new(OpenAiProtocol::new(server.config(style, "key"))))
+                    .with_images(service, image_policy)
+                    .with_tool_images(Arc::new(PlotImages(id.clone())));
             let mut request = request(&id);
             request.history = vec![TurnItem::User {
                 content: MessageContent::text("make plots"),
@@ -342,7 +346,7 @@ async fn two_dialects_preserve_content_and_tail_order_and_reuse_one_upload() {
         Arc::new(ProviderImages::new(source.clone(), Arc::new(MemoryCache::default())).unwrap());
     let id = ImageId::generate();
     for style in [ApiStyle::Completions, ApiStyle::Responses] {
-        let runtime = OpenAiCompatRuntime::new(server.config(style, "key"))
+        let runtime = LlmRuntime::new(Arc::new(OpenAiProtocol::new(server.config(style, "key"))))
             .with_images(images.clone(), policy());
         let request = request(&id);
         runtime
@@ -402,7 +406,7 @@ async fn cancelling_one_waiter_does_not_cancel_the_other_upload() {
         tokio::spawn(async move {
             service
                 .prepare(
-                    &config,
+                    OpenAiProtocol::new(config.clone()).connection(),
                     &policy(),
                     &request.session_id,
                     &request.history,
@@ -441,7 +445,7 @@ async fn all_waiters_cancel_then_a_new_request_can_upload() {
     let first = tokio::spawn(async move {
         service
             .prepare(
-                &config_first,
+                OpenAiProtocol::new(config_first.clone()).connection(),
                 &policy(),
                 &first_request.session_id,
                 &first_request.history,
@@ -456,7 +460,7 @@ async fn all_waiters_cancel_then_a_new_request_can_upload() {
     server.state.gates.add_permits(1);
     let result = images
         .prepare(
-            &config,
+            OpenAiProtocol::new(config.clone()).connection(),
             &policy(),
             &request.session_id,
             &request.history,
@@ -493,7 +497,8 @@ async fn confirmed_missing_file_is_repaired_once_but_auth_and_rate_errors_are_no
             )
             .unwrap();
         let service = Arc::new(ProviderImages::new(source, cache).unwrap());
-        let runtime = OpenAiCompatRuntime::new(config).with_images(service, policy());
+        let runtime =
+            LlmRuntime::new(Arc::new(OpenAiProtocol::new(config))).with_images(service, policy());
         let mut run = runtime.run(request(&ImageId::generate())).await.unwrap();
         let result = run.next().await.unwrap();
         assert_eq!(result.is_ok(), status == 400);
@@ -536,7 +541,8 @@ async fn persistent_rejection_stops_after_one_confirmed_file_repair() {
         )
         .unwrap();
     let service = Arc::new(ProviderImages::new(source, cache).unwrap());
-    let runtime = OpenAiCompatRuntime::new(config).with_images(service, policy());
+    let runtime =
+        LlmRuntime::new(Arc::new(OpenAiProtocol::new(config))).with_images(service, policy());
     let mut run = runtime.run(request(&ImageId::generate())).await.unwrap();
     assert!(run.next().await.unwrap().is_err());
     run.close_and_join().await.unwrap();
@@ -561,7 +567,7 @@ async fn capability_rejection_checks_history_before_any_upload_and_credentials_d
     assert!(
         service
             .prepare(
-                &server.config(ApiStyle::Completions, "one"),
+                server.protocol(ApiStyle::Completions, "one").connection(),
                 &disabled,
                 &request.session_id,
                 &request.history,
@@ -574,7 +580,7 @@ async fn capability_rejection_checks_history_before_any_upload_and_credentials_d
     for key in ["one", "two"] {
         service
             .prepare(
-                &server.config(ApiStyle::Completions, key),
+                server.protocol(ApiStyle::Completions, key).connection(),
                 &policy(),
                 &request.session_id,
                 &request.history,

@@ -10,7 +10,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::Engine;
 use bytes::Bytes;
 use phi_kernel::{ContentPart, ImageId, SessionId, TurnCancel, TurnItem};
 use reqwest::{Client, multipart};
@@ -18,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
-use crate::{ApiBase, ApiKey, LlmConfig};
+use crate::{ApiBase, ApiKey, HttpConnection};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ImageDigest(String);
@@ -153,14 +152,65 @@ pub trait FileReferenceCache: Send + Sync {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum PreparedImage {
-    Inline(String),
+pub enum PreparedImage {
+    Inline {
+        mime_type: String,
+        bytes: Bytes,
+    },
     File {
         key: FileCacheKey,
         reference: FileReference,
     },
 }
-pub(crate) type PreparedImages = HashMap<ImageId, PreparedImage>;
+#[derive(Clone, Debug, Default)]
+pub struct PreparedImages {
+    entries: HashMap<ImageId, PreparedImage>,
+    max_request_bytes: Option<usize>,
+    tool_materials: HashMap<usize, phi_kernel::MessageContent>,
+}
+impl PreparedImages {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn get(&self, id: &ImageId) -> Option<&PreparedImage> {
+        self.entries.get(id)
+    }
+    pub fn insert(&mut self, id: ImageId, image: PreparedImage) -> Option<PreparedImage> {
+        self.entries.insert(id, image)
+    }
+    pub fn contains_key(&self, id: &ImageId) -> bool {
+        self.entries.contains_key(id)
+    }
+    pub fn values(&self) -> impl Iterator<Item = &PreparedImage> {
+        self.entries.values()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&ImageId, &PreparedImage)> {
+        self.entries.iter()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    /// A request-local history position, not a provider call identity (which can repeat).
+    pub fn tool_output_at(&self, position: usize) -> Option<&phi_kernel::MessageContent> {
+        self.tool_materials.get(&position)
+    }
+    pub(crate) fn attach_tool_outputs(
+        &mut self,
+        materials: HashMap<usize, phi_kernel::MessageContent>,
+    ) {
+        self.tool_materials = materials;
+    }
+    pub fn validate_request_bytes(&self, len: usize) -> Result<(), String> {
+        if self.max_request_bytes.is_some_and(|max| len > max) {
+            Err("请求体超出 Provider 限制，请减少当前上下文的图片或文字".into())
+        } else {
+            Ok(())
+        }
+    }
+}
 
 struct UploadFlight {
     result: watch::Sender<Option<Result<FileReference, String>>>,
@@ -322,7 +372,7 @@ impl ProviderImages {
 
     pub(crate) async fn prepare(
         self: &Arc<Self>,
-        config: &LlmConfig,
+        config: &HttpConnection,
         policy: &ImagePolicy,
         session: &SessionId,
         history: &[TurnItem],
@@ -330,11 +380,17 @@ impl ProviderImages {
     ) -> Result<PreparedImages, String> {
         let (occurrences, mut metadata) = self.inspect(policy, session, history, cancel).await?;
         if occurrences.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(PreparedImages {
+                max_request_bytes: Some(policy.max_request_bytes),
+                ..PreparedImages::new()
+            });
         }
         let transfer = policy.transfer.ok_or("image transfer not configured")?;
         // Validate the entire request before any upload starts.
-        let mut prepared = HashMap::new();
+        let mut prepared = PreparedImages {
+            max_request_bytes: Some(policy.max_request_bytes),
+            ..PreparedImages::new()
+        };
         for id in occurrences {
             if prepared.contains_key(&id) {
                 continue;
@@ -346,11 +402,10 @@ impl ProviderImages {
                         () = cancel.cancelled() => return Err("image preparation cancelled".into()),
                         result = self.read_verified(session, &id, &meta) => result?,
                     };
-                    PreparedImage::Inline(format!(
-                        "data:{};base64,{}",
-                        meta.mime_type,
-                        base64::engine::general_purpose::STANDARD.encode(bytes)
-                    ))
+                    PreparedImage::Inline {
+                        mime_type: meta.mime_type,
+                        bytes,
+                    }
                 }
                 ImageTransfer::DeepSeekFiles => {
                     let key =
@@ -381,7 +436,7 @@ impl ProviderImages {
 
     async fn reference(
         self: &Arc<Self>,
-        config: &LlmConfig,
+        config: &HttpConnection,
         policy: &ImagePolicy,
         session: &SessionId,
         id: &ImageId,
@@ -446,7 +501,7 @@ impl ProviderImages {
 
     async fn upload(
         &self,
-        config: &LlmConfig,
+        config: &HttpConnection,
         session: &SessionId,
         id: &ImageId,
         meta: &ImageMetadata,
@@ -477,10 +532,8 @@ impl ProviderImages {
             .text("expires_after[anchor]", "created_at")
             .text("expires_after[seconds]", seconds.to_string())
             .part("file", part);
-        let response = self
-            .client
-            .post(format!("{}/files", config.api_base))
-            .bearer_auth(config.api_key.as_str())
+        let response = config
+            .authorize(self.client.post(format!("{}/files", config.api_base)))
             .multipart(form)
             .send()
             .await
@@ -512,7 +565,7 @@ impl ProviderImages {
     /// A rejected request alone does not prove expiry. Only GET /files/{id} = 404 repairs a reference.
     pub(crate) async fn repair_missing(
         &self,
-        config: &LlmConfig,
+        config: &HttpConnection,
         prepared: &PreparedImages,
         cancel: &TurnCancel,
     ) -> Result<bool, String> {
@@ -521,8 +574,8 @@ impl ProviderImages {
             if let PreparedImage::File { key, reference } = image {
                 let response = tokio::select! {
                     () = cancel.cancelled() => return Err("image verification cancelled".into()),
-                    result = self.client.get(format!("{}/files/{}", config.api_base, reference.id.as_str()))
-                        .bearer_auth(config.api_key.as_str()).timeout(Duration::from_secs(20)).send() => result.map_err(|_| "unable to verify provider file")?,
+                    result = config.authorize(self.client.get(format!("{}/files/{}", config.api_base, reference.id.as_str())))
+                        .timeout(Duration::from_secs(20)).send() => result.map_err(|_| "unable to verify provider file")?,
                 };
                 match response.status().as_u16() {
                     404 => missing.push((key, &reference.id)),

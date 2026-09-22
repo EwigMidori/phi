@@ -3,7 +3,7 @@ name = "phi-ext-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "phi ext — LLM provider adapters implementing AgentRuntime (OpenAI-compatible wire)"
+description = "phi ext — shared LLM runtime with OpenAI-compatible and native Gemini adapters"
 readme = "README.md"
 
 [dependencies]

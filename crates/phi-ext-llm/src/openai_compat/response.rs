@@ -1,308 +1,27 @@
 use super::*;
+use crate::framing::SseFramer;
+use crate::{ResponseStep, ToolArgumentNormalizer};
 use bytes::Bytes;
-use futures::{Stream, StreamExt, stream};
-use phi_ext_tools::{ToolExecution, ToolExecutionScope};
+use futures::Stream;
 use phi_kernel::{
-    AgentEventStream, AgentRun, AgentRunLifecycle, MessageId, ModelResponse, ModelResponseId,
-    ProviderContinuation, ResponseUsageDrain, ToolArguments, ToolCallId, ToolName, TranscriptRow,
-    TurnRequest, Usage,
+    MessageId, ModelResponseId, ProviderContinuation, ToolArguments, ToolCallId, ToolName,
+    TranscriptRow, Usage,
 };
-use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
-    pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 #[cfg(test)]
 mod tests;
 
-struct RunLifecycle {
-    scope: Arc<ToolExecutionScope>,
-    finished: AtomicBool,
-    usage_only: AtomicBool,
-}
-impl ResponseUsageDrain for RunLifecycle {
-    fn begin(&self) {
-        self.usage_only.store(true, Ordering::SeqCst);
-    }
-}
-#[async_trait]
-impl AgentRunLifecycle for RunLifecycle {
-    async fn close_and_join(&self) -> Result<(), String> {
-        if self.finished.load(Ordering::SeqCst) {
-            self.scope.join().await;
-        } else {
-            self.scope.close_and_join().await;
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl AgentRuntime for OpenAiCompatRuntime {
-    async fn run(&self, request: TurnRequest) -> Result<AgentRun, String> {
-        let bound = self.tools.specs();
-        let mut names = HashSet::new();
-        for spec in &request.prefix.tools {
-            if !names.insert(spec.name.clone()) {
-                return Err("duplicate tool in agent prefix".into());
-            }
-            if !bound
-                .iter()
-                .any(|known| known.name == spec.name && known.parameters == spec.parameters)
-            {
-                return Err(format!(
-                    "tool definition has no matching executable binding: {}",
-                    spec.name
-                ));
-            }
-        }
-        let lifecycle = Arc::new(RunLifecycle {
-            scope: Arc::new(
-                self.tools
-                    .scope_for(request.session_id.clone(), request.cancel.clone()),
-            ),
-            finished: AtomicBool::new(false),
-            usage_only: AtomicBool::new(false),
-        });
-        let conversation = ProviderConversation {
-            runtime: self.clone(),
-            history: self.projector.project(&request.history),
-            request,
-            reader: None,
-            tools: VecDeque::new(),
-            pending_response: None,
-            response_count: 0,
-            tool_count: 0,
-            done: false,
-            lifecycle: lifecycle.clone(),
-        };
-        let stream: AgentEventStream = Box::pin(stream::unfold(
-            conversation,
-            |mut conversation| async move {
-                if conversation.done {
-                    return None;
-                }
-                let event = conversation.next().await;
-                if event.is_err() {
-                    conversation.done = true;
-                }
-                Some((event, conversation))
-            },
-        ));
-        Ok(AgentRun::with_lifecycle(stream, lifecycle.clone()).with_usage_drain(lifecycle))
-    }
-}
-
-struct PendingCall {
-    response_id: ModelResponseId,
-    id: ToolCallId,
-    name: ToolName,
-    arguments: ToolArguments,
-}
-struct ProviderConversation {
-    runtime: OpenAiCompatRuntime,
-    request: TurnRequest,
-    history: Vec<TurnItem>,
-    reader: Option<SseReader>,
-    tools: VecDeque<PendingCall>,
-    pending_response: Option<ModelResponse>,
-    response_count: usize,
-    tool_count: usize,
-    done: bool,
-    lifecycle: Arc<RunLifecycle>,
-}
-impl ProviderConversation {
-    async fn next(&mut self) -> Result<AgentEvent, String> {
-        if self.request.cancel.is_cancelled() {
-            return Err("generation cancelled".into());
-        }
-        if self.lifecycle.usage_only.load(Ordering::SeqCst) {
-            // This branch is before the commit acknowledgement/tool loop. Even
-            // already-decoded calls can never execute after usage draining begins.
-            if let Some(reader) = &mut self.reader {
-                reader.begin_usage_drain();
-                match reader.next().await {
-                    Ok(Some(event @ AgentEvent::Usage { .. })) => return Ok(event),
-                    // The accepted answer is independent of optional metadata.
-                    // A malformed/failed tail simply leaves counters unknown.
-                    Ok(_) | Err(_) => {}
-                }
-            }
-            self.reader = None;
-            self.done = true;
-            self.lifecycle.finished.store(true, Ordering::SeqCst);
-            return Ok(AgentEvent::Finished {
-                reason: Some("response usage drained".into()),
-            });
-        }
-        // Reaching this poll acknowledges the previous response/result commit.
-        if let Some(response) = self.pending_response.take() {
-            let no_calls = self.tools.is_empty();
-            self.history.push(TurnItem::ModelResponse { response });
-            if no_calls {
-                self.done = true;
-                self.lifecycle.finished.store(true, Ordering::SeqCst);
-                return Ok(AgentEvent::Finished {
-                    reason: Some("stop".into()),
-                });
-            }
-        }
-        if let Some(call) = self.tools.pop_front() {
-            if self.tool_count >= 32 {
-                return Err("generation exceeded 32 tool calls".into());
-            }
-            self.tool_count += 1;
-            let result = if self
-                .request
-                .prefix
-                .tools
-                .iter()
-                .any(|spec| spec.name == call.name)
-            {
-                self.lifecycle
-                    .scope
-                    .execute(&call.name, call.arguments.as_str())
-                    .await
-            } else {
-                ToolExecution::error(
-                    "UnknownTool",
-                    format!("Tool {} is not enabled for this generation", call.name),
-                )
-            };
-            self.history.push(TurnItem::ToolResult {
-                tool_call_id: call.id.clone(),
-                tool_name: call.name,
-                output: result.output.clone(),
-                status: result.status,
-            });
-            return Ok(AgentEvent::ToolResult {
-                response_id: call.response_id,
-                tool_call_id: call.id,
-                output: result.output,
-                status: result.status,
-            });
-        }
-        if self.reader.is_none() {
-            if self.response_count >= 16 {
-                return Err("generation exceeded 16 model responses".into());
-            }
-            self.response_count += 1;
-            let history = self
-                .request
-                .materialize_history(self.history.clone())
-                .map_err(|error| error.to_string())?;
-            let history = match &self.runtime.tool_images {
-                Some(source) => crate::tool_images::ToolImageProjection::project(
-                    history,
-                    source.as_ref(),
-                    self.runtime
-                        .images
-                        .as_ref()
-                        .is_some_and(|(_, policy)| policy.enabled),
-                )?,
-                None => history,
-            };
-            self.reader = Some(
-                self.runtime
-                    .open_response(
-                        &self.request.session_id,
-                        &self.request.prefix,
-                        &history,
-                        &self.request.cancel,
-                    )
-                    .await?,
-            );
-        }
-        let mut event = self
-            .reader
-            .as_mut()
-            .expect("response reader")
-            .next()
-            .await?
-            .ok_or("provider ended without a complete response")?;
-        if let AgentEvent::ModelResponseCompleted { response } = &mut event {
-            if self.request.prefix.tools.is_empty()
-                && response
-                    .rows
-                    .iter()
-                    .any(|row| matches!(row.item, TurnItem::ToolCall { .. }))
-            {
-                return Err("provider requested tools for a turn with no tools enabled".into());
-            }
-            for row in &mut response.rows {
-                if let TurnItem::ToolCall {
-                    tool_call_id,
-                    tool_name,
-                    input,
-                } = &mut row.item
-                {
-                    // Persist and execute the same canonical input. Invalid calls
-                    // stay intact so execution reports a tool error to the model.
-                    if self
-                        .request
-                        .prefix
-                        .tools
-                        .iter()
-                        .any(|spec| spec.name == *tool_name)
-                        && let Ok(normalized) =
-                            self.runtime.tools.normalize_arguments(tool_name, input)
-                    {
-                        if self.runtime.codec.reasoning.dialect == ReasoningDialect::Gemini
-                            && let Some(continuation) = &mut response.continuation
-                            && let Some(calls) = continuation
-                                .payload
-                                .get_mut("tool_calls")
-                                .and_then(Value::as_array_mut)
-                        {
-                            let original = calls
-                                .iter_mut()
-                                .find(|call| {
-                                    call.get("id").and_then(Value::as_str)
-                                        == Some(tool_call_id.as_str())
-                                })
-                                .ok_or("signed tool call is missing its original request")?;
-                            // The tool owns normalization (including legacy argument
-                            // aliases). Record its accepted canonical input alongside
-                            // the immutable signed provider arguments before commit.
-                            original["canonical_arguments"] = json!(normalized.as_str());
-                        }
-                        *input = normalized;
-                    }
-                    self.tools.push_back(PendingCall {
-                        response_id: response.id.clone(),
-                        id: tool_call_id.clone(),
-                        name: tool_name.clone(),
-                        arguments: input.clone(),
-                    });
-                }
-            }
-            self.pending_response = Some(response.clone());
-            self.reader = None;
-        }
-        Ok(event)
-    }
-}
-
-/// Byte-framed SSE: UTF-8 is decoded only after a complete line, never per TCP chunk.
+/// OpenAI response state, with byte framing delegated to the shared transport.
 pub(super) struct SseReader {
-    stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    buffer: Vec<u8>,
-    data: Vec<String>,
-    event: Option<String>,
+    framer: SseFramer,
     decoder: ResponseDecoder,
-    cancel: TurnCancel,
     queued: VecDeque<AgentEvent>,
     done: bool,
-    usage_bytes_left: Option<usize>,
+    usage_only: bool,
+    pending: Option<ModelResponse>,
+    sealed: bool,
 }
 impl SseReader {
-    fn begin_usage_drain(&mut self) {
-        if self.usage_bytes_left.is_none() {
-            self.usage_bytes_left = Some(256 * 1024);
-            self.queued
-                .retain(|event| matches!(event, AgentEvent::Usage { .. }));
-        }
-    }
     pub(super) fn from_byte_stream<S>(
         stream: S,
         cancel: TurnCancel,
@@ -320,18 +39,16 @@ impl SseReader {
             assistant_message_id: decoder.assistant_id.clone(),
         });
         Self {
-            stream: Box::pin(stream),
-            buffer: Vec::new(),
-            data: Vec::new(),
-            event: None,
+            framer: SseFramer::new(stream, cancel),
             decoder,
-            cancel,
             queued,
             done: false,
-            usage_bytes_left: None,
+            usage_only: false,
+            pending: None,
+            sealed: false,
         }
     }
-    pub(super) async fn next(&mut self) -> Result<Option<AgentEvent>, String> {
+    async fn next_event(&mut self) -> Result<Option<AgentEvent>, ProviderError> {
         loop {
             if let Some(event) = self.queued.pop_front() {
                 return Ok(Some(event));
@@ -339,89 +56,24 @@ impl SseReader {
             if self.done {
                 return Ok(None);
             }
-            if self.usage_bytes_left == Some(0) {
-                self.done = true;
-                return Ok(None);
-            }
-            while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
-                if let Some(remaining) = &mut self.usage_bytes_left {
-                    if index + 1 > *remaining {
-                        self.done = true;
-                        return Ok(None);
-                    }
-                    *remaining -= index + 1;
+            let Some(frame) = self.framer.next().await? else {
+                if self.usage_only {
+                    self.done = true;
+                    return Ok(None);
                 }
-                let line: Vec<_> = self.buffer.drain(..=index).collect();
-                let line = std::str::from_utf8(&line)
-                    .map_err(|_| "invalid UTF-8 in provider stream")?
-                    .trim_end_matches(['\r', '\n'])
-                    .to_owned();
-                if line.is_empty() {
-                    self.dispatch()?;
-                    if !self.queued.is_empty() || self.done {
-                        break;
-                    }
-                } else if let Some(data) = line.strip_prefix("data:") {
-                    self.data
-                        .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
-                } else if let Some(event) = line.strip_prefix("event:") {
-                    self.event = Some(event.trim().to_owned());
+                if self.decoder.style == ApiStyle::Completions
+                    && self.decoder.finish_reason.is_some()
+                {
+                    self.complete()?;
+                    continue;
                 }
-            }
-            if !self.queued.is_empty() || self.done {
-                continue;
-            }
-            if self
-                .usage_bytes_left
-                .is_some_and(|remaining| self.buffer.len() >= remaining)
-            {
-                self.done = true;
-                return Ok(None);
-            }
-            let next = tokio::select! {()=self.cancel.cancelled()=>return Err("request cancelled".into()),next=self.stream.next()=>next};
-            match next {
-                Some(Ok(bytes)) => {
-                    if let Some(remaining) = self.usage_bytes_left {
-                        let allowed = remaining.saturating_sub(self.buffer.len()).min(bytes.len());
-                        self.buffer.extend_from_slice(&bytes[..allowed]);
-                    } else {
-                        self.buffer.extend(bytes);
-                    }
-                    if self.buffer.len() > 8 * 1024 * 1024 {
-                        return Err("provider SSE frame exceeds limit".into());
-                    }
-                }
-                Some(Err(error)) => return Err(format!("stream read error: {error}")),
-                None => {
-                    if !self.buffer.is_empty() {
-                        return Err("provider stream ended inside an SSE frame".into());
-                    }
-                    if !self.data.is_empty() {
-                        self.dispatch()?;
-                    }
-                    if self.usage_bytes_left.is_some() {
-                        self.done = true;
-                    } else if !self.done {
-                        if self.decoder.style == ApiStyle::Completions
-                            && self.decoder.finish_reason.is_some()
-                        {
-                            self.complete()?;
-                        } else {
-                            return Err("provider stream ended before normal completion".into());
-                        }
-                    }
-                }
-            }
+                return Err("provider stream ended before normal completion".into());
+            };
+            self.dispatch(frame.data, frame.event)?;
         }
     }
-    fn dispatch(&mut self) -> Result<(), String> {
-        if self.data.is_empty() {
-            self.event = None;
-            return Ok(());
-        }
-        let data = std::mem::take(&mut self.data).join("\n");
-        let event = self.event.take();
-        if self.usage_bytes_left.is_some() {
+    fn dispatch(&mut self, data: String, event: Option<String>) -> Result<(), String> {
+        if self.usage_only {
             if data == "[DONE]" {
                 self.done = true;
                 return Ok(());
@@ -450,10 +102,10 @@ impl SseReader {
         }
         let value: Value =
             serde_json::from_str(&data).map_err(|error| format!("invalid SSE JSON: {error}"))?;
-        let terminal = self
+        if self
             .decoder
-            .consume(value, event.as_deref(), &mut self.queued)?;
-        if terminal {
+            .consume(value, event.as_deref(), &mut self.queued)?
+        {
             self.complete()?;
         }
         Ok(())
@@ -464,6 +116,75 @@ impl SseReader {
             .push_back(AgentEvent::ModelResponseCompleted { response });
         self.done = true;
         Ok(())
+    }
+}
+#[async_trait]
+impl ProviderResponse for SseReader {
+    async fn next(&mut self) -> Result<ResponseStep, ProviderError> {
+        if self.sealed {
+            return Ok(ResponseStep::Ended);
+        }
+        if self.pending.is_some() {
+            return Ok(ResponseStep::ReadyToSeal);
+        }
+        match self.next_event().await? {
+            Some(AgentEvent::ModelResponseCompleted { response }) => {
+                self.pending = Some(response);
+                Ok(ResponseStep::ReadyToSeal)
+            }
+            Some(event) => Ok(ResponseStep::Observation(event)),
+            None => Ok(ResponseStep::Ended),
+        }
+    }
+    fn seal(
+        &mut self,
+        normalizer: &dyn ToolArgumentNormalizer,
+    ) -> Result<ModelResponse, ProviderError> {
+        let mut response = self.pending.take().ok_or("response is not ready to seal")?;
+        for row in &mut response.rows {
+            if let TurnItem::ToolCall {
+                tool_call_id,
+                tool_name,
+                input,
+            } = &mut row.item
+            {
+                if let Ok(normalized) = normalizer.normalize(tool_name, input) {
+                    if self.decoder.dialect == ReasoningDialect::Gemini {
+                        if let Some(calls) = response
+                            .continuation
+                            .as_mut()
+                            .and_then(|continuation| continuation.payload.get_mut("tool_calls"))
+                            .and_then(Value::as_array_mut)
+                        {
+                            let original = calls
+                                .iter_mut()
+                                .find(|call| {
+                                    call.get("id").and_then(Value::as_str)
+                                        == Some(tool_call_id.as_str())
+                                })
+                                .ok_or("signed tool call is missing its original request")?;
+                            original["canonical_arguments"] = json!(normalized.as_str());
+                        }
+                    }
+                    *input = normalized;
+                }
+            }
+        }
+        self.sealed = true;
+        Ok(response)
+    }
+    fn begin_usage_drain(&mut self) {
+        self.usage_only = true;
+        self.pending = None;
+        self.queued
+            .retain(|event| matches!(event, AgentEvent::Usage { .. }));
+        self.framer.begin_usage_drain();
+    }
+    fn close(&mut self) {
+        self.framer.close();
+        self.queued.clear();
+        self.pending = None;
+        self.done = true;
     }
 }
 

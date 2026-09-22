@@ -7,7 +7,7 @@
 //! |------|---------|
 //! | Config | [`LlmConfig`], [`ApiStyle`], [`ModelId`], [`ApiBase`], [`ApiKey`] |
 //! | Strategy port | [`HistoryProjector`], default [`PassThrough`] |
-//! | Runtime | [`OpenAiCompatRuntime`] — [`phi_kernel::AgentRuntime`] + [`phi_kernel::OneshotText`] |
+//! | Runtime | [`LlmRuntime`] — [`phi_kernel::AgentRuntime`] + [`phi_kernel::OneshotText`] |
 //!
 //! Context policy is **product-owned** (inject a projector). This crate is wire
 //! mechanism only. Standalone completions bypass the agent loop and share its wire reader.
@@ -23,18 +23,28 @@ mod image_tests;
 mod images;
 mod tool_images;
 pub use tool_images::ToolOutputImages;
+mod config;
+pub(crate) mod framing;
+mod gemini;
 mod openai_compat;
+mod protocol;
 mod reasoning;
+mod runtime;
 pub use images::{
     FileCacheKey, FileReference, FileReferenceCache, ImageDigest, ImageMetadata, ImagePolicy,
     ImageSource, ImageTransfer, ProviderFileId, ProviderImages,
 };
 pub use reasoning::{ReasoningConfig, ReasoningDialect, ReasoningEffort, ReasoningMode};
 
-pub use openai_compat::{
-    ApiBase, ApiKey, ApiStyle, HistoryProjector, LlmConfig, ModelId, OpenAiCompatRuntime,
-    PassThrough,
+pub use config::{ApiBase, ApiKey, ApiStyle, LlmConfig, ModelId};
+pub use gemini::{GeminiProtocol, GeminiThinking};
+pub use images::{PreparedImage, PreparedImages};
+pub use openai_compat::OpenAiProtocol;
+pub use protocol::{
+    AuthMode, HttpConnection, ProviderError, ProviderErrorKind, ProviderProtocol, ProviderResponse,
+    ResponseMode, ResponseStep, ToolArgumentNormalizer,
 };
+pub use runtime::{HistoryProjector, LlmRuntime, PassThrough};
 
 pub const EXT_LLM_NAME: &str = "phi-ext-llm";
 

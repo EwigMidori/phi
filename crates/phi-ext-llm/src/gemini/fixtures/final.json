@@ -1,0 +1,4 @@
+{
+  "candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": "答案完成"}]}, "finishReason": "STOP"}],
+  "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 2, "totalTokenCount": 22}
+}

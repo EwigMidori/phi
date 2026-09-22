@@ -6,19 +6,20 @@ LLM **provider adapters** for **phi**: HTTP/SSE → `AgentRuntime` / `AgentEvent
 
 ## Public surface
 
-- `LlmConfig` — `ApiBase` + `ApiKey` + `ModelId` + `ApiStyle` (typed; no bare config strings)
+- `LlmConfig` — OpenAI adapter configuration: `ApiBase` + `ApiKey` + `ModelId` + `ApiStyle` (typed; no bare config strings)
 - `ApiBase` / `ApiKey` / `ModelId` — `try_new` rejects empty; `ApiBase` strips trailing `/`; `ApiKey` Debug redacted
 - `ApiStyle` — `responses` \| `completions`
 - `HistoryProjector` (strategy **port** only) + default `PassThrough`
-- `OpenAiCompatRuntime` — mechanism object (codec + HTTP + SSE + provider/tool loop); `with_tools(Arc<ToolRegistry>)` binds executable mechanisms, while `request.prefix.tools` freezes the enabled catalog
-- Private `ProviderConversation` and byte-framed `SseReader` assemble complete responses before yielding a durable commit batch
+- `LlmRuntime` — one shared Agent/Oneshot mechanism, injecting `Arc<dyn ProviderProtocol>`; `with_tools(Arc<ToolRegistry>)` binds executable mechanisms, while `request.prefix.tools` freezes the enabled catalog
+- `OpenAiProtocol` and `GeminiProtocol` own wire policy; `ProviderResponse` owns one response and seals normalized arguments with original replay material. `ProviderConversation` owns the only tool loop.
+- `HttpConnection` owns explicit auth headers; Gemini `ResponseMode` selects both buffered and streaming endpoints without fallback. `SseFramer` owns byte framing only.
 - `AgentRun` owns the stream and per-generation `ToolExecutionScope`; normal finish joins, cancel/error closes and joins
 - Responses continuation is persisted faithfully with provider/protocol/model scope. Matching Responses scope replays the opaque payload; any other provider/protocol/model encodes the portable visible rows. Persistence never drops continuation.
 - Matching-scope replay applies projected Assistant text to the corresponding visible message while preserving opaque items and tool correlation. Projection must retain one Assistant row per nonempty provider message, in original order; structural mismatches are errors.
 
 ## Rules
 
-- `OneshotModel::generate` makes one explicit multimodal request with caller instructions and cancellation. It bypasses `ProviderConversation`, history projection, tail state and tool execution. `OneshotText` is its bare text convenience adapter. Agent turns and standalone requests share the same `open_response` HTTP/image preparation and `SseReader`; never duplicate the wire stack.
+- `OneshotModel::generate` makes one explicit multimodal request with caller instructions and cancellation. It bypasses `ProviderConversation`, history projection, tail state and tool execution. `OneshotText` is its bare text convenience adapter. Agent turns and standalone requests share the same `open_response` HTTP/image preparation and protocol response owner; never duplicate the wire stack.
 - Tool responses complete only a provider round. Only the final response emits `Finished`; malformed/incomplete streams never execute accumulated calls
 - Each batch/result yield is a pull commit barrier. No background producer may execute the next tool before the consumer advances
 - Completions must consume trailing usage and group multiple tool calls in one assistant message; Responses must retain opaque reasoning items
@@ -38,3 +39,7 @@ LLM **provider adapters** for **phi**: HTTP/SSE → `AgentRuntime` / `AgentEvent
 - Owning “correct” context policy (ChatTextOnly etc. belongs in product)
 - TUI
 - `da-*` imports
+
+- Shared runtime code must not inspect dialects or continuation JSON. Protocol response sealing receives only a pure argument normalizer, never tool execution rights.
+- Tool image material is request-local and indexed by history position; provider ToolCallIds may repeat between responses. Only adapters choose its wire placement. Never insert tool images into logical history as a new user turn.
+- Error categories survive through `AgentRun` RunFailure reporting; configuration/protocol/history/cancellation failures are terminal. The host alone applies retry policy.

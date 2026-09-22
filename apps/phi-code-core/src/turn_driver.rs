@@ -9,7 +9,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use phi_ext_llm::{ApiBase, ApiStyle, HistoryProjector, LlmConfig, ModelId, OpenAiCompatRuntime};
+use phi_ext_llm::{
+    ApiBase, ApiStyle, HistoryProjector, LlmConfig, LlmRuntime, ModelId, OpenAiProtocol,
+};
 
 use crate::session::SessionHost;
 use crate::{KernelEvent, TurnItem, Usage};
@@ -171,7 +173,10 @@ impl TurnDriver {
         let api_style = Some(cfg.api_style);
         let api_base = cfg.api_base.clone();
         // Product strategy: lean chat context (not owned by phi-ext-llm).
-        let agent = Arc::new(OpenAiCompatRuntime::new(cfg).with_projector(Arc::new(ChatTextOnly)));
+        let agent = Arc::new(
+            LlmRuntime::new(Arc::new(OpenAiProtocol::new(cfg)))
+                .with_projector(Arc::new(ChatTextOnly)),
+        );
         Self {
             host: Some(SessionHost::new(agent)),
             config_error: None,

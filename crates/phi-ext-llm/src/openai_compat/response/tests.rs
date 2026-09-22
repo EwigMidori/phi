@@ -1,12 +1,19 @@
 //! OpenAI-compatible protocol fixtures, verified against function-calling docs
 //! 2026-09-11. Assertions exercise continuation and execution, not serde derives.
 use super::*;
+use crate::{HistoryProjector, LlmRuntime, OpenAiProtocol};
 use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
-use phi_ext_tools::{ToolExecutor, ToolRegistry};
+use futures::stream;
+use phi_ext_tools::{ToolExecution, ToolExecutor, ToolRegistry};
 use phi_kernel::{
     AgentPorts, FixedAgentPrefix, FixedToolCallSeal, GenerationJob, InMemoryTranscript, JobId,
     SessionDirectory, ToolCallSealPolicy, ToolResultStatus, Transcript,
 };
+use phi_kernel::{
+    AgentRuntime, MessageContent, OneshotModel, OneshotRequest, OneshotText, TurnRequest,
+};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, atomic::AtomicUsize};
 
 fn sse(values: Vec<Value>, done: bool) -> String {
@@ -258,14 +265,16 @@ impl Server {
             }),
         )
     }
-    fn runtime(&self, style: ApiStyle, registry: Arc<ToolRegistry>) -> OpenAiCompatRuntime {
-        OpenAiCompatRuntime::new(LlmConfig {
-            api_base: super::super::super::ApiBase::try_new(&self.base).unwrap(),
-            api_key: super::super::super::ApiKey::try_new("test").unwrap(),
-            model: super::super::super::ModelId::try_new("test-model").unwrap(),
+    fn protocol(&self, style: ApiStyle) -> OpenAiProtocol {
+        OpenAiProtocol::new(LlmConfig {
+            api_base: crate::ApiBase::try_new(&self.base).unwrap(),
+            api_key: crate::ApiKey::try_new("test").unwrap(),
+            model: crate::ModelId::try_new("test-model").unwrap(),
             api_style: style,
         })
-        .with_tools(registry)
+    }
+    fn runtime(&self, style: ApiStyle, registry: Arc<ToolRegistry>) -> LlmRuntime {
+        LlmRuntime::new(Arc::new(self.protocol(style))).with_tools(registry)
     }
 }
 
@@ -447,7 +456,7 @@ async fn byte_fragmentation_and_duplicate_ids_are_validated_before_execution() {
         );
         let mut completed = false;
         let mut error = false;
-        while let Some(event) = match reader.next().await {
+        while let Some(event) = match reader.next_event().await {
             Ok(event) => event,
             Err(_) => {
                 error = true;
@@ -545,15 +554,15 @@ async fn usage_drain_ignores_output_validation_and_bounds_the_unwanted_tail() {
         ReasoningDialect::Generic,
     );
     while !matches!(
-        reader.next().await.unwrap(),
+        reader.next_event().await.unwrap(),
         Some(AgentEvent::TextDelta { .. })
     ) {}
     let accepted = reader.decoder.text.clone();
     reader.begin_usage_drain();
     assert!(
-        matches!(reader.next().await.unwrap(), Some(AgentEvent::Usage { usage }) if usage.total_tokens == Some(16))
+        matches!(reader.next_event().await.unwrap(), Some(AgentEvent::Usage { usage }) if usage.total_tokens == Some(16))
     );
-    assert!(reader.next().await.unwrap().is_none());
+    assert!(reader.next_event().await.unwrap().is_none());
     assert_eq!(reader.decoder.text, accepted);
 
     let tail = sse(
@@ -571,7 +580,7 @@ async fn usage_drain_ignores_output_validation_and_bounds_the_unwanted_tail() {
         ReasoningDialect::Generic,
     );
     reader.begin_usage_drain();
-    assert!(reader.next().await.unwrap().is_none());
+    assert!(reader.next_event().await.unwrap().is_none());
     assert!(reader.decoder.text.is_empty());
 
     // Capture a report within the budget even when a large trailing transport
@@ -592,9 +601,9 @@ async fn usage_drain_ignores_output_validation_and_bounds_the_unwanted_tail() {
     );
     reader.begin_usage_drain();
     assert!(
-        matches!(reader.next().await.unwrap(), Some(AgentEvent::Usage { usage }) if usage.total_tokens == Some(16))
+        matches!(reader.next_event().await.unwrap(), Some(AgentEvent::Usage { usage }) if usage.total_tokens == Some(16))
     );
-    assert!(reader.next().await.unwrap().is_none());
+    assert!(reader.next_event().await.unwrap().is_none());
 }
 
 #[test]
@@ -803,7 +812,7 @@ async fn deepseek_thinking_controls_requests_and_tool_continuation() {
                 .unwrap();
             let registry = Arc::new(registry);
             let runtime = server
-                .runtime(style, registry.clone())
+                .protocol(style)
                 .with_reasoning(crate::ReasoningConfig {
                     dialect: ReasoningDialect::DeepSeek,
                     mode: if !enabled {
@@ -814,6 +823,7 @@ async fn deepseek_thinking_controls_requests_and_tool_continuation() {
                         crate::ReasoningMode::Enabled
                     },
                 })
+                .map(|protocol| LlmRuntime::new(Arc::new(protocol)).with_tools(registry.clone()))
                 .unwrap();
             let mut run = runtime
                 .run(TurnRequest {
@@ -924,11 +934,12 @@ async fn completion_reasoning_state_survives_tools_and_persisted_history() {
             .unwrap();
         let registry = Arc::new(registry);
         let runtime = server
-            .runtime(ApiStyle::Completions, registry.clone())
+            .protocol(ApiStyle::Completions)
             .with_reasoning(ReasoningConfig {
                 dialect,
                 mode: ReasoningMode::ProviderDefault,
             })
+            .map(|protocol| LlmRuntime::new(Arc::new(protocol)).with_tools(registry.clone()))
             .unwrap();
         let request = |history| TurnRequest {
             session_id: SessionId::generate(),
@@ -985,12 +996,13 @@ async fn completion_reasoning_state_survives_tools_and_persisted_history() {
                 content: MessageContent::text("continue"),
             },
         ];
-        let changed = runtime
-            .clone()
+        let changed = server
+            .protocol(ApiStyle::Completions)
             .with_reasoning(ReasoningConfig {
                 dialect,
                 mode: ReasoningMode::Effort(ReasoningEffort::High),
             })
+            .map(|protocol| LlmRuntime::new(Arc::new(protocol)).with_tools(registry.clone()))
             .unwrap();
         let mut run = changed.run(request(history)).await.unwrap();
         while let Some(event) = run.next().await {
@@ -1022,7 +1034,10 @@ async fn completion_reasoning_state_survives_tools_and_persisted_history() {
         }
         assert!(requests[0].get("reasoning_effort").is_none());
         assert!(requests[0].get("thinking").is_none());
-        let foreign = runtime.with_reasoning(ReasoningConfig::default()).unwrap();
+        let foreign = server
+            .protocol(ApiStyle::Completions)
+            .with_reasoning(ReasoningConfig::default())
+            .unwrap();
         let mut projected = Vec::new();
         foreign
             .codec
@@ -1187,11 +1202,12 @@ async fn signed_code_calls_execute_canonical_aliases_and_replay_original_argumen
         .unwrap();
     let registry = Arc::new(registry);
     let runtime = server
-        .runtime(ApiStyle::Completions, registry.clone())
+        .protocol(ApiStyle::Completions)
         .with_reasoning(crate::ReasoningConfig {
             dialect: ReasoningDialect::Gemini,
             mode: crate::ReasoningMode::Effort(crate::ReasoningEffort::Low),
         })
+        .map(|protocol| LlmRuntime::new(Arc::new(protocol)).with_tools(registry.clone()))
         .unwrap();
     let mut run = runtime
         .run(TurnRequest {
@@ -1241,14 +1257,21 @@ async fn signed_code_calls_execute_canonical_aliases_and_replay_original_argumen
     let bytes = serde_json::to_vec(&response).unwrap();
     let mut reopened: ModelResponse = serde_json::from_slice(&bytes).unwrap();
     let mut replay = Vec::new();
-    runtime
+    let protocol = server
+        .protocol(ApiStyle::Completions)
+        .with_reasoning(crate::ReasoningConfig {
+            dialect: ReasoningDialect::Gemini,
+            mode: crate::ReasoningMode::Effort(crate::ReasoningEffort::Low),
+        })
+        .unwrap();
+    protocol
         .codec
         .encode_history(
             &TurnItem::ModelResponse {
                 response: reopened.clone(),
             },
             &PreparedImages::new(),
-            &runtime.continuation_scope(),
+            &protocol.continuation_scope(),
             &mut replay,
         )
         .unwrap();
@@ -1262,12 +1285,12 @@ async fn signed_code_calls_execute_canonical_aliases_and_replay_original_argumen
         }
     }
     assert!(
-        runtime
+        protocol
             .codec
             .encode_history(
                 &TurnItem::ModelResponse { response: reopened },
                 &PreparedImages::new(),
-                &runtime.continuation_scope(),
+                &protocol.continuation_scope(),
                 &mut Vec::new()
             )
             .is_err()

@@ -1,0 +1,13 @@
+{
+  "candidates": [{
+    "index": 0,
+    "content": {"role": "model", "parts": [
+      {"text": "先计算"},
+      {"functionCall": {"name": "compute", "args": {"legacyValue": 3}}, "thoughtSignature": "Zmlyc3Qtc2lnbmF0dXJl"},
+      {"functionCall": {"id": "provider-second", "name": "compute", "args": {"value": 7}}},
+      {"text": "", "thoughtSignature": "bGF0ZS1zaWduYXR1cmU="}
+    ]},
+    "finishReason": "STOP"
+  }],
+  "usageMetadata": {"promptTokenCount": 11, "cachedContentTokenCount": 2, "candidatesTokenCount": 4, "thoughtsTokenCount": 3, "totalTokenCount": 18}
+}
