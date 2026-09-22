@@ -22,13 +22,37 @@ pub struct ExecutionLimits {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CodeInput {
     code: String,
     timeout_ms: Option<u64>,
 }
 impl CodeInput {
-    fn parse(input: Value, limits: &ExecutionLimits) -> Result<(Self, Duration), ToolExecution> {
+    fn parse(
+        mut input: Value,
+        limits: &ExecutionLimits,
+    ) -> Result<(Self, Duration), ToolExecution> {
+        if let Some(arguments) = input.as_object_mut() {
+            if !arguments.contains_key("code") {
+                // Some model harnesses insist on their own code parameter name.
+                let mut candidates = arguments.iter().filter_map(|(name, value)| {
+                    if matches!(name.as_str(), "timeout_ms" | "inputs") {
+                        None
+                    } else {
+                        value.as_str()
+                    }
+                });
+                if let Some(code) = candidates.next() {
+                    if candidates.next().is_some() {
+                        return Err(ToolExecution::error(
+                            "InvalidArguments",
+                            "Multiple string arguments could supply code; provide code explicitly",
+                        ));
+                    }
+                    let code = code.to_owned();
+                    arguments.insert("code".into(), Value::String(code));
+                }
+            }
+        }
         let input: Self = serde_json::from_value(input)
             .map_err(|e| ToolExecution::error("InvalidArguments", e.to_string()))?;
         if input.code.is_empty() || input.code.len() > limits.code_bytes {
@@ -60,7 +84,7 @@ impl CodeSpec {
             name: ToolName::from(name),
             description: description.into(),
             parameters: Some(
-                json!({"type":"object","properties":{"code":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1,"description":"Optional execution timeout in milliseconds"}},"required":["code"],"additionalProperties":false}),
+                json!({"type":"object","properties":{"code":{"type":"string","description":"Source code to execute. If omitted, a single string-valued unknown argument is accepted as code."},"timeout_ms":{"type":"integer","minimum":1,"description":"Optional execution timeout in milliseconds"}},"additionalProperties":true}),
             ),
         }
     }
