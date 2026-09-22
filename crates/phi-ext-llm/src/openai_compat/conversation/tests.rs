@@ -443,6 +443,7 @@ async fn byte_fragmentation_and_duplicate_ids_are_validated_before_execution() {
             TurnCancel::new(),
             style,
             "scope".into(),
+            ReasoningDialect::Generic,
         );
         let mut completed = false;
         let mut error = false;
@@ -541,6 +542,7 @@ async fn usage_drain_ignores_output_validation_and_bounds_the_unwanted_tail() {
         TurnCancel::new(),
         ApiStyle::Responses,
         "test".into(),
+        ReasoningDialect::Generic,
     );
     while !matches!(
         reader.next().await.unwrap(),
@@ -566,6 +568,7 @@ async fn usage_drain_ignores_output_validation_and_bounds_the_unwanted_tail() {
         TurnCancel::new(),
         ApiStyle::Completions,
         "test".into(),
+        ReasoningDialect::Generic,
     );
     reader.begin_usage_drain();
     assert!(reader.next().await.unwrap().is_none());
@@ -585,6 +588,7 @@ async fn usage_drain_ignores_output_validation_and_bounds_the_unwanted_tail() {
         TurnCancel::new(),
         ApiStyle::Completions,
         "test".into(),
+        ReasoningDialect::Generic,
     );
     reader.begin_usage_drain();
     assert!(
@@ -595,14 +599,22 @@ async fn usage_drain_ignores_output_validation_and_bounds_the_unwanted_tail() {
 
 #[test]
 fn malformed_arguments_remain_model_correctable_and_incomplete_responses_fail() {
-    let mut decoder = ResponseDecoder::new(ApiStyle::Completions, "scope".into());
+    let mut decoder = ResponseDecoder::new(
+        ApiStyle::Completions,
+        "scope".into(),
+        ReasoningDialect::Generic,
+    );
     let mut events = VecDeque::new();
     decoder.consume(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"broken","function":{"name":"compute","arguments":"{broken"}}]},"finish_reason":"tool_calls"}]}),None,&mut events).unwrap();
     let response = decoder.complete().unwrap();
     assert!(
         matches!(&response.rows[0].item,TurnItem::ToolCall{input,..} if input.parse().is_err()&&input.as_str()=="{broken")
     );
-    let mut responses = ResponseDecoder::new(ApiStyle::Responses, "scope".into());
+    let mut responses = ResponseDecoder::new(
+        ApiStyle::Responses,
+        "scope".into(),
+        ReasoningDialect::Generic,
+    );
     assert!(
         responses
             .consume(json!({"type":"response.incomplete"}), None, &mut events)
@@ -625,7 +637,11 @@ fn continuation_replay_projects_visible_text_without_changing_opaque_items() {
             {"type":"output_text","text":"after tool","annotations":[]}
         ]}
     ]);
-    let mut decoder = ResponseDecoder::new(ApiStyle::Responses, "scope".into());
+    let mut decoder = ResponseDecoder::new(
+        ApiStyle::Responses,
+        "scope".into(),
+        ReasoningDialect::Generic,
+    );
     decoder
         .consume(
             json!({"type":"response.completed","response":{"output":original}}),
@@ -788,7 +804,17 @@ async fn deepseek_thinking_controls_requests_and_tool_continuation() {
             let registry = Arc::new(registry);
             let runtime = server
                 .runtime(style, registry.clone())
-                .with_deepseek_thinking(enabled);
+                .with_reasoning(crate::ReasoningConfig {
+                    dialect: ReasoningDialect::DeepSeek,
+                    mode: if !enabled {
+                        crate::ReasoningMode::Disabled
+                    } else if style == ApiStyle::Responses {
+                        crate::ReasoningMode::Effort(crate::ReasoningEffort::High)
+                    } else {
+                        crate::ReasoningMode::Enabled
+                    },
+                })
+                .unwrap();
             let mut run = runtime
                 .run(TurnRequest {
                     session_id: SessionId::generate(),
@@ -845,4 +871,405 @@ async fn deepseek_thinking_controls_requests_and_tool_continuation() {
             }
         }
     }
+}
+
+// Google OpenAI-compat thought signatures and OpenRouter reasoning_details,
+// official protocol fixtures reviewed 2026-09-22. Exercise complete tool loops,
+// persisted opaque state, model edits, and cross-dialect isolation.
+#[tokio::test]
+async fn completion_reasoning_state_survives_tools_and_persisted_history() {
+    use crate::{ReasoningConfig, ReasoningEffort, ReasoningMode};
+    for dialect in [
+        ReasoningDialect::Gemini,
+        ReasoningDialect::OpenRouter,
+        ReasoningDialect::DeepSeek,
+    ] {
+        let extra = match dialect {
+            ReasoningDialect::Gemini => {
+                json!({"extra_content":{"google":{"thought_signature":"signed-tool-state"}}})
+            }
+            ReasoningDialect::OpenRouter => {
+                json!({"reasoning":"check arithmetic","reasoning_details":[{"type":"reasoning.encrypted","data":"opaque-","format":"anthropic-claude-v1","index":0}]})
+            }
+            _ => json!({"reasoning_content":"check arithmetic"}),
+        };
+        let mut first_delta = json!({"content":"before tool","tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"compute","arguments":"{ \"value\": 2 }"}}]});
+        if dialect == ReasoningDialect::Gemini {
+            first_delta["tool_calls"][0]["extra_content"] = extra["extra_content"].clone();
+            first_delta["tool_calls"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("index");
+        } else {
+            first_delta
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+        }
+        let mut frames = vec![json!({"choices":[{"delta":first_delta}]})];
+        if dialect == ReasoningDialect::OpenRouter {
+            frames.push(json!({"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","data":"state","format":"anthropic-claude-v1","index":0}]}}]}));
+        }
+        frames.push(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}));
+        let server = Server::start(vec![
+            sse(frames, true),
+            final_response(ApiStyle::Completions),
+            final_response(ApiStyle::Completions),
+        ])
+        .await;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(Compute(executions.clone())))
+            .unwrap();
+        let registry = Arc::new(registry);
+        let runtime = server
+            .runtime(ApiStyle::Completions, registry.clone())
+            .with_reasoning(ReasoningConfig {
+                dialect,
+                mode: ReasoningMode::ProviderDefault,
+            })
+            .unwrap();
+        let request = |history| TurnRequest {
+            session_id: SessionId::generate(),
+            job_id: JobId::generate(),
+            history,
+            prefix: AgentPrefix {
+                preamble: Vec::new(),
+                tools: registry.specs(),
+                skill_index: Default::default(),
+            },
+            cancel: TurnCancel::new(),
+            tail_state: None,
+            tool_call_seal: ToolCallSealPolicy::SealAlways,
+        };
+        let mut run = runtime
+            .run(request(vec![TurnItem::User {
+                content: MessageContent::text("calculate"),
+            }]))
+            .await
+            .unwrap();
+        let mut first = None;
+        while let Some(event) = run.next().await {
+            if let AgentEvent::ModelResponseCompleted { response } = event.unwrap()
+                && first.is_none()
+            {
+                first = Some(response);
+            }
+        }
+        run.close_and_join().await.unwrap();
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        // Persistence is exercised because opaque continuation has to survive
+        // reopening before a new generation can use the same signed history.
+        let bytes = serde_json::to_vec(&first.unwrap()).unwrap();
+        let mut reopened: ModelResponse = serde_json::from_slice(&bytes).unwrap();
+        for row in &mut reopened.rows {
+            if let TurnItem::Assistant { content } = &mut row.item {
+                *content = "edited visible text".into();
+            }
+        }
+        let history = vec![
+            TurnItem::User {
+                content: MessageContent::text("calculate"),
+            },
+            TurnItem::ModelResponse {
+                response: reopened.clone(),
+            },
+            TurnItem::ToolResult {
+                tool_call_id: ToolCallId::new("call"),
+                tool_name: ToolName::new("compute"),
+                output: json!(2),
+                status: ToolResultStatus::Ok,
+            },
+            TurnItem::User {
+                content: MessageContent::text("continue"),
+            },
+        ];
+        let changed = runtime
+            .clone()
+            .with_reasoning(ReasoningConfig {
+                dialect,
+                mode: ReasoningMode::Effort(ReasoningEffort::High),
+            })
+            .unwrap();
+        let mut run = changed.run(request(history)).await.unwrap();
+        while let Some(event) = run.next().await {
+            event.unwrap();
+        }
+        run.close_and_join().await.unwrap();
+        let requests = server.state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        for index in [1, 2] {
+            let assistant = requests[index]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v.get("tool_calls").is_some())
+                .unwrap();
+            match dialect {
+                ReasoningDialect::Gemini => assert_eq!(
+                    assistant["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+                    "signed-tool-state"
+                ),
+                ReasoningDialect::OpenRouter => {
+                    assert_eq!(assistant["reasoning_details"][0]["data"], "opaque-state");
+                }
+                _ => assert_eq!(assistant["reasoning_content"], "check arithmetic"),
+            }
+            if index == 2 {
+                assert_eq!(assistant["content"], "edited visible text");
+            }
+        }
+        assert!(requests[0].get("reasoning_effort").is_none());
+        assert!(requests[0].get("thinking").is_none());
+        let foreign = runtime.with_reasoning(ReasoningConfig::default()).unwrap();
+        let mut projected = Vec::new();
+        foreign
+            .codec
+            .encode_history(
+                &TurnItem::ModelResponse { response: reopened },
+                &PreparedImages::new(),
+                &foreign.continuation_scope(),
+                &mut projected,
+            )
+            .unwrap();
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert!(!encoded.contains("signed-tool-state"));
+        assert!(!encoded.contains("opaque-state"));
+        assert!(encoded.contains("edited visible text"));
+    }
+}
+
+#[test]
+fn existing_responses_continuation_scope_remains_readable() {
+    let mut codec = WireCodec::for_style(ApiStyle::Responses);
+    codec.reasoning.dialect = ReasoningDialect::OpenAi;
+    assert!(codec.accepts_continuation(
+        "openai-compatible/v1|https://api.openai.com/v1|responses|model",
+        "openai-compatible/v2/openai|https://api.openai.com/v1|responses|model"
+    ));
+    assert!(!codec.accepts_continuation(
+        "openai-compatible/v1|https://other.invalid|responses|model",
+        "openai-compatible/v2/openai|https://api.openai.com/v1|responses|model"
+    ));
+    assert!(!codec.accepts_continuation(
+        "openai-compatible/v2/deepseek|https://api.openai.com/v1|responses|model",
+        "openai-compatible/v2/openai|https://api.openai.com/v1|responses|model"
+    ));
+}
+
+#[test]
+fn optional_reasoning_indexes_and_late_signatures_preserve_protocol_state() {
+    let mut decoder = ResponseDecoder::new(
+        ApiStyle::Completions,
+        "scope".into(),
+        ReasoningDialect::OpenRouter,
+    );
+    let mut events = VecDeque::new();
+    for detail in [
+        json!({"type":"reasoning.text","id":"one","text":"work ","signature":null}),
+        json!({"type":"reasoning.text","id":"one","text":"carefully","signature":"signature"}),
+        json!({"type":"reasoning.encrypted","id":null,"data":"opaque"}),
+    ] {
+        decoder
+            .consume(
+                json!({"choices":[{"delta":{"reasoning_details":[detail]}}]}),
+                None,
+                &mut events,
+            )
+            .unwrap();
+    }
+    decoder
+        .consume(
+            json!({"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}),
+            None,
+            &mut events,
+        )
+        .unwrap();
+    let response = decoder.complete().unwrap();
+    assert!(response.rows.iter().any(
+        |row| matches!(&row.item,TurnItem::Reasoning { content } if content == "work carefully")
+    ));
+    let details = &response.continuation.unwrap().payload["reasoning_details"];
+    assert_eq!(details.as_array().unwrap().len(), 2);
+    assert_eq!(details[0]["signature"], "signature");
+    assert_eq!(details[0]["text"], "work carefully");
+    assert_eq!(details[1]["data"], "opaque");
+
+    let mut decoder = ResponseDecoder::new(
+        ApiStyle::Completions,
+        "scope".into(),
+        ReasoningDialect::Gemini,
+    );
+    decoder
+        .consume(
+            json!({"choices":[{"delta":{"content":"answer"}}]}),
+            None,
+            &mut events,
+        )
+        .unwrap();
+    decoder.consume(json!({"choices":[{"delta":{"content":"","extra_content":{"google":{"thought_signature":"final-state"}}},"finish_reason":"stop"}]}),None,&mut events).unwrap();
+    let response = decoder.complete().unwrap();
+    let mut codec = WireCodec::for_style(ApiStyle::Completions);
+    codec.reasoning.dialect = ReasoningDialect::Gemini;
+    let mut replay = Vec::new();
+    codec
+        .encode_history(
+            &TurnItem::ModelResponse {
+                response: response.clone(),
+            },
+            &PreparedImages::new(),
+            "scope",
+            &mut replay,
+        )
+        .unwrap();
+    assert_eq!(
+        replay[0]["extra_content"]["google"]["thought_signature"],
+        "final-state"
+    );
+    let mut damaged = response;
+    damaged.continuation.as_mut().unwrap().payload["extra_content"]["google"]["thought_signature"] =
+        json!(123);
+    assert!(
+        codec
+            .encode_history(
+                &TurnItem::ModelResponse { response: damaged },
+                &PreparedImages::new(),
+                "scope",
+                &mut Vec::new()
+            )
+            .is_err()
+    );
+}
+
+struct NormalizingCode(Arc<Mutex<Vec<Value>>>);
+#[async_trait]
+impl ToolExecutor for NormalizingCode {
+    fn spec(&self) -> phi_kernel::ToolSpec {
+        phi_kernel::ToolSpec {
+            name: ToolName::new("python"),
+            description: "run code".into(),
+            parameters: Some(
+                json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}),
+            ),
+        }
+    }
+    fn normalize_input(&self, input: Value) -> Result<Value, ToolExecution> {
+        phi_ext_tools::CodeInput::normalize(input)
+    }
+    async fn execute(&self, input: Value, _: TurnCancel) -> ToolExecution {
+        self.0.lock().unwrap().push(input);
+        ToolExecution {
+            status: ToolResultStatus::Ok,
+            output: json!(2),
+        }
+    }
+}
+
+#[tokio::test]
+async fn signed_code_calls_execute_canonical_aliases_and_replay_original_arguments() {
+    let original_arguments = "{ \"source\": \"print(2)\" }";
+    let server = Server::start(vec![
+        sse(
+            vec![json!({"choices":[{"delta":{"tool_calls":[{
+        "index":0,"id":"code-call","function":{"name":"python","arguments":original_arguments},
+        "extra_content":{"google":{"thought_signature":"signed-original-alias"}}
+    }]},"finish_reason":"tool_calls"}]})],
+            true,
+        ),
+        final_response(ApiStyle::Completions),
+    ])
+    .await;
+    let executions = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(NormalizingCode(executions.clone())))
+        .unwrap();
+    let registry = Arc::new(registry);
+    let runtime = server
+        .runtime(ApiStyle::Completions, registry.clone())
+        .with_reasoning(crate::ReasoningConfig {
+            dialect: ReasoningDialect::Gemini,
+            mode: crate::ReasoningMode::Effort(crate::ReasoningEffort::Low),
+        })
+        .unwrap();
+    let mut run = runtime
+        .run(TurnRequest {
+            session_id: SessionId::generate(),
+            job_id: JobId::generate(),
+            history: vec![TurnItem::User {
+                content: MessageContent::text("calculate"),
+            }],
+            prefix: AgentPrefix {
+                preamble: Vec::new(),
+                tools: registry.specs(),
+                skill_index: Default::default(),
+            },
+            cancel: TurnCancel::new(),
+            tail_state: None,
+            tool_call_seal: ToolCallSealPolicy::SealAlways,
+        })
+        .await
+        .unwrap();
+    let mut saved = None;
+    while let Some(event) = run.next().await {
+        if let AgentEvent::ModelResponseCompleted { response } = event.unwrap()
+            && response.continuation.is_some()
+        {
+            saved = Some(response);
+        }
+    }
+    run.close_and_join().await.unwrap();
+    assert_eq!(
+        *executions.lock().unwrap(),
+        vec![json!({"code":"print(2)"})]
+    );
+    let response = saved.unwrap();
+    assert!(response.rows.iter().any(|row| matches!(&row.item,TurnItem::ToolCall { input,.. } if input.as_str() == "{\"code\":\"print(2)\"}")));
+    let requests = server.state.requests.lock().unwrap();
+    let signed = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message.get("tool_calls").is_some())
+        .unwrap();
+    assert_eq!(
+        signed["tool_calls"][0]["function"]["arguments"],
+        original_arguments
+    );
+    assert!(signed["tool_calls"][0].get("canonical_arguments").is_none());
+    let bytes = serde_json::to_vec(&response).unwrap();
+    let mut reopened: ModelResponse = serde_json::from_slice(&bytes).unwrap();
+    let mut replay = Vec::new();
+    runtime
+        .codec
+        .encode_history(
+            &TurnItem::ModelResponse {
+                response: reopened.clone(),
+            },
+            &PreparedImages::new(),
+            &runtime.continuation_scope(),
+            &mut replay,
+        )
+        .unwrap();
+    assert_eq!(
+        replay[0]["tool_calls"][0]["function"]["arguments"],
+        original_arguments
+    );
+    for row in &mut reopened.rows {
+        if let TurnItem::ToolCall { input, .. } = &mut row.item {
+            *input = ToolArguments::new("{\"code\":\"print(3)\"}");
+        }
+    }
+    assert!(
+        runtime
+            .codec
+            .encode_history(
+                &TurnItem::ModelResponse { response: reopened },
+                &PreparedImages::new(),
+                &runtime.continuation_scope(),
+                &mut Vec::new()
+            )
+            .is_err()
+    );
 }

@@ -247,6 +247,25 @@ impl ProviderConversation {
                         && let Ok(normalized) =
                             self.runtime.tools.normalize_arguments(tool_name, input)
                     {
+                        if self.runtime.codec.reasoning.dialect == ReasoningDialect::Gemini
+                            && let Some(continuation) = &mut response.continuation
+                            && let Some(calls) = continuation
+                                .payload
+                                .get_mut("tool_calls")
+                                .and_then(Value::as_array_mut)
+                        {
+                            let original = calls
+                                .iter_mut()
+                                .find(|call| {
+                                    call.get("id").and_then(Value::as_str)
+                                        == Some(tool_call_id.as_str())
+                                })
+                                .ok_or("signed tool call is missing its original request")?;
+                            // The tool owns normalization (including legacy argument
+                            // aliases). Record its accepted canonical input alongside
+                            // the immutable signed provider arguments before commit.
+                            original["canonical_arguments"] = json!(normalized.as_str());
+                        }
                         *input = normalized;
                     }
                     self.tools.push_back(PendingCall {
@@ -289,11 +308,12 @@ impl SseReader {
         cancel: TurnCancel,
         style: ApiStyle,
         scope: String,
+        dialect: ReasoningDialect,
     ) -> Self
     where
         S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     {
-        let decoder = ResponseDecoder::new(style, scope);
+        let decoder = ResponseDecoder::new(style, scope, dialect);
         let mut queued = VecDeque::new();
         queued.push_back(AgentEvent::ResponseStarted {
             response_id: decoder.id.clone(),
@@ -452,27 +472,118 @@ struct CallFragments {
     id: String,
     name: String,
     arguments: String,
+    extra_content: Option<Value>,
 }
 struct ResponseDecoder {
     style: ApiStyle,
+    dialect: ReasoningDialect,
     scope: String,
     id: ModelResponseId,
     assistant_id: MessageId,
     text: String,
     reasoning: String,
+    reasoning_details: Vec<Value>,
+    extra_content: Option<Value>,
     items: BTreeMap<usize, Value>,
     calls: BTreeMap<usize, CallFragments>,
     finish_reason: Option<String>,
 }
 impl ResponseDecoder {
-    fn new(style: ApiStyle, scope: String) -> Self {
+    fn capture_google_signature(
+        target: &mut Option<Value>,
+        incoming: Option<&Value>,
+    ) -> Result<(), String> {
+        let Some(incoming) = incoming.filter(|v| !v.is_null()) else {
+            return Ok(());
+        };
+        let Some(signature) = incoming.pointer("/google/thought_signature") else {
+            return Ok(());
+        };
+        let signature = signature
+            .as_str()
+            .ok_or("invalid Google thought signature")?;
+        if let Some(saved) = target {
+            let current = saved
+                .pointer("/google/thought_signature")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if current != signature {
+                return Err("Google thought signature changed within one response part".into());
+            }
+        } else {
+            *target = Some(json!({"google":{"thought_signature":signature}}));
+        }
+        Ok(())
+    }
+
+    fn append_reasoning_details(
+        &mut self,
+        details: &Value,
+        display: bool,
+        out: &mut VecDeque<AgentEvent>,
+    ) -> Result<(), String> {
+        let details = details
+            .as_array()
+            .ok_or("invalid OpenRouter reasoning details")?;
+        for detail in details {
+            let incoming = detail.as_object().ok_or("invalid reasoning detail")?;
+            let index = incoming.get("index").filter(|v| !v.is_null());
+            if index.is_some_and(|v| v.as_u64().is_none()) {
+                return Err("invalid reasoning detail index".into());
+            }
+            let id = incoming.get("id").filter(|v| v.is_string());
+            let position = self
+                .reasoning_details
+                .iter()
+                .position(|saved| {
+                    index.is_some_and(|index| saved.get("index") == Some(index))
+                        || (index.is_none() && id.is_some_and(|id| saved.get("id") == Some(id)))
+                })
+                .unwrap_or_else(|| {
+                    self.reasoning_details.push(json!({}));
+                    self.reasoning_details.len() - 1
+                });
+            let saved = &mut self.reasoning_details[position];
+            let saved = saved.as_object_mut().expect("created as object");
+            for (key, value) in incoming {
+                if value.is_null() {
+                    saved.entry(key.clone()).or_insert(Value::Null);
+                    continue;
+                }
+                if matches!(key.as_str(), "text" | "summary" | "data" | "signature") {
+                    let text = value.as_str().ok_or("invalid reasoning detail fragment")?;
+                    if display && matches!(key.as_str(), "text" | "summary") {
+                        self.reasoning.push_str(text);
+                        out.push_back(AgentEvent::ReasoningDelta {
+                            text: text.to_owned(),
+                        });
+                    }
+                    let previous = saved.get(key).and_then(Value::as_str).unwrap_or_default();
+                    saved.insert(key.clone(), json!(format!("{previous}{text}")));
+                } else if let Some(previous) = saved.get(key).filter(|v| !v.is_null()) {
+                    if previous != value {
+                        return Err("reasoning detail identity changed mid-stream".into());
+                    }
+                } else {
+                    saved.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn new(style: ApiStyle, scope: String, dialect: ReasoningDialect) -> Self {
         Self {
             style,
+            dialect,
             scope,
             id: ModelResponseId::generate(),
             assistant_id: MessageId::generate(),
             text: String::new(),
             reasoning: String::new(),
+            reasoning_details: Vec::new(),
+            extra_content: None,
             items: BTreeMap::new(),
             calls: BTreeMap::new(),
             finish_reason: None,
@@ -507,11 +618,36 @@ impl ResponseDecoder {
                                 text: text.to_owned(),
                             });
                         }
-                        if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
+                        if let Some(text) = delta
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .or_else(|| {
+                                (self.dialect == ReasoningDialect::OpenRouter)
+                                    .then(|| delta.get("reasoning").and_then(Value::as_str))
+                                    .flatten()
+                            })
+                        {
                             self.reasoning.push_str(text);
                             out.push_back(AgentEvent::ReasoningDelta {
                                 text: text.to_owned(),
                             });
+                        }
+                        if self.dialect == ReasoningDialect::OpenRouter
+                            && let Some(details) =
+                                delta.get("reasoning_details").filter(|v| !v.is_null())
+                        {
+                            let display = delta.get("reasoning").and_then(Value::as_str).is_none()
+                                && delta
+                                    .get("reasoning_content")
+                                    .and_then(Value::as_str)
+                                    .is_none();
+                            self.append_reasoning_details(details, display, out)?;
+                        }
+                        if self.dialect == ReasoningDialect::Gemini {
+                            Self::capture_google_signature(
+                                &mut self.extra_content,
+                                delta.get("extra_content"),
+                            )?;
                         }
                         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                             for call in calls {
@@ -519,10 +655,42 @@ impl ResponseDecoder {
                                     .get("index")
                                     .and_then(Value::as_u64)
                                     .and_then(|index| usize::try_from(index).ok())
+                                    .or_else(|| {
+                                        // Gemini can return complete named calls without
+                                        // the OpenAI streaming index. An explicit call id
+                                        // still gives an unambiguous correlation identity.
+                                        if self.dialect != ReasoningDialect::Gemini {
+                                            return None;
+                                        }
+                                        let id = call.get("id").and_then(Value::as_str)?;
+                                        if id.is_empty() {
+                                            return None;
+                                        }
+                                        Some(
+                                            self.calls
+                                                .iter()
+                                                .find(|(_, fragment)| fragment.id == id)
+                                                .map(|(index, _)| *index)
+                                                .unwrap_or_else(|| {
+                                                    self.calls
+                                                        .last_key_value()
+                                                        .map_or(0, |(index, _)| index + 1)
+                                                }),
+                                        )
+                                    })
                                     .ok_or("invalid tool delta index")?;
                                 let fragment = self.calls.entry(index).or_default();
+                                if self.dialect == ReasoningDialect::Gemini {
+                                    Self::capture_google_signature(
+                                        &mut fragment.extra_content,
+                                        call.get("extra_content"),
+                                    )?;
+                                }
                                 if let Some(id) = call.get("id").and_then(Value::as_str) {
-                                    fragment.id.push_str(id);
+                                    if self.dialect != ReasoningDialect::Gemini || fragment.id != id
+                                    {
+                                        fragment.id.push_str(id);
+                                    }
                                 }
                                 if let Some(name) =
                                     call.pointer("/function/name").and_then(Value::as_str)
@@ -683,7 +851,11 @@ impl ResponseDecoder {
                     Some("reasoning") => {
                         opaque = true;
                         let mut text = String::new();
-                        if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                        if let Some(summary) = item
+                            .get("summary")
+                            .or_else(|| item.get("content"))
+                            .and_then(Value::as_array)
+                        {
                             for part in summary {
                                 if let Some(value) = part.get("text").and_then(Value::as_str) {
                                     text.push_str(value);
@@ -747,6 +919,39 @@ impl ResponseDecoder {
                     &call.name,
                     &call.arguments,
                 )?;
+            }
+            let mut payload = json!({});
+            if self.dialect == ReasoningDialect::OpenRouter {
+                if !self.reasoning_details.is_empty() {
+                    if self
+                        .reasoning_details
+                        .iter()
+                        .any(|detail| detail.get("type").and_then(Value::as_str).is_none())
+                    {
+                        return Err("reasoning detail type missing".into());
+                    }
+                    payload["reasoning_details"] = json!(self.reasoning_details);
+                } else if !self.reasoning.is_empty() {
+                    payload["reasoning"] = json!(self.reasoning);
+                }
+            }
+            if self.dialect == ReasoningDialect::Gemini {
+                if let Some(extra) = &self.extra_content {
+                    payload["extra_content"] = extra.clone();
+                }
+                if self.calls.values().any(|call| call.extra_content.is_some()) {
+                    payload["tool_calls"] = json!(self.calls.values().map(|call| {
+                        let mut value = json!({"id":call.id,"function":{"name":call.name,"arguments":call.arguments}});
+                        if let Some(extra) = &call.extra_content { value["extra_content"] = extra.clone(); }
+                        value
+                    }).collect::<Vec<_>>());
+                }
+            }
+            if payload.as_object().is_some_and(|v| !v.is_empty()) {
+                continuation = Some(ProviderContinuation {
+                    scope: self.scope.clone(),
+                    payload,
+                });
             }
         }
         if rows.is_empty() && continuation.is_none() {

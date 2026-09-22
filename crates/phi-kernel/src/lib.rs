@@ -37,6 +37,7 @@ mod content;
 mod error;
 mod events;
 mod ids;
+mod reasoning;
 mod send_queue;
 mod transcript;
 
@@ -52,6 +53,7 @@ pub use content::{ContentPart, MessageContent, TailState};
 pub use error::{KernelError, Result};
 pub use events::{EventBus, KernelEvent};
 pub use ids::{ImageId, JobId, MessageId, ModelResponseId, SessionId};
+pub use reasoning::ReasoningEffort;
 pub use send_queue::{GenerationJob, SendQueue, SessionDirectory};
 pub use transcript::{
     GenerationCommit, GenerationRecord, GenerationStamp, GenerationStatus, InMemoryTranscript,

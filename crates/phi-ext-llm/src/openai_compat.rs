@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use self::conversation::SseReader;
 use crate::images::{PreparedImage, PreparedImages};
-use crate::{ImagePolicy, ProviderImages};
+use crate::{ImagePolicy, ProviderImages, ReasoningConfig, ReasoningDialect};
 use async_trait::async_trait;
 use phi_kernel::{
     AgentEvent, AgentPrefix, AgentRun, AgentRuntime, ContentPart, MessageContent, ModelResponse,
@@ -197,14 +197,118 @@ impl HistoryProjector for PassThrough {
 #[derive(Clone)]
 struct WireCodec {
     style: ApiStyle,
-    deepseek_thinking: Option<bool>,
+    reasoning: ReasoningConfig,
 }
 
 impl WireCodec {
+    fn accepts_continuation(&self, saved: &str, current: &str) -> bool {
+        if saved == current {
+            return true;
+        }
+        // Existing Responses payloads already contain complete provider items.
+        // Their v1 scope predates dialect selection; preserve those files only
+        // for the exact same endpoint, API style and model.
+        self.style == ApiStyle::Responses
+            && saved
+                .strip_prefix("openai-compatible/v1|")
+                .is_some_and(|identity| {
+                    current
+                        .split_once('|')
+                        .is_some_and(|(_, now)| identity == now)
+                })
+    }
+
+    fn restore_completion_metadata(
+        &self,
+        message: &mut Value,
+        saved: &Value,
+    ) -> Result<(), String> {
+        let saved = saved.as_object().ok_or("invalid completion continuation")?;
+        if self.reasoning.dialect == ReasoningDialect::OpenRouter {
+            if let Some(details) = saved.get("reasoning_details") {
+                let details_array = details
+                    .as_array()
+                    .ok_or("invalid reasoning details continuation")?;
+                if details_array.iter().any(|value| {
+                    !value.is_object() || value.get("type").and_then(Value::as_str).is_none()
+                }) {
+                    return Err("invalid reasoning detail continuation".into());
+                }
+                message["reasoning_details"] = details.clone();
+            }
+            if let Some(reasoning) = saved.get("reasoning") {
+                if !reasoning.is_string() {
+                    return Err("invalid reasoning continuation".into());
+                }
+                message["reasoning"] = reasoning.clone();
+            }
+        }
+        if self.reasoning.dialect == ReasoningDialect::Gemini {
+            if let Some(extra) = saved.get("extra_content") {
+                Self::validate_google_signature(extra)?;
+                message["extra_content"] = extra.clone();
+            }
+            if let Some(saved_calls) = saved.get("tool_calls") {
+                let saved_calls = saved_calls
+                    .as_array()
+                    .ok_or("invalid signed tool continuation")?;
+                let calls = message
+                    .get_mut("tool_calls")
+                    .and_then(Value::as_array_mut)
+                    .ok_or("signed tool continuation has no matching calls")?;
+                if calls.len() != saved_calls.len() {
+                    return Err("signed tool continuation call count changed".into());
+                }
+                for (call, saved_call) in calls.iter_mut().zip(saved_calls) {
+                    let arguments_match = match (
+                        call.pointer("/function/arguments").and_then(Value::as_str),
+                        saved_call
+                            .get("canonical_arguments")
+                            .or_else(|| saved_call.pointer("/function/arguments"))
+                            .and_then(Value::as_str),
+                    ) {
+                        (Some(current), Some(original)) if current == original => true,
+                        (Some(current), Some(original)) => match (
+                            serde_json::from_str::<Value>(current),
+                            serde_json::from_str::<Value>(original),
+                        ) {
+                            (Ok(current), Ok(original)) => current == original,
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    if call.get("id") != saved_call.get("id")
+                        || call.pointer("/function/name") != saved_call.pointer("/function/name")
+                        || !arguments_match
+                    {
+                        return Err("signed tool continuation no longer matches tool call".into());
+                    }
+                    call["function"] = saved_call["function"].clone();
+                    if let Some(extra) = saved_call.get("extra_content") {
+                        Self::validate_google_signature(extra)?;
+                        call["extra_content"] = extra.clone();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_google_signature(extra: &Value) -> Result<(), String> {
+        if extra
+            .pointer("/google/thought_signature")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err("invalid Google thought signature continuation".into());
+        }
+        Ok(())
+    }
+
     fn for_style(style: ApiStyle) -> Self {
         Self {
             style,
-            deepseek_thinking: None,
+            reasoning: ReasoningConfig::default(),
         }
     }
 
@@ -265,16 +369,7 @@ impl WireCodec {
             body["store"] = json!(false);
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
-        if let Some(enabled) = self.deepseek_thinking {
-            match self.style {
-                ApiStyle::Completions => {
-                    body["thinking"] = json!({"type": if enabled { "enabled" } else { "disabled" }})
-                }
-                ApiStyle::Responses => {
-                    body["reasoning"] = json!({"effort": if enabled { "high" } else { "none" }})
-                }
-            }
-        }
+        self.reasoning.apply(self.style, &mut body)?;
         Ok(body)
     }
 
@@ -288,7 +383,7 @@ impl WireCodec {
         match item {
             TurnItem::ModelResponse{response}=>{
                 if let Some(continuation)=&response.continuation {
-                    if continuation.scope==scope && self.style==ApiStyle::Responses {
+                    if self.accepts_continuation(&continuation.scope, scope) && self.style==ApiStyle::Responses {
                         let items=continuation.payload.as_array().ok_or("invalid persisted continuation")?;
                         out.extend(self.project_continuation(response, items)?);return Ok(());
                     }
@@ -302,10 +397,15 @@ impl WireCodec {
                         _=>return Err("invalid response group member".into()),
                     }}
                     let mut message=json!({"role":"assistant","content":text});
-                    if self.deepseek_thinking == Some(true) && (!reasoning.is_empty() || !calls.is_empty()) {
+                    if self.reasoning.replay_reasoning() && (!reasoning.is_empty() || !calls.is_empty()) {
                         message["reasoning_content"] = json!(reasoning);
                     }
                     if !calls.is_empty(){message["tool_calls"]=json!(calls);}
+                    if let Some(continuation) = &response.continuation {
+                        if self.accepts_continuation(&continuation.scope, scope) {
+                            self.restore_completion_metadata(&mut message, &continuation.payload)?;
+                        }
+                    }
                     out.push(message);
                 }else{for row in &response.rows{self.encode_history(&row.item,images,scope,out)?;}}
             }
@@ -448,12 +548,12 @@ pub struct OpenAiCompatRuntime {
 }
 
 impl OpenAiCompatRuntime {
-    /// DeepSeek protocol option (2026-09): caller decides model capability and user policy.
-    /// Completions tool continuations must replay the assistant's reasoning_content.
+    /// Explicit wire dialect and validated user choice. Callers own model capabilities.
     #[must_use]
-    pub fn with_deepseek_thinking(mut self, enabled: bool) -> Self {
-        self.codec.deepseek_thinking = Some(enabled);
-        self
+    pub fn with_reasoning(mut self, config: ReasoningConfig) -> Result<Self, String> {
+        config.validate(self.config.api_style)?;
+        self.codec.reasoning = config;
+        Ok(self)
     }
 
     pub fn with_tool_images(mut self, source: Arc<dyn crate::ToolOutputImages>) -> Self {
@@ -467,7 +567,8 @@ impl OpenAiCompatRuntime {
     }
     fn continuation_scope(&self) -> String {
         format!(
-            "openai-compatible/v1|{}|{}|{}",
+            "openai-compatible/v2/{}|{}|{}|{}",
+            self.codec.reasoning.dialect.scope_name(),
             self.config.api_base.as_str(),
             self.config.api_style,
             self.config.model.as_str()
@@ -594,6 +695,7 @@ impl OpenAiCompatRuntime {
             cancel.clone(),
             self.config.api_style,
             self.continuation_scope(),
+            self.codec.reasoning.dialect,
         );
         Ok(reader)
     }

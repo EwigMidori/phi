@@ -24,10 +24,12 @@ mod images;
 mod tool_images;
 pub use tool_images::ToolOutputImages;
 mod openai_compat;
+mod reasoning;
 pub use images::{
     FileCacheKey, FileReference, FileReferenceCache, ImageDigest, ImageMetadata, ImagePolicy,
     ImageSource, ImageTransfer, ProviderFileId, ProviderImages,
 };
+pub use reasoning::{ReasoningConfig, ReasoningDialect, ReasoningEffort, ReasoningMode};
 
 pub use openai_compat::{
     ApiBase, ApiKey, ApiStyle, HistoryProjector, LlmConfig, ModelId, OpenAiCompatRuntime,
