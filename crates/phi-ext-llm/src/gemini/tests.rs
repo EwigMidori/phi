@@ -413,6 +413,152 @@ async fn both_modes_commit_before_tools_and_replay_native_parts_with_canonical_e
 }
 
 #[tokio::test]
+async fn nullable_native_fields_preserve_tool_commit_and_signed_replay() {
+    for mode in [ResponseMode::Buffered, ResponseMode::Streaming] {
+        let mut original = calls_response();
+        original["candidates"][0]["index"] = Value::Null;
+        original["candidates"][0]["content"]["parts"][0]["thought"] = Value::Null;
+        original["candidates"][0]["content"]["parts"][0]["thoughtSignature"] = Value::Null;
+        original["candidates"][0]["content"]["parts"][0]["functionCall"] = Value::Null;
+        original["candidates"][0]["content"]["parts"][1]["functionCall"]["id"] = Value::Null;
+        original["candidates"][0]["content"]["parts"][1]["text"] = Value::Null;
+        original["promptFeedback"] = json!({"blockReason":null});
+        original["usageMetadata"]["cachedContentTokenCount"] = Value::Null;
+        let first = if mode == ResponseMode::Streaming {
+            let mut pending = original.clone();
+            pending["candidates"][0]["finishReason"] = Value::Null;
+            Reply::sse(&[
+                json!({"candidates":null,"usageMetadata":null}),
+                json!({"candidates":[{"content":null,"finishReason":null}]}),
+                json!({"candidates":[{"content":{"role":null,"parts":null}}]}),
+                pending,
+                json!({"candidates":[{"content":null,"finishReason":"STOP"}]}),
+                json!({"usageMetadata":{"promptTokenCount":null,"totalTokenCount":18}}),
+            ])
+        } else {
+            Reply::json(original.clone())
+        };
+        let server = Server::start(vec![first, Reply::native(mode, final_response())]).await;
+        let (tools, executions) = registry();
+        let mut run = LlmRuntime::new(Arc::new(server.protocol(mode)))
+            .with_tools(tools.clone())
+            .run(request(&tools))
+            .await
+            .unwrap();
+        let mut usages = Vec::new();
+        let response = until_response(&mut run, &mut usages).await;
+        assert!(executions.lock().unwrap().is_empty());
+        assert_eq!(call_rows(&response).len(), 2);
+        assert!(
+            matches!(&response.rows[0].item, TurnItem::Assistant { content } if content == "先计算")
+        );
+        assert_eq!(usages[0], Usage::new(Some(11), Some(4), Some(18)));
+        let mut finished = false;
+        while let Some(event) = run.next().await {
+            if matches!(event.unwrap(), AgentEvent::Finished { .. }) {
+                finished = true;
+                break;
+            }
+        }
+        run.close_and_join().await.unwrap();
+        assert!(finished);
+        assert_eq!(
+            *executions.lock().unwrap(),
+            [json!({"value":3}), json!({"value":7})]
+        );
+        let requests = server.state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].body["contents"][1], original["candidates"][0]["content"],
+            "null tolerance must not rewrite signed parts or tool arguments"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unsuccessful_finish_reasons_report_cause_without_sealing_calls() {
+    use crate::protocol::ProviderErrorKind;
+    for mode in [ResponseMode::Buffered, ResponseMode::Streaming] {
+        for (reason, kind, diagnostic) in [
+            (
+                json!("MAX_TOKENS"),
+                ProviderErrorKind::Truncated,
+                "MAX_TOKENS",
+            ),
+            (json!("LANGUAGE"), ProviderErrorKind::Blocked, "LANGUAGE"),
+            (
+                json!("IMAGE_RECITATION"),
+                ProviderErrorKind::Blocked,
+                "IMAGE_RECITATION",
+            ),
+            (
+                json!("MODEL_ARMOR"),
+                ProviderErrorKind::Blocked,
+                "MODEL_ARMOR",
+            ),
+            (json!("OTHER"), ProviderErrorKind::Protocol, "OTHER"),
+            (
+                json!("MALFORMED_RESPONSE"),
+                ProviderErrorKind::Protocol,
+                "MALFORMED_RESPONSE",
+            ),
+            (
+                json!("FUTURE_REASON"),
+                ProviderErrorKind::Protocol,
+                "FUTURE_REASON",
+            ),
+            (json!(false), ProviderErrorKind::Protocol, "boolean"),
+            (
+                json!({"secret":"private"}),
+                ProviderErrorKind::Protocol,
+                "object",
+            ),
+            (
+                json!("private\ntext"),
+                ProviderErrorKind::Protocol,
+                "invalid enum name",
+            ),
+            (
+                Value::Null,
+                ProviderErrorKind::Protocol,
+                "without a complete stopped candidate",
+            ),
+        ] {
+            let mut body = calls_response();
+            body["candidates"][0]["finishReason"] = reason;
+            let server = Server::start(vec![Reply::native(mode, body)]).await;
+            let (tools, _) = registry();
+            let request = request(&tools);
+            let mut response = server
+                .protocol(mode)
+                .open_response(
+                    &request.session_id,
+                    &request.prefix,
+                    &request.history,
+                    &PreparedImages::default(),
+                    &request.cancel,
+                )
+                .await
+                .unwrap();
+            let error = loop {
+                match response.next().await {
+                    Ok(ResponseStep::Observation(_)) => {}
+                    Err(error) => break error,
+                    _ => panic!("unsuccessful response became executable"),
+                }
+            };
+            assert_eq!(error.kind(), kind);
+            assert!(error.to_string().contains(diagnostic), "{error}");
+            assert!(!error.to_string().contains("private"));
+            assert!(matches!(
+                response.next().await.unwrap(),
+                ResponseStep::Ended
+            ));
+        }
+    }
+}
+
+#[tokio::test]
 async fn malformed_truncated_blocked_or_unsigned_responses_never_execute_calls() {
     let mut duplicate = calls_response();
     duplicate["candidates"][0]["content"]["parts"][1]["functionCall"]["id"] =
@@ -424,6 +570,10 @@ async fn malformed_truncated_blocked_or_unsigned_responses_never_execute_calls()
         .as_object_mut()
         .unwrap()
         .remove("thoughtSignature");
+    let mut null_signature = unsigned.clone();
+    null_signature["candidates"][0]["content"]["parts"][1]["thoughtSignature"] = Value::Null;
+    let mut invalid_thought = calls_response();
+    invalid_thought["candidates"][0]["content"]["parts"][0]["thought"] = json!("false");
     let mut unfinished = calls_response();
     unfinished["candidates"][0]
         .as_object_mut()
@@ -435,6 +585,8 @@ async fn malformed_truncated_blocked_or_unsigned_responses_never_execute_calls()
             duplicate.clone(),
             truncated.clone(),
             unsigned.clone(),
+            null_signature.clone(),
+            invalid_thought.clone(),
             unfinished.clone(),
             blocked.clone(),
             json!({"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}]}),

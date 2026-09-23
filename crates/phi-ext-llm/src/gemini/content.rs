@@ -48,12 +48,15 @@ impl NativeContent {
 
     pub(super) fn validate_part(part: &Value) -> Result<(), String> {
         let object = part.as_object().ok_or("Gemini part is not an object")?;
-        if let Some(thought) = object.get("thought") {
+        if let Some(thought) = object.get("thought").filter(|value| !value.is_null()) {
             if !thought.is_boolean() {
                 return Err("invalid Gemini thought flag".into());
             }
         }
-        if let Some(signature) = object.get("thoughtSignature") {
+        if let Some(signature) = object
+            .get("thoughtSignature")
+            .filter(|value| !value.is_null())
+        {
             let signature = signature
                 .as_str()
                 .ok_or("invalid Gemini thought signature")?;
@@ -73,7 +76,10 @@ impl NativeContent {
                 return Err(format!("unsupported Gemini output part: {key}"));
             }
         }
-        match (object.get("text"), object.get("functionCall")) {
+        match (
+            object.get("text").filter(|value| !value.is_null()),
+            object.get("functionCall").filter(|value| !value.is_null()),
+        ) {
             (Some(text), None) if text.is_string() => Ok(()),
             (None, Some(call)) => {
                 let call = call.as_object().ok_or("invalid Gemini function call")?;
@@ -90,29 +96,38 @@ impl NativeContent {
                 if name.trim().is_empty() {
                     return Err("Gemini function name empty".into());
                 }
-                if let Some(id) = call.get("id") {
+                if let Some(id) = call.get("id").filter(|value| !value.is_null()) {
                     if id.as_str().is_none_or(|id| id.trim().is_empty()) {
                         return Err("invalid Gemini function id".into());
                     }
                 }
-                if call.get("args").is_some_and(|args| !args.is_object()) {
+                if call
+                    .get("args")
+                    .is_some_and(|args| !args.is_null() && !args.is_object())
+                {
                     return Err("Gemini function arguments must be an object".into());
                 }
                 // Schema-invalid object contents are preserved for the tool's reply.
                 Ok(())
             }
-            (None, None) if object.contains_key("thoughtSignature") => Ok(()),
+            (None, None)
+                if object
+                    .get("thoughtSignature")
+                    .is_some_and(|value| !value.is_null()) =>
+            {
+                Ok(())
+            }
             _ => Err("unsupported or ambiguous Gemini output part".into()),
         }
     }
 
     pub(super) fn validate_signatures(&self, required: bool) -> Result<(), String> {
         if required
-            && let Some(part) = self
-                .parts
-                .iter()
-                .find(|part| part.get("functionCall").is_some())
-            && part.get("thoughtSignature").is_none()
+            && let Some(part) = self.parts.iter().find(|part| {
+                part.get("functionCall")
+                    .is_some_and(|value| !value.is_null())
+            })
+            && part.get("thoughtSignature").is_none_or(Value::is_null)
         {
             return Err(
                 "Gemini current tool response is missing its required thought signature".into(),
@@ -171,7 +186,7 @@ impl NativeContent {
                     canonical_arguments: None,
                 });
                 rows.push(TranscriptRow::new(id, item));
-            } else if let Some(call) = part.get("functionCall") {
+            } else if let Some(call) = part.get("functionCall").filter(|value| !value.is_null()) {
                 if let Some(id) = call.get("id").and_then(Value::as_str) {
                     if !provider_ids.insert(id.to_owned()) {
                         return Err("duplicate Gemini function call id".into());
@@ -180,7 +195,11 @@ impl NativeContent {
                 let name = call["name"]
                     .as_str()
                     .ok_or("Gemini function name missing")?;
-                let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                let arguments = call
+                    .get("args")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
                 let input = ToolArguments::from(arguments);
                 bindings.push(Binding {
                     row: RowSlot(rows.len()),

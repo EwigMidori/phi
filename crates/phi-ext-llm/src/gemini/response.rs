@@ -163,7 +163,7 @@ impl GeminiResponse {
     }
 
     fn read_usage(&mut self, value: &Value) -> Result<(), String> {
-        let Some(metadata) = value.get("usageMetadata") else {
+        let Some(metadata) = value.get("usageMetadata").filter(|value| !value.is_null()) else {
             return Ok(());
         };
         let metadata = metadata
@@ -176,7 +176,7 @@ impl GeminiResponse {
             ("totalTokenCount", &mut usage.total_tokens),
             ("cachedContentTokenCount", &mut usage.cached_tokens),
         ] {
-            if let Some(value) = metadata.get(key) {
+            if let Some(value) = metadata.get(key).filter(|value| !value.is_null()) {
                 let value = value.as_u64().ok_or("invalid Gemini usage counter")?;
                 if target.is_some_and(|previous| value < previous) {
                     return Err("Gemini cumulative usage counter decreased".into());
@@ -196,10 +196,13 @@ impl GeminiResponse {
         if self.state == ResponseState::Draining || self.fault.is_some() {
             return Ok(());
         }
-        if value.get("error").is_some() {
+        if value.get("error").is_some_and(|value| !value.is_null()) {
             return Err("Gemini provider reported an error".into());
         }
-        if let Some(reason) = value.pointer("/promptFeedback/blockReason") {
+        if let Some(reason) = value
+            .pointer("/promptFeedback/blockReason")
+            .filter(|value| !value.is_null())
+        {
             if reason
                 .as_str()
                 .is_none_or(|reason| reason != "BLOCK_REASON_UNSPECIFIED")
@@ -207,7 +210,7 @@ impl GeminiResponse {
                 return Err(ProviderError::blocked("Gemini blocked the input prompt"));
             }
         }
-        let Some(candidates) = value.get("candidates") else {
+        let Some(candidates) = value.get("candidates").filter(|value| !value.is_null()) else {
             return Ok(());
         };
         let candidates = candidates.as_array().ok_or("invalid Gemini candidates")?;
@@ -222,26 +225,33 @@ impl GeminiResponse {
         let candidate = candidates[0]
             .as_object()
             .ok_or("invalid Gemini candidate")?;
-        if let Some(index) = candidate.get("index") {
+        if let Some(index) = candidate.get("index").filter(|value| !value.is_null()) {
             if index.as_u64() != Some(0) {
                 return Err("Gemini candidate identity changed".into());
             }
         }
         self.seen_candidate = true;
-        if let Some(content) = candidate.get("content") {
-            if let Some(role) = content.get("role") {
+        if let Some(content) = candidate.get("content").filter(|value| !value.is_null()) {
+            let content = content.as_object().ok_or("invalid Gemini content")?;
+            if let Some(role) = content.get("role").filter(|value| !value.is_null()) {
                 if role.as_str() != Some("model") {
                     return Err("unexpected Gemini output role".into());
                 }
             }
-            let parts = content
-                .get("parts")
-                .and_then(Value::as_array)
-                .ok_or("Gemini content parts missing")?;
+            // ProtoJSON null means unset, including optional streaming subtrees.
+            let parts = match content.get("parts").filter(|value| !value.is_null()) {
+                Some(parts) => parts
+                    .as_array()
+                    .ok_or("invalid Gemini content parts")?
+                    .as_slice(),
+                None => &[],
+            };
             for part in parts {
                 NativeContent::validate_part(part)?;
                 if self.stop
-                    && (part.get("functionCall").is_some()
+                    && (part
+                        .get("functionCall")
+                        .is_some_and(|value| !value.is_null())
                         || part
                             .get("text")
                             .and_then(Value::as_str)
@@ -270,39 +280,73 @@ impl GeminiResponse {
                 self.parts.push(part.clone());
             }
         }
-        if let Some(reason) = candidate.get("finishReason") {
-            match reason.as_str() {
-                Some("STOP") => self.stop = true,
-                Some("FINISH_REASON_UNSPECIFIED" | "") => {}
-                Some("MAX_TOKENS") => {
-                    return Err(ProviderError::truncated(
-                        "Gemini response was truncated at its output limit",
-                    ));
-                }
-                Some(
-                    "SAFETY"
-                    | "RECITATION"
-                    | "BLOCKLIST"
-                    | "PROHIBITED_CONTENT"
-                    | "SPII"
-                    | "IMAGE_SAFETY"
-                    | "IMAGE_PROHIBITED_CONTENT",
-                ) => {
-                    return Err(ProviderError::blocked(
-                        "Gemini blocked the generated response",
-                    ));
-                }
-                Some(
-                    "MALFORMED_FUNCTION_CALL"
-                    | "UNEXPECTED_TOOL_CALL"
-                    | "TOO_MANY_TOOL_CALLS"
-                    | "MISSING_THOUGHT_SIGNATURE",
-                ) => return Err("Gemini stopped with an invalid tool response".into()),
-                _ => {
-                    return Err(
-                        "Gemini response has an unsupported or invalid finish reason".into(),
-                    );
-                }
+        if let Some(reason) = candidate
+            .get("finishReason")
+            .filter(|value| !value.is_null())
+        {
+            self.read_finish_reason(reason)?;
+        }
+        Ok(())
+    }
+
+    fn read_finish_reason(&mut self, value: &Value) -> Result<(), ProviderError> {
+        let reason = value.as_str().ok_or_else(|| {
+            let kind = match value {
+                Value::Number(_) => "number",
+                Value::Bool(_) => "boolean",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+                _ => "null",
+            };
+            ProviderError::invalid(format!(
+                "Gemini finishReason must be an enum name, received {kind}"
+            ))
+        })?;
+        // Expose an enum token, never arbitrary provider text or the response body.
+        if reason.len() > 128
+            || !reason
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err("Gemini finishReason contains an invalid enum name".into());
+        }
+        match reason {
+            "STOP" => self.stop = true,
+            "FINISH_REASON_UNSPECIFIED" | "" => {}
+            "MAX_TOKENS" => {
+                return Err(ProviderError::truncated(
+                    "Gemini response was truncated at its output limit (MAX_TOKENS)",
+                ));
+            }
+            "SAFETY"
+            | "RECITATION"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"
+            | "IMAGE_RECITATION"
+            | "LANGUAGE"
+            | "MODEL_ARMOR" => {
+                return Err(ProviderError::blocked(format!(
+                    "Gemini blocked the generated response ({reason})"
+                )));
+            }
+            "MALFORMED_FUNCTION_CALL"
+            | "UNEXPECTED_TOOL_CALL"
+            | "TOO_MANY_TOOL_CALLS"
+            | "MISSING_THOUGHT_SIGNATURE"
+            | "MALFORMED_RESPONSE"
+            | "NO_IMAGE"
+            | "OTHER"
+            | "IMAGE_OTHER"
+            | "ESCALATION" => {
+                return Err(format!("Gemini stopped without a complete response ({reason})").into());
+            }
+            _ => {
+                return Err(
+                    format!("Gemini response has an unsupported finish reason: {reason}").into(),
+                );
             }
         }
         Ok(())
