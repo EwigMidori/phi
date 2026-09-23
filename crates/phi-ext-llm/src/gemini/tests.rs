@@ -25,8 +25,8 @@ use futures::{Stream, StreamExt};
 use phi_ext_tools::{ToolExecution, ToolExecutor, ToolRegistry};
 use phi_kernel::{
     AgentEvent, AgentRun, AgentRuntime, ContentPart, ImageId, JobId, MessageContent, MessageId,
-    ModelResponse, OneshotModel, OneshotRequest, OneshotText, ToolArguments, ToolCallId,
-    ToolCallSealPolicy, ToolName, ToolResultStatus, ToolSpec, TurnRequest, Usage,
+    ModelResponse, ModelResponseId, OneshotModel, OneshotRequest, OneshotText, ToolArguments,
+    ToolCallId, ToolCallSealPolicy, ToolName, ToolResultStatus, ToolSpec, TurnRequest, Usage,
 };
 use serde_json::json;
 
@@ -505,6 +505,193 @@ async fn relay_split_call_after_tool_result_commits_once_and_continues_to_answer
         }]),
         "placeholder is applied only to the outgoing unsigned call"
     );
+}
+
+#[tokio::test]
+async fn native_replay_removes_only_plain_empty_text_without_changing_saved_bindings() {
+    // GenerateContent v1beta replay: stream padding is not an assistant message;
+    // signed or annotated empty parts still carry provider state.
+    for mode in [ResponseMode::Buffered, ResponseMode::Streaming] {
+        let mut original = calls_response();
+        let parts = original["candidates"][0]["content"]["parts"]
+            .as_array_mut()
+            .unwrap();
+        parts.insert(0, json!({"text":""}));
+        parts.insert(2, json!({"text":""}));
+        parts.push(json!({"text":"","partMetadata":{"marker":"keep"}}));
+        parts.push(json!({"text":""}));
+        let expected_parts: Vec<Value> = parts
+            .iter()
+            .filter(|part| **part != json!({"text":""}))
+            .cloned()
+            .collect();
+        let server = Server::start(vec![
+            Reply::native(mode, original.clone()),
+            Reply::native(mode, final_response()),
+        ])
+        .await;
+        let (tools, executions) = registry();
+        let mut run = LlmRuntime::new(Arc::new(server.protocol(mode)))
+            .with_tools(tools.clone())
+            .run(request(&tools))
+            .await
+            .unwrap();
+        let response = until_response(&mut run, &mut Vec::new()).await;
+        assert!(executions.lock().unwrap().is_empty());
+        for _ in 0..2 {
+            assert!(matches!(
+                run.next().await.unwrap().unwrap(),
+                AgentEvent::ToolResult {
+                    status: ToolResultStatus::Ok,
+                    ..
+                }
+            ));
+        }
+        let answer = until_response(&mut run, &mut Vec::new()).await;
+        assert!(matches!(&answer.rows[0].item,
+            TurnItem::Assistant { content } if content == "答案完成"));
+        assert!(matches!(
+            run.next().await.unwrap().unwrap(),
+            AgentEvent::Finished { .. }
+        ));
+        run.close_and_join().await.unwrap();
+        assert_eq!(executions.lock().unwrap().len(), 2);
+        assert_eq!(
+            response.continuation.as_ref().unwrap().payload["content"],
+            original["candidates"][0]["content"],
+            "persisted parts and original slot bindings stay intact"
+        );
+        let requests = server.state.requests.lock().unwrap();
+        assert_eq!(
+            requests[1].body["contents"][1]["parts"],
+            json!(expected_parts)
+        );
+        let replies = &requests[1].body["contents"][2]["parts"];
+        assert_eq!(replies[0]["functionResponse"]["response"]["output"], 3);
+        assert_eq!(replies[1]["functionResponse"]["id"], "provider-second");
+        assert_eq!(replies[1]["functionResponse"]["response"]["output"], 7);
+    }
+}
+
+#[tokio::test]
+async fn foreign_history_keeps_reasoning_and_tool_results_without_empty_model_messages() {
+    for mode in [ResponseMode::Buffered, ResponseMode::Streaming] {
+        let first_id = ToolCallId::new("old-first");
+        let second_id = ToolCallId::new("old-second");
+        let foreign = ModelResponse {
+            id: ModelResponseId::generate(),
+            rows: vec![
+                phi_kernel::TranscriptRow::new(
+                    MessageId::generate(),
+                    TurnItem::Assistant {
+                        content: String::new(),
+                    },
+                ),
+                phi_kernel::TranscriptRow::new(
+                    MessageId::generate(),
+                    TurnItem::Reasoning {
+                        content: "earlier calculation".into(),
+                    },
+                ),
+                phi_kernel::TranscriptRow::new(
+                    MessageId::generate(),
+                    TurnItem::ToolCall {
+                        tool_call_id: first_id.clone(),
+                        tool_name: ToolName::new("compute"),
+                        input: json!({"value":3}).into(),
+                    },
+                ),
+                phi_kernel::TranscriptRow::new(
+                    MessageId::generate(),
+                    TurnItem::ToolCall {
+                        tool_call_id: second_id.clone(),
+                        tool_name: ToolName::new("compute"),
+                        input: json!({"value":7}).into(),
+                    },
+                ),
+            ],
+            continuation: Some(phi_kernel::ProviderContinuation {
+                scope: "foreign-protocol/model".into(),
+                payload: json!({"private_state":"not portable"}),
+            }),
+            complete: true,
+        };
+        let empty = ModelResponse {
+            id: ModelResponseId::generate(),
+            rows: vec![phi_kernel::TranscriptRow::new(
+                MessageId::generate(),
+                TurnItem::Assistant {
+                    content: String::new(),
+                },
+            )],
+            continuation: None,
+            complete: false,
+        };
+        let (tools, executions) = registry();
+        let mut turn = request(&tools);
+        turn.history = vec![
+            TurnItem::User {
+                content: "old question".into(),
+            },
+            TurnItem::ModelResponse { response: foreign },
+            TurnItem::ToolResult {
+                tool_call_id: first_id,
+                tool_name: ToolName::new("compute"),
+                output: json!(3),
+                status: ToolResultStatus::Ok,
+            },
+            TurnItem::ToolResult {
+                tool_call_id: second_id,
+                tool_name: ToolName::new("compute"),
+                output: json!({"error":"old failure"}),
+                status: ToolResultStatus::Error,
+            },
+            TurnItem::ModelResponse { response: empty },
+            TurnItem::User {
+                content: "new question after model switch".into(),
+            },
+        ];
+        let server = Server::start(vec![Reply::native(mode, final_response())]).await;
+        let protocol = server
+            .protocol(mode)
+            .with_signature_policy(GeminiSignaturePolicy::PlaceholderForMissing);
+        let mut run = LlmRuntime::new(Arc::new(protocol))
+            .with_tools(tools)
+            .run(turn)
+            .await
+            .unwrap();
+        let answer = until_response(&mut run, &mut Vec::new()).await;
+        assert!(
+            matches!(&answer.rows[0].item, TurnItem::Assistant { content } if content == "答案完成")
+        );
+        assert!(matches!(
+            run.next().await.unwrap().unwrap(),
+            AgentEvent::Finished { .. }
+        ));
+        run.close_and_join().await.unwrap();
+        assert!(
+            executions.lock().unwrap().is_empty(),
+            "historical calls never execute again"
+        );
+        let requests = server.state.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].body["contents"],
+            json!([
+                {"role":"user","parts":[{"text":"old question"}]},
+                {"role":"model","parts":[
+                    {"text":"earlier calculation","thought":true},
+                    {"functionCall":{"name":"compute","args":{"value":3}},"thoughtSignature":"skip_thought_signature_validator"},
+                    {"functionCall":{"name":"compute","args":{"value":7}}}
+                ]},
+                {"role":"user","parts":[
+                    {"functionResponse":{"name":"compute","response":{"status":"ok","output":3}}},
+                    {"functionResponse":{"name":"compute","response":{"status":"error","output":{"error":"old failure"}}}}
+                ]},
+                {"role":"user","parts":[{"text":"new question after model switch"}]}
+            ])
+        );
+    }
 }
 
 #[tokio::test]

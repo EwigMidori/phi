@@ -383,25 +383,39 @@ impl<'a> GeminiHistory<'a> {
         if !self.pending.is_empty() {
             return Err("Gemini history contains unanswered tool calls".into());
         }
-        if self.contents.is_empty() {
-            return Err("Gemini input is empty".into());
-        }
-        if self.signature_policy == GeminiSignaturePolicy::PlaceholderForMissing {
-            for content in &mut self.contents {
-                if content["role"] != "model" {
-                    continue;
-                }
-                let first_call = content["parts"]
-                    .as_array_mut()
-                    .expect("encoded parts")
+        for content in &mut self.contents {
+            if content["role"] != "model" {
+                continue;
+            }
+            let parts = content["parts"].as_array_mut().expect("encoded parts");
+            // Empty SSE text padding is not an assistant message. Normalize only
+            // the outbound copy, after validating persisted bindings; any extra
+            // field (especially a signature) makes the original part significant.
+            parts.retain(|part| {
+                !part.as_object().is_some_and(|fields| {
+                    fields.len() == 1 && fields.get("text").and_then(Value::as_str) == Some("")
+                })
+            });
+            if self.signature_policy == GeminiSignaturePolicy::PlaceholderForMissing {
+                let first_call = parts
                     .iter_mut()
                     .find(|part| part.get("functionCall").is_some_and(|call| !call.is_null()));
-                if let Some(part) = first_call {
-                    if part.get("thoughtSignature").is_none_or(Value::is_null) {
-                        part["thoughtSignature"] = json!(REPLAY_SIGNATURE_PLACEHOLDER);
-                    }
+                if let Some(part) = first_call
+                    && part.get("thoughtSignature").is_none_or(Value::is_null)
+                {
+                    part["thoughtSignature"] = json!(REPLAY_SIGNATURE_PLACEHOLDER);
                 }
             }
+        }
+        self.contents.retain(|content| {
+            content["role"] != "model"
+                || !content["parts"]
+                    .as_array()
+                    .expect("encoded parts")
+                    .is_empty()
+        });
+        if self.contents.is_empty() {
+            return Err("Gemini input is empty".into());
         }
         Ok(self.contents)
     }
