@@ -6,7 +6,7 @@ use futures::{Stream, StreamExt};
 use phi_kernel::{AgentEvent, MessageId, ModelResponse, ModelResponseId, TurnCancel, Usage};
 use serde_json::Value;
 
-use super::content::NativeContent;
+use super::{GeminiSignaturePolicy, content::NativeContent, parts::GeminiParts};
 use crate::{
     ResponseMode,
     framing::SseFramer,
@@ -108,10 +108,10 @@ pub(super) struct GeminiResponse {
     transport: Transport,
     cancel: TurnCancel,
     scope: String,
-    required_signatures: bool,
+    signature_policy: GeminiSignaturePolicy,
     response_id: ModelResponseId,
     assistant_id: MessageId,
-    parts: Vec<Value>,
+    parts: GeminiParts,
     stop: bool,
     seen_candidate: bool,
     usage: Usage,
@@ -127,7 +127,7 @@ impl GeminiResponse {
         mode: ResponseMode,
         cancel: TurnCancel,
         scope: String,
-        required_signatures: bool,
+        signature_policy: GeminiSignaturePolicy,
     ) -> Self {
         let transport = match mode {
             ResponseMode::Buffered => Transport::Json {
@@ -148,10 +148,10 @@ impl GeminiResponse {
             transport,
             cancel,
             scope,
-            required_signatures,
+            signature_policy,
             response_id,
             assistant_id,
-            parts: Vec::new(),
+            parts: GeminiParts::new(mode == ResponseMode::Streaming),
             stop: false,
             seen_candidate: false,
             usage: Usage::default(),
@@ -247,7 +247,6 @@ impl GeminiResponse {
                 None => &[],
             };
             for part in parts {
-                NativeContent::validate_part(part)?;
                 if self.stop
                     && (part
                         .get("functionCall")
@@ -259,6 +258,7 @@ impl GeminiResponse {
                 {
                     return Err("Gemini emitted new content after its terminal candidate".into());
                 }
+                self.parts.push(part.clone())?;
                 if let Some(text) = part
                     .get("text")
                     .and_then(Value::as_str)
@@ -277,7 +277,6 @@ impl GeminiResponse {
                     };
                     self.queued.push_back(event);
                 }
-                self.parts.push(part.clone());
             }
         }
         if let Some(reason) = candidate
@@ -341,7 +340,9 @@ impl GeminiResponse {
             | "OTHER"
             | "IMAGE_OTHER"
             | "ESCALATION" => {
-                return Err(format!("Gemini stopped without a complete response ({reason})").into());
+                return Err(
+                    format!("Gemini stopped without a complete response ({reason})").into(),
+                );
             }
             _ => {
                 return Err(
@@ -422,8 +423,8 @@ impl ProviderResponse for GeminiResponse {
         }
         // Make failed sealing terminal as well: no retry can produce a second batch.
         self.state = ResponseState::Sealed;
-        let native = NativeContent::new(self.parts.clone());
-        native.validate_signatures(self.required_signatures)?;
+        let native = NativeContent::new(self.parts.finish());
+        native.validate_signatures(self.signature_policy == GeminiSignaturePolicy::Required)?;
         let (rows, continuation) = native.seal(&self.assistant_id, &self.scope, normalizer)?;
         Ok(ModelResponse {
             id: self.response_id.clone(),

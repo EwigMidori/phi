@@ -149,7 +149,7 @@ impl Server {
             mode,
         )
         .unwrap()
-        .with_required_thought_signatures(true)
+        .with_signature_policy(GeminiSignaturePolicy::Required)
     }
 }
 
@@ -410,6 +410,254 @@ async fn both_modes_commit_before_tools_and_replay_native_parts_with_canonical_e
             "edited arguments cannot silently reuse a signed call"
         );
     }
+}
+
+#[tokio::test]
+async fn relay_split_call_after_tool_result_commits_once_and_continues_to_answer() {
+    // Modelflare native SSE structure observed on 2026-09-23: a named empty
+    // header, then a nameless complete args object. All values here are synthetic.
+    let first_part = calls_response()["candidates"][0]["content"]["parts"][1].clone();
+    let first = json!({"candidates":[{"content":{"role":"model","parts":[first_part.clone()]},"finishReason":"STOP"}]});
+    let header = json!({"functionCall":{"name":"compute","args":{}}});
+    let argument_part = json!({"functionCall":{"name":"","args":{"legacyValue":7}}});
+    let split = Reply::sse(&[
+        json!({"candidates":[{"content":{"parts":[header]},"finishReason":null}]}),
+        json!({"candidates":[{"content":{"parts":[argument_part]},"finishReason":null}]}),
+        json!({"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":26,"candidatesTokenCount":0,"totalTokenCount":26}}),
+    ]);
+    let server = Server::start(vec![
+        Reply::sse(&[first]),
+        split,
+        Reply::sse(&[final_response()]),
+    ])
+    .await;
+    let protocol = server
+        .protocol(ResponseMode::Streaming)
+        .with_signature_policy(GeminiSignaturePolicy::PlaceholderForMissing);
+    let (tools, executions) = registry();
+    let mut run = LlmRuntime::new(Arc::new(protocol))
+        .with_tools(tools.clone())
+        .run(request(&tools))
+        .await
+        .unwrap();
+    let mut usages = Vec::new();
+    let first = until_response(&mut run, &mut usages).await;
+    assert_eq!(call_rows(&first).len(), 1);
+    assert!(executions.lock().unwrap().is_empty());
+    assert!(matches!(
+        run.next().await.unwrap().unwrap(),
+        AgentEvent::ToolResult {
+            status: ToolResultStatus::Ok,
+            ..
+        }
+    ));
+    let second = until_response(&mut run, &mut usages).await;
+    let calls = call_rows(&second);
+    assert_eq!(calls.len(), 1, "header and arguments form one call");
+    assert_eq!(calls[0].2.parse().unwrap(), json!({"value":7}));
+    assert_eq!(
+        executions.lock().unwrap().len(),
+        1,
+        "second response must commit before execution"
+    );
+    assert!(matches!(
+        run.next().await.unwrap().unwrap(),
+        AgentEvent::ToolResult {
+            status: ToolResultStatus::Ok,
+            ..
+        }
+    ));
+    assert_eq!(
+        server.state.requests.lock().unwrap().len(),
+        2,
+        "tool result is a pull barrier"
+    );
+    let final_reply = until_response(&mut run, &mut usages).await;
+    assert!(
+        matches!(&final_reply.rows[0].item, TurnItem::Assistant { content } if content == "答案完成")
+    );
+    assert!(matches!(
+        run.next().await.unwrap().unwrap(),
+        AgentEvent::Finished { .. }
+    ));
+    run.close_and_join().await.unwrap();
+    assert_eq!(
+        *executions.lock().unwrap(),
+        [json!({"value":3}), json!({"value":7})]
+    );
+    let saved = &second.continuation.as_ref().unwrap().payload["content"]["parts"];
+    assert_eq!(
+        saved,
+        &json!([{"functionCall":{"name":"compute","args":{"legacyValue":7}}}])
+    );
+    let requests = server.state.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].body["contents"][1]["parts"],
+        json!([first_part]),
+        "existing signature stays exact"
+    );
+    assert_eq!(
+        requests[2].body["contents"][3]["parts"],
+        json!([{
+            "functionCall":{"name":"compute","args":{"legacyValue":7}},
+            "thoughtSignature":"skip_thought_signature_validator"
+        }]),
+        "placeholder is applied only to the outgoing unsigned call"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_relay_fragments_never_commit_or_execute() {
+    let header = json!({"functionCall":{"name":"compute","args":{}}});
+    let tail = json!({"functionCall":{"name":"","args":{"value":7}}});
+    for (mode, parts, stopped) in [
+        (ResponseMode::Streaming, vec![tail.clone()], true),
+        (
+            ResponseMode::Streaming,
+            vec![
+                json!({"functionCall":{"name":"compute","args":{"value":3}}}),
+                tail.clone(),
+            ],
+            true,
+        ),
+        (
+            ResponseMode::Streaming,
+            vec![header.clone(), json!({"text":"intervening"}), tail.clone()],
+            true,
+        ),
+        (
+            ResponseMode::Streaming,
+            vec![
+                json!({"functionCall":{"name":"compute","id":"first","args":{}}}),
+                json!({"functionCall":{"name":"","id":"other","args":{"value":7}}}),
+            ],
+            true,
+        ),
+        (
+            ResponseMode::Streaming,
+            vec![
+                header.clone(),
+                json!({"functionCall":{"name":"","args":"{\"value\":7}"}}),
+            ],
+            true,
+        ),
+        (
+            ResponseMode::Streaming,
+            vec![header.clone(), tail.clone(), tail.clone()],
+            true,
+        ),
+        (
+            ResponseMode::Streaming,
+            vec![header.clone(), tail.clone()],
+            false,
+        ),
+        (
+            ResponseMode::Buffered,
+            vec![header.clone(), tail.clone()],
+            true,
+        ),
+        (
+            ResponseMode::Streaming,
+            vec![
+                json!({"functionCall":{"name":"compute","args":{}},"thoughtSignature":"YQ=="}),
+                json!({"functionCall":{"name":"","args":{"value":7}},"thoughtSignature":"Yg=="}),
+            ],
+            true,
+        ),
+    ] {
+        let reply = if mode == ResponseMode::Streaming {
+            let mut frames: Vec<Value> = parts
+                .into_iter()
+                .map(|part| json!({"candidates":[{"content":{"parts":[part]}}]}))
+                .collect();
+            if stopped {
+                frames.push(json!({"candidates":[{"finishReason":"STOP"}]}));
+            }
+            Reply::sse(&frames)
+        } else {
+            Reply::json(json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]}))
+        };
+        let server = Server::start(vec![reply]).await;
+        let (tools, executions) = registry();
+        let protocol = server
+            .protocol(mode)
+            .with_signature_policy(GeminiSignaturePolicy::PlaceholderForMissing);
+        let mut run = LlmRuntime::new(Arc::new(protocol))
+            .with_tools(tools.clone())
+            .run(request(&tools))
+            .await
+            .unwrap();
+        let mut failed = false;
+        while let Some(event) = run.next().await {
+            match event {
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+                Ok(
+                    AgentEvent::ModelResponseCompleted { .. }
+                    | AgentEvent::ToolResult { .. }
+                    | AgentEvent::Finished { .. },
+                ) => panic!("ambiguous fragment escaped validation"),
+                _ => {}
+            }
+        }
+        run.close_and_join().await.unwrap();
+        assert!(failed);
+        assert!(executions.lock().unwrap().is_empty());
+        assert_eq!(server.state.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn complete_zero_argument_calls_and_signed_split_calls_remain_distinct() {
+    let unsigned = json!({"functionCall":{"name":"compute","args":{}}});
+    let signature = "c2lnbmF0dXJl";
+    let signed_header = json!({"functionCall":{"name":"compute","args":{},"id":"named"},"thoughtSignature":signature});
+    let tail = json!({"functionCall":{"name":"","args":{"value":7},"id":"named"}});
+    let server = Server::start(vec![Reply::sse(&[
+        json!({"candidates":[{"content":{"parts":[signed_header]}}]}),
+        json!({"candidates":[{"content":{"parts":[tail]}}]}),
+        json!({"candidates":[{"content":{"parts":[unsigned.clone(),unsigned]},"finishReason":"STOP"}]}),
+    ]), Reply::sse(&[final_response()])]).await;
+    let (tools, executions) = registry();
+    let mut run = LlmRuntime::new(Arc::new(server.protocol(ResponseMode::Streaming)))
+        .with_tools(tools.clone())
+        .run(request(&tools))
+        .await
+        .unwrap();
+    let mut usages = Vec::new();
+    let response = until_response(&mut run, &mut usages).await;
+    assert_eq!(
+        call_rows(&response).len(),
+        3,
+        "zero argument calls are not discarded or collapsed"
+    );
+    assert!(executions.lock().unwrap().is_empty());
+    let mut results = Vec::new();
+    while let Some(event) = run.next().await {
+        match event.unwrap() {
+            AgentEvent::ToolResult { status, .. } => results.push(status),
+            AgentEvent::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    run.close_and_join().await.unwrap();
+    assert_eq!(
+        results,
+        [
+            ToolResultStatus::Ok,
+            ToolResultStatus::Error,
+            ToolResultStatus::Error
+        ]
+    );
+    assert_eq!(*executions.lock().unwrap(), [json!({"value":7})]);
+    let requests = server.state.requests.lock().unwrap();
+    assert_eq!(
+        requests[1].body["contents"][1]["parts"][0],
+        json!({"functionCall":{"name":"compute","args":{"value":7},"id":"named"},"thoughtSignature":signature})
+    );
 }
 
 #[tokio::test]

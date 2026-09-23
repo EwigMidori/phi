@@ -8,6 +8,8 @@ use phi_kernel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use super::{GeminiSignaturePolicy, REPLAY_SIGNATURE_PLACEHOLDER};
+
 use crate::{
     images::{PreparedImage, PreparedImages},
     protocol::ToolArgumentNormalizer,
@@ -61,9 +63,10 @@ impl NativeContent {
                 .as_str()
                 .ok_or("invalid Gemini thought signature")?;
             if signature.is_empty()
-                || base64::engine::general_purpose::STANDARD
-                    .decode(signature)
-                    .is_err()
+                || (signature != REPLAY_SIGNATURE_PLACEHOLDER
+                    && base64::engine::general_purpose::STANDARD
+                        .decode(signature)
+                        .is_err())
             {
                 return Err("invalid Gemini thought signature encoding".into());
             }
@@ -346,7 +349,7 @@ struct NativeCall {
 
 pub(super) struct GeminiHistory<'a> {
     scope: String,
-    required_signatures: bool,
+    signature_policy: GeminiSignaturePolicy,
     images: &'a PreparedImages,
     contents: Vec<Value>,
     pending: HashMap<ToolCallId, NativeCall>,
@@ -356,12 +359,12 @@ pub(super) struct GeminiHistory<'a> {
 impl<'a> GeminiHistory<'a> {
     pub(super) fn new(
         scope: String,
-        required_signatures: bool,
+        signature_policy: GeminiSignaturePolicy,
         images: &'a PreparedImages,
     ) -> Self {
         Self {
             scope,
-            required_signatures,
+            signature_policy,
             images,
             contents: Vec::new(),
             pending: HashMap::new(),
@@ -382,6 +385,23 @@ impl<'a> GeminiHistory<'a> {
         }
         if self.contents.is_empty() {
             return Err("Gemini input is empty".into());
+        }
+        if self.signature_policy == GeminiSignaturePolicy::PlaceholderForMissing {
+            for content in &mut self.contents {
+                if content["role"] != "model" {
+                    continue;
+                }
+                let first_call = content["parts"]
+                    .as_array_mut()
+                    .expect("encoded parts")
+                    .iter_mut()
+                    .find(|part| part.get("functionCall").is_some_and(|call| !call.is_null()));
+                if let Some(part) = first_call {
+                    if part.get("thoughtSignature").is_none_or(Value::is_null) {
+                        part["thoughtSignature"] = json!(REPLAY_SIGNATURE_PLACEHOLDER);
+                    }
+                }
+            }
         }
         Ok(self.contents)
     }
@@ -443,7 +463,9 @@ impl<'a> GeminiHistory<'a> {
                             .expect("validated parts")
                             .clone(),
                     )
-                    .validate_signatures(current && self.required_signatures)?;
+                    .validate_signatures(
+                        current && self.signature_policy == GeminiSignaturePolicy::Required,
+                    )?;
                     for row in &response.rows {
                         if let TurnItem::ToolCall { tool_call_id, .. } = &row.item {
                             self.register(
@@ -478,7 +500,7 @@ impl<'a> GeminiHistory<'a> {
                 tool_name,
                 input,
             } => {
-                if current && self.required_signatures {
+                if current && self.signature_policy == GeminiSignaturePolicy::Required {
                     return Err("selected current tool turn has no Gemini thought signature; start a new user turn or use an isolated context".into());
                 }
                 let args = input.parse().map_err(

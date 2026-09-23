@@ -37,7 +37,7 @@ pub use images::{
 pub use reasoning::{ReasoningConfig, ReasoningDialect, ReasoningEffort, ReasoningMode};
 
 pub use config::{ApiBase, ApiKey, ApiStyle, LlmConfig, ModelId};
-pub use gemini::{GeminiProtocol, GeminiThinking};
+pub use gemini::{GeminiProtocol, GeminiSignaturePolicy, GeminiThinking};
 pub use images::{PreparedImage, PreparedImages};
 pub use openai_compat::OpenAiProtocol;
 pub use protocol::{

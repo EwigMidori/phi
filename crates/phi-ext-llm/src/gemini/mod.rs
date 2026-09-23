@@ -1,5 +1,6 @@
 //! Gemini GenerateContent v1beta. Both transports share native response state.
 mod content;
+mod parts;
 mod response;
 #[cfg(test)]
 mod tests;
@@ -16,6 +17,19 @@ use crate::{
 };
 use content::GeminiHistory;
 use response::GeminiResponse;
+
+/// The host chooses how unsigned tool history is sent to Gemini.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GeminiSignaturePolicy {
+    #[default]
+    Optional,
+    Required,
+    /// Preserve every supplied signature; use Google's documented placeholder
+    /// only when the first call of an outgoing model content has none.
+    PlaceholderForMissing,
+}
+
+const REPLAY_SIGNATURE_PLACEHOLDER: &str = "skip_thought_signature_validator";
 
 /// Exact native controls. Model capability policy belongs to the host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,7 +84,7 @@ pub struct GeminiProtocol {
     model: ModelId,
     mode: ResponseMode,
     thinking: GeminiThinking,
-    required_signatures: bool,
+    signature_policy: GeminiSignaturePolicy,
     root: Url,
     client: Client,
 }
@@ -116,7 +130,7 @@ impl GeminiProtocol {
             model,
             mode,
             thinking: GeminiThinking::ProviderDefault,
-            required_signatures: false,
+            signature_policy: GeminiSignaturePolicy::Optional,
             root,
             client,
         })
@@ -128,10 +142,10 @@ impl GeminiProtocol {
         Ok(self)
     }
 
-    /// Hosts select the model's signature contract; no model-name table lives here.
+    /// Hosts select the connection's signature contract; no model-name table lives here.
     #[must_use]
-    pub fn with_required_thought_signatures(mut self, required: bool) -> Self {
-        self.required_signatures = required;
+    pub fn with_signature_policy(mut self, policy: GeminiSignaturePolicy) -> Self {
+        self.signature_policy = policy;
         self
     }
 
@@ -167,7 +181,7 @@ impl GeminiProtocol {
         images: &PreparedImages,
     ) -> Result<Value, String> {
         let contents =
-            GeminiHistory::new(self.scope(), self.required_signatures, images).encode(history)?;
+            GeminiHistory::new(self.scope(), self.signature_policy, images).encode(history)?;
         let mut config = json!({"candidateCount": 1});
         self.thinking.apply(&mut config);
         let mut body = json!({"contents": contents, "generationConfig": config});
@@ -265,7 +279,7 @@ impl ProviderProtocol for GeminiProtocol {
             self.mode,
             cancel.clone(),
             self.scope(),
-            self.required_signatures,
+            self.signature_policy,
         )))
     }
 }
